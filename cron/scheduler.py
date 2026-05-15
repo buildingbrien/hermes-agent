@@ -739,6 +739,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
+    # ── P7: Record task start via bridge ──────────────────────────
+    try:
+        from cron.p7_task_hook import task_start as _p7_task_start, task_end as _p7_task_end
+        _p7_task_start(_cron_session_id, job_id, job_name)
+    except Exception:
+        _p7_task_start = None
+        _p7_task_end = None
+
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
@@ -987,6 +995,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+        if _p7_task_end:
+            try:
+                _p7_task_end(_cron_session_id, "completed")
+            except Exception:
+                pass
         return True, output, final_response, None
         
     except Exception as e:
@@ -1009,7 +1022,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 {error_msg}
 ```
 """
+        if _p7_task_end:
+            try:
+                _p7_task_end(_cron_session_id, "failed", error_msg)
+            except Exception:
+                pass
         return False, output, "", error_msg
+
 
     finally:
         # Clean up injected env vars so they don't leak to other jobs
