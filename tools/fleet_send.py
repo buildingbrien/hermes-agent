@@ -81,6 +81,31 @@ def _check_recipient_inbox(recipient: str, task_id: str, timeout: int = 5) -> bo
     return False
 
 
+# Dead-letter log dir — every undeliverable message is recorded here so a
+# failed send is never silently dropped (P6 ACK reliability).
+DEAD_LETTER_DIR = os.path.expanduser("~/.lucaryin/fleet-dead-letters")
+
+
+def _write_dead_letter(recipient: str, message: str, sender: str, reason: str) -> str:
+    """Append an undeliverable message to today's dead-letter log.
+
+    Returns the file path on success, or "" if the write itself failed.
+    """
+    try:
+        os.makedirs(DEAD_LETTER_DIR, exist_ok=True)
+        path = os.path.join(DEAD_LETTER_DIR, f"{time.strftime('%Y-%m-%d')}.md")
+        entry = (
+            f"\n## {time.strftime('%Y-%m-%d %H:%M:%S')} — {sender} → {recipient} (DEAD)\n"
+            f"- reason: {reason}\n"
+            f"- message: {message[:500]}\n"
+        )
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(entry)
+        return path
+    except Exception:
+        return ""
+
+
 def fleet_send_tool(args, **kw):
     """Handle fleet_send tool calls with delivery confirmation and fallback."""
     recipient = (args.get("recipient", "") or "").strip().lower()
@@ -112,6 +137,9 @@ def fleet_send_tool(args, **kw):
         "sender": sender,
     }
 
+    # Receipt is tri-state: "delivered" (confirmed), "queued" (published but
+    # unconfirmed — recipient may still pick it up), or "dead" (every transport
+    # failed → logged to a dead-letter and surfaced to the user).
     # ── Phase 1: Try pub/sub via our own bridge ──────────────────
     try:
         result = _post_json(bus_url, payload, timeout=10)
@@ -122,41 +150,80 @@ def fleet_send_tool(args, **kw):
             if task_id and _check_recipient_inbox(recipient, task_id, timeout=5):
                 return json.dumps({
                     "success": True,
+                    "status": "delivered",
                     "recipient": recipient,
                     "method": "pubsub",
-                    "message": f"Message sent to {recipient} (confirmed delivered).",
+                    "message": f"Message delivered to {recipient} (confirmed).",
                 })
 
             # Phase 3: Not confirmed — fall back to direct bridge-to-bridge
             recipient_port = AGENT_PORTS.get(recipient)
             if recipient_port:
+                try:
+                    direct_url = f"http://127.0.0.1:{recipient_port}/api/bus/send"
+                    direct_result = _post_json(direct_url, payload, timeout=10)
+                    if direct_result.get("success"):
+                        return json.dumps({
+                            "success": True,
+                            "status": "delivered",
+                            "recipient": recipient,
+                            "method": "direct",
+                            "message": f"Message delivered to {recipient} (direct bridge fallback).",
+                        })
+                except Exception:
+                    pass  # fall through to "queued"
+
+            # Phase 4: Published but delivery unconfirmed — queued, not dead.
+            return json.dumps({
+                "success": True,
+                "status": "queued",
+                "recipient": recipient,
+                "method": "pubsub_unconfirmed",
+                "message": (
+                    f"Message published to {recipient} but delivery could not be "
+                    "confirmed (recipient may be offline or between sessions). It "
+                    "is queued — consider retrying, or tell the user it is unconfirmed."
+                ),
+            })
+
+        # Bus accepted the request but reported failure → dead.
+        reason = result.get("error", "bus returned success=false")
+    except urllib.error.URLError as e:
+        reason = f"bus endpoint unreachable: {getattr(e, 'reason', e)}"
+        # Last resort: try the recipient's bridge directly before giving up.
+        recipient_port = AGENT_PORTS.get(recipient)
+        if recipient_port:
+            try:
                 direct_url = f"http://127.0.0.1:{recipient_port}/api/bus/send"
                 direct_result = _post_json(direct_url, payload, timeout=10)
                 if direct_result.get("success"):
                     return json.dumps({
                         "success": True,
+                        "status": "delivered",
                         "recipient": recipient,
                         "method": "direct",
-                        "message": f"Message sent to {recipient} (direct fallback — pub/sub unconfirmed).",
+                        "message": f"Message delivered to {recipient} (direct bridge; local bus was unreachable).",
                     })
-
-            # Phase 4: Both methods failed or pub/sub sent but unconfirmed
-            return json.dumps({
-                "success": True,
-                "recipient": recipient,
-                "method": "pubsub_unconfirmed",
-                "message": (
-                    f"Message published to {recipient} but delivery could not be confirmed. "
-                    "The recipient may be offline or its bridge may be stuck. "
-                    "Consider retrying in a moment or using a different channel."
-                ),
-            })
-        else:
-            return json.dumps({"error": result.get("error", "Unknown error")})
-    except urllib.error.URLError as e:
-        return json.dumps({"error": f"Bus endpoint unreachable: {e.reason}"})
+            except Exception:
+                pass
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        reason = str(e)
+
+    # ── Dead: every transport failed. Never silently drop — log + surface. ──
+    dl_path = _write_dead_letter(recipient, message, sender, reason)
+    return json.dumps({
+        "success": False,
+        "status": "dead",
+        "recipient": recipient,
+        "method": "none",
+        "error": reason,
+        "dead_letter": dl_path,
+        "message": (
+            f"Delivery to {recipient} FAILED ({reason}). Logged to the dead-letter "
+            "file. Do NOT silently drop this — tell the user what you tried, to "
+            "whom, and that it failed, and offer to retry."
+        ),
+    })
 
 
 # --- Registry ---
