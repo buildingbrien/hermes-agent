@@ -46,12 +46,23 @@ AGENT_PORTS = {
 }
 
 
+def _auth_headers(extra: dict | None = None) -> dict:
+    """Headers for bridge calls — includes the bearer token when present (P4)."""
+    h = {"Content-Type": "application/json"}
+    if extra:
+        h.update(extra)
+    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
+
+
 def _post_json(url: str, payload: dict, timeout: int = 10) -> dict:
     """POST JSON payload and return parsed response dict."""
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=_auth_headers(),
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -68,7 +79,7 @@ def _check_recipient_inbox(recipient: str, task_id: str, timeout: int = 5) -> bo
     while time.time() < deadline:
         try:
             url = f"http://127.0.0.1:{recipient_port}/api/pubsub/messages"
-            req = urllib.request.Request(url, method="GET")
+            req = urllib.request.Request(url, headers=_auth_headers(), method="GET")
             with urllib.request.urlopen(req, timeout=3) as resp:
                 data = json.loads(resp.read().decode())
             messages = data.get("messages", [])
