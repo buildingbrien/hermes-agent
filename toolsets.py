@@ -58,6 +58,10 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
+    # Fleet inter-agent bus messaging
+    "fleet_send",
+    # Synchronous research delegation to the persistent Neith agent (:9007)
+    "delegate_to_neith",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
