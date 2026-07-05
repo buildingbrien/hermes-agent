@@ -66,6 +66,7 @@ else:
 # Import our tool system
 from model_tools import (
     get_tool_definitions,
+    get_last_unavailable_tool_names,
     get_toolset_for_tool,
     handle_function_call,
     check_toolset_requirements,
@@ -98,7 +99,7 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE, GROUNDING_GUIDANCE, build_unavailable_tools_prompt, scrub_web_search_references
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -1352,7 +1353,12 @@ class AIAgent:
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
         )
-        
+        # Tools requested but dropped because their availability check failed
+        # (missing API keys, etc.).  Surfaced in the system prompt so the
+        # model knows the tool is missing instead of hallucinating results
+        # it claims came from it (e.g. "I searched the web" with no key).
+        self.unavailable_tool_names: set = set(get_last_unavailable_tool_names())
+
         # Show tool configuration and store valid tool names for validation
         self.valid_tool_names = set()
         if self.tools:
@@ -4063,8 +4069,31 @@ class AIAgent:
                     prompt_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
                 # OpenAI GPT/Codex execution discipline (tool persistence,
                 # prerequisite checks, verification, anti-hallucination).
+                # web_search references are scrubbed when the tool was
+                # dropped from the resolved toolset (no search key) so the
+                # guidance never advertises a tool that doesn't exist.
                 if "gpt" in _model_lower or "codex" in _model_lower:
-                    prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
+                    prompt_parts.append(scrub_web_search_references(
+                        OPENAI_MODEL_EXECUTION_GUIDANCE, self.valid_tool_names))
+            # Anti-hallucination grounding — injected for ALL models with
+            # tools loaded, not just TOOL_USE_ENFORCEMENT_MODELS matches:
+            # the default customer model (DeepSeek) fabricated results when
+            # the substring gate excluded it.  Respects the explicit opt-out
+            # (agent.tool_use_enforcement: false) only.
+            _grounding_off = _enforce is False or (
+                isinstance(_enforce, str)
+                and _enforce.lower() in ("false", "never", "no", "off")
+            )
+            if not _grounding_off:
+                prompt_parts.append(GROUNDING_GUIDANCE)
+
+        # Honest tool availability: name the key-gated tools that were
+        # requested but dropped (check_fn failed) so the model states it
+        # cannot use them instead of inventing their output.
+        _unavailable_block = build_unavailable_tools_prompt(
+            getattr(self, "unavailable_tool_names", None))
+        if _unavailable_block:
+            prompt_parts.append(_unavailable_block)
 
         # so it can refer the user to them rather than reinventing answers.
 

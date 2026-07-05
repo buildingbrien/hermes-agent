@@ -7,11 +7,14 @@ within 5 seconds, it falls back to a direct HTTP POST to the recipient's
 bridge /api/bus/send, bypassing the pub/sub layer entirely.
 """
 
+from __future__ import annotations
+
 import json
 import os
 import time
 import urllib.request
 import urllib.error
+import uuid
 
 FLEET_SEND_SCHEMA = {
     "name": "fleet_send",
@@ -46,7 +49,7 @@ AGENT_PORTS = {
 }
 
 
-def _auth_headers(extra: dict | None = None) -> dict:
+def _auth_headers(extra: "dict | None" = None) -> dict:
     """Headers for bridge calls — includes the bearer token when present (P4)."""
     h = {"Content-Type": "application/json"}
     if extra:
@@ -55,6 +58,37 @@ def _auth_headers(extra: dict | None = None) -> dict:
     if token:
         h["Authorization"] = f"Bearer {token}"
     return h
+
+
+# ── WS2: Fleet delegation budget propagation ─────────────────────────────
+# When this process is itself running a delegated task, the bridge worker
+# exports FLEET_DELEGATION_* env vars. Attach the next-hop budget to every
+# outbound fleet message so the receiving bridge seeds its worker's depth
+# and refuses runaway cascades.
+_FLEET_VISITED_MAX = 16
+
+
+def _delegation_budget_fields(sender: str) -> dict:
+    try:
+        depth = max(0, int(os.environ.get("FLEET_DELEGATION_DEPTH", "0")))
+    except ValueError:
+        depth = 0
+    origin = os.environ.get("FLEET_DELEGATION_ORIGIN", "").strip().lower()
+    visited = []
+    for item in os.environ.get("FLEET_DELEGATION_VISITED", "").split(","):
+        name = item.strip().lower()
+        if name and name not in visited:
+            visited.append(name)
+        if len(visited) >= _FLEET_VISITED_MAX:
+            break
+    sender_l = (sender or "").strip().lower()
+    if sender_l and sender_l not in visited:
+        visited.append(sender_l)
+    return {
+        "delegation_depth": depth + 1,
+        "delegation_origin": origin or sender_l,
+        "delegation_visited": visited,
+    }
 
 
 def _post_json(url: str, payload: dict, timeout: int = 10) -> dict:
@@ -142,11 +176,16 @@ def fleet_send_tool(args, **kw):
     port = os.environ.get("HERMES_SERVER_PORT", "9001")
     bus_url = f"http://127.0.0.1:{port}/api/bus/send"
 
+    # WS2: mint the task_id CLIENT-side so the pub/sub publish and the
+    # direct-bridge fallback carry the same id — the receiving bridge dedups
+    # on task_id, so double delivery collapses to one execution.
     payload = {
         "recipient": recipient,
         "message": message,
         "sender": sender,
+        "task_id": str(uuid.uuid4()),
     }
+    payload.update(_delegation_budget_fields(sender))
 
     # Receipt is tri-state: "delivered" (confirmed), "queued" (published but
     # unconfirmed — recipient may still pick it up), or "dead" (every transport
@@ -193,7 +232,8 @@ def fleet_send_tool(args, **kw):
                 "message": (
                     f"Message published to {recipient} but delivery could not be "
                     "confirmed (recipient may be offline or between sessions). It "
-                    "is queued — consider retrying, or tell the user it is unconfirmed."
+                    "is queued and may still be picked up — do NOT resend it; "
+                    "tell the user delivery is unconfirmed."
                 ),
             })
 

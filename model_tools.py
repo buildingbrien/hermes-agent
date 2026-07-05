@@ -158,6 +158,21 @@ TOOLSET_REQUIREMENTS: Dict[str, dict] = registry.get_toolset_requirements()
 # Used by code_execution_tool to know which tools are available in this session.
 _last_resolved_tool_names: List[str] = []
 
+# Tool names requested by the last get_tool_definitions() call but dropped
+# because their availability check failed (missing API keys, etc.).
+# Used by run_agent.py to tell the model which tools are NOT available so it
+# never claims to have used them (e.g. "I searched the web" with no search key).
+_last_unavailable_tool_names: List[str] = []
+
+
+def get_last_unavailable_tool_names() -> List[str]:
+    """Return tool names dropped by the last ``get_tool_definitions()`` call.
+
+    These are registered, requested tools whose ``check_fn()`` failed —
+    typically key-gated tools like web_search without a configured backend.
+    """
+    return list(_last_unavailable_tool_names)
+
 
 # =============================================================================
 # Legacy toolset name mapping  (old _tools-suffixed names -> tool name lists)
@@ -260,8 +275,13 @@ def get_tool_definitions(
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
 
-    # Ask the registry for schemas (only returns tools whose check_fn passes)
-    filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+    # Ask the registry for schemas (only returns tools whose check_fn passes).
+    # Tools dropped because their check failed are collected so the system
+    # prompt can state honestly that they are unavailable in this deployment.
+    unavailable_names: List[str] = []
+    filtered_tools = registry.get_definitions(
+        tools_to_include, quiet=quiet_mode, unavailable_out=unavailable_names
+    )
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references
@@ -333,9 +353,12 @@ def get_tool_definitions(
             print(f"🛠️  Final tool selection ({len(filtered_tools)} tools): {', '.join(tool_names)}")
         else:
             print("🛠️  No tools selected (all filtered out or unavailable)")
+        if unavailable_names:
+            print(f"🚫 Unavailable (check failed — missing keys/config): {', '.join(sorted(unavailable_names))}")
 
-    global _last_resolved_tool_names
+    global _last_resolved_tool_names, _last_unavailable_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
+    _last_unavailable_tool_names = sorted(unavailable_names)
 
     return filtered_tools
 

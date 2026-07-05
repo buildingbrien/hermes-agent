@@ -13,6 +13,9 @@ Import chain (circular-import safe):
            ^
     run_agent.py, cli.py, batch_runner.py, etc.
 """
+# Defer all annotations to strings so PEP 604 unions (X | None) stay valid on
+# Python 3.9 fleet nodes (nothing here evaluates annotations at runtime).
+from __future__ import annotations
 
 import ast
 import importlib
@@ -255,11 +258,23 @@ class ToolRegistry:
     # Schema retrieval
     # ------------------------------------------------------------------
 
-    def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
+    def get_definitions(
+        self,
+        tool_names: Set[str],
+        quiet: bool = False,
+        unavailable_out: Optional[List[str]] = None,
+    ) -> List[dict]:
         """Return OpenAI-format tool schemas for the requested tool names.
 
         Only tools whose ``check_fn()`` returns True (or have no check_fn)
         are included.
+
+        When *unavailable_out* is provided, the names of registered tools
+        that were requested but dropped because their ``check_fn()`` failed
+        (missing API keys, unreachable backends, etc.) are appended to it.
+        Callers use this to tell the model which tools are NOT available in
+        the deployment, instead of silently hiding them and letting the
+        model hallucinate their results.
         """
         result = []
         check_results: Dict[Callable, bool] = {}
@@ -279,6 +294,8 @@ class ToolRegistry:
                 if not check_results[entry.check_fn]:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)
+                    if unavailable_out is not None:
+                        unavailable_out.append(name)
                     continue
             # Ensure schema always has a "name" field — use entry.name as fallback
             schema_with_name = {**entry.schema, "name": entry.name}

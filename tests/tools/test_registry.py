@@ -84,6 +84,55 @@ class TestGetDefinitions:
         assert len(defs) == 1
         assert defs[0]["function"]["name"] == "available"
 
+    def test_unavailable_out_collects_dropped_tools(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="available",
+            toolset="s",
+            schema=_make_schema("available"),
+            handler=_dummy_handler,
+            check_fn=lambda: True,
+        )
+        reg.register(
+            name="gated",
+            toolset="s2",
+            schema=_make_schema("gated"),
+            handler=_dummy_handler,
+            check_fn=lambda: False,
+        )
+        dropped = []
+        defs = reg.get_definitions({"available", "gated"}, unavailable_out=dropped)
+        assert [d["function"]["name"] for d in defs] == ["available"]
+        assert dropped == ["gated"]
+
+    def test_unavailable_out_collects_raising_check(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="broken",
+            toolset="s",
+            schema=_make_schema("broken"),
+            handler=_dummy_handler,
+            check_fn=lambda: (_ for _ in ()).throw(OSError("network down")),
+        )
+        dropped = []
+        defs = reg.get_definitions({"broken"}, unavailable_out=dropped)
+        assert defs == []
+        assert dropped == ["broken"]
+
+    def test_unavailable_out_ignores_unregistered_names(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="real",
+            toolset="s",
+            schema=_make_schema("real"),
+            handler=_dummy_handler,
+        )
+        dropped = []
+        defs = reg.get_definitions({"real", "never_registered"}, unavailable_out=dropped)
+        assert len(defs) == 1
+        # Unknown names are not "unavailable" — they simply don't exist.
+        assert dropped == []
+
     def test_reuses_shared_check_fn_once_per_call(self):
         reg = ToolRegistry()
         calls = {"count": 0}

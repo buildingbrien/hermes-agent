@@ -24,6 +24,9 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    GROUNDING_GUIDANCE,
+    build_unavailable_tools_prompt,
+    scrub_web_search_references,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
@@ -499,7 +502,10 @@ class TestBuildContextFilesPrompt:
         with patch("pathlib.Path.home", return_value=fake_home):
             result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Project Context" in result
-        assert "Hermes Agent" in result
+        # Seeded identity is neutral (or profile-named) — never the internal
+        # "Hermes" runtime codename.
+        assert "the user's AI assistant" in result
+        assert "Hermes Agent" not in result
 
     def test_loads_agents_md(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
@@ -1008,6 +1014,13 @@ class TestToolUseEnforcementGuidance:
     def test_enforcement_models_includes_grok(self):
         assert "grok" in TOOL_USE_ENFORCEMENT_MODELS
 
+    def test_enforcement_models_includes_deepseek(self):
+        # DeepSeek is the default customer model (deepseek-v4-pro); the gate
+        # previously excluded it, so it never received grounding guidance.
+        assert "deepseek" in TOOL_USE_ENFORCEMENT_MODELS
+        assert any(p in "deepseek-v4-pro" for p in TOOL_USE_ENFORCEMENT_MODELS)
+        assert any(p in "deepseek/deepseek-chat" for p in TOOL_USE_ENFORCEMENT_MODELS)
+
     def test_enforcement_models_is_tuple(self):
         assert isinstance(TOOL_USE_ENFORCEMENT_MODELS, tuple)
 
@@ -1045,6 +1058,89 @@ class TestOpenAIModelExecutionGuidance:
     def test_guidance_is_string(self):
         assert isinstance(OPENAI_MODEL_EXECUTION_GUIDANCE, str)
         assert len(OPENAI_MODEL_EXECUTION_GUIDANCE) > 100
+
+
+# =========================================================================
+# Grounding guidance + web_search scrubbing + unavailable-tool honesty
+# =========================================================================
+
+
+class TestGroundingGuidance:
+    def test_forbids_fabrication(self):
+        assert "Never fabricate" in GROUNDING_GUIDANCE
+
+    def test_forbids_false_tool_use_claims(self):
+        text = GROUNDING_GUIDANCE
+        assert "Never claim to have performed an action" in text
+        assert "'I searched'" in text
+
+    def test_forbids_guessing_on_missing_context(self):
+        assert "do NOT guess" in GROUNDING_GUIDANCE
+
+    def test_does_not_advertise_specific_tools(self):
+        # Written generically so it never needs scrubbing when key-gated
+        # tools (web_search etc.) are dropped from the toolset.
+        assert "web_search" not in GROUNDING_GUIDANCE
+        assert "browser_navigate" not in GROUNDING_GUIDANCE
+
+    def test_uses_xml_tags(self):
+        assert "<grounding>" in GROUNDING_GUIDANCE
+        assert "</grounding>" in GROUNDING_GUIDANCE
+
+
+class TestScrubWebSearchReferences:
+    def test_unchanged_when_web_search_available(self):
+        out = scrub_web_search_references(
+            OPENAI_MODEL_EXECUTION_GUIDANCE, {"web_search", "terminal"}
+        )
+        assert out == OPENAI_MODEL_EXECUTION_GUIDANCE
+
+    def test_unchanged_when_available_tools_unknown(self):
+        out = scrub_web_search_references(OPENAI_MODEL_EXECUTION_GUIDANCE, None)
+        assert out == OPENAI_MODEL_EXECUTION_GUIDANCE
+
+    def test_scrubbed_when_web_search_missing(self):
+        out = scrub_web_search_references(
+            OPENAI_MODEL_EXECUTION_GUIDANCE, {"terminal", "read_file"}
+        )
+        assert "web_search" not in out
+        # Remaining guidance is preserved
+        assert "<tool_persistence>" in out
+        assert "<missing_context>" in out
+        assert "(search_files, read_file, etc.)" in out
+
+    def test_scrubs_skills_index_advertisement(self):
+        text = "handle it with basic tools like web_search or terminal."
+        out = scrub_web_search_references(text, {"terminal"})
+        assert "web_search" not in out
+        assert "basic tools like terminal" in out
+
+    def test_empty_available_set_scrubs(self):
+        out = scrub_web_search_references(
+            OPENAI_MODEL_EXECUTION_GUIDANCE, set()
+        )
+        assert "web_search" not in out
+
+
+class TestBuildUnavailableToolsPrompt:
+    def test_empty_when_nothing_dropped(self):
+        assert build_unavailable_tools_prompt(set()) == ""
+        assert build_unavailable_tools_prompt(None) == ""
+
+    def test_names_dropped_tools(self):
+        block = build_unavailable_tools_prompt({"web_search", "web_extract"})
+        assert "NOT available" in block
+        assert "web_extract, web_search" in block  # sorted order
+        assert "Never claim to have used an unavailable tool" in block
+
+    def test_web_search_gets_explicit_no_search_language(self):
+        block = build_unavailable_tools_prompt({"web_search"})
+        assert "never say you searched the web" in block
+
+    def test_non_web_tool_skips_web_sentence(self):
+        block = build_unavailable_tools_prompt({"image_generate"})
+        assert "image_generate" in block
+        assert "searched the web" not in block
 
 
 # =========================================================================

@@ -231,3 +231,37 @@ class TestBackwardCompat:
     def test_tool_to_toolset_map(self):
         assert isinstance(TOOL_TO_TOOLSET_MAP, dict)
         assert len(TOOL_TO_TOOLSET_MAP) > 0
+
+
+# =========================================================================
+# Unavailable-tool tracking (key-gated tools dropped by check_fn)
+# =========================================================================
+
+class TestUnavailableToolTracking:
+    def test_get_last_unavailable_tool_names_tracks_dropped(self):
+        from model_tools import get_tool_definitions, get_last_unavailable_tool_names
+
+        def fake_get_definitions(tool_names, quiet=False, unavailable_out=None):
+            if unavailable_out is not None:
+                unavailable_out.extend(["web_search", "web_extract"])
+            return []
+
+        with patch(
+            "model_tools.registry.get_definitions",
+            side_effect=fake_get_definitions,
+        ):
+            get_tool_definitions(enabled_toolsets=[], quiet_mode=True)
+
+        # Sorted, and exposed as a copy for run_agent's system prompt.
+        assert get_last_unavailable_tool_names() == ["web_extract", "web_search"]
+
+    def test_get_last_unavailable_tool_names_resets_when_all_pass(self):
+        from model_tools import get_tool_definitions, get_last_unavailable_tool_names
+
+        with patch(
+            "model_tools.registry.get_definitions",
+            side_effect=lambda tool_names, quiet=False, unavailable_out=None: [],
+        ):
+            get_tool_definitions(enabled_toolsets=[], quiet_mode=True)
+
+        assert get_last_unavailable_tool_names() == []

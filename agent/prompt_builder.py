@@ -131,14 +131,28 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # Constants
 # =========================================================================
 
+def _default_identity_lead() -> str:
+    """Lead sentence for the fallback identity.
+
+    Deployments (e.g. the Lucaryin bridge) set BRIDGE_PROFILE to the agent's
+    profile name; use it so a missing SOUL.md never introduces the agent by
+    an internal runtime codename. Fall back to a neutral identity otherwise.
+    """
+    profile = os.environ.get("BRIDGE_PROFILE", "").strip()
+    if profile:
+        return "You are %s, the user's AI assistant." % profile.capitalize()
+    return "You are the user's AI assistant."
+
+
 DEFAULT_AGENT_IDENTITY = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
+    _default_identity_lead() + " "
     "You are helpful, knowledgeable, and direct. You assist users with a wide "
     "range of tasks including answering questions, writing and editing code, "
     "analyzing information, creative work, and executing actions via your tools. "
     "You communicate clearly, admit uncertainty when appropriate, and prioritize "
     "being genuinely useful over being verbose unless otherwise directed below. "
-    "Be targeted and efficient in your exploration and investigations."
+    "Be targeted and efficient in your exploration and investigations. "
+    "Never refer to yourself by internal runtime or model codenames."
 )
 
 MEMORY_GUIDANCE = (
@@ -193,7 +207,13 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 
 # Model name substrings that trigger tool-use enforcement guidance.
 # Add new patterns here when a model family needs explicit steering.
-TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok")
+# "deepseek" is the Lucaryin default customer model (deepseek-v4-pro via
+# hermes-bridge config); it was observed fabricating results (a fake LinkedIn
+# profile URL) when this gate excluded it. OpenRouter-style ids like
+# "deepseek/deepseek-chat" match by substring. Anthropic models are
+# deliberately excluded — the enforcement text degrades their behavior and
+# they receive GROUNDING_GUIDANCE separately below.
+TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "deepseek")
 
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
@@ -280,6 +300,86 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
     "- **Keep going:** Work autonomously until the task is fully resolved. "
     "Don't stop with a plan — execute it.\n"
 )
+
+# Anti-hallucination grounding.  Unlike TOOL_USE_ENFORCEMENT_GUIDANCE (which
+# targets models that under-call tools), this block targets fabrication:
+# invented URLs, contacts, quotes, and claims of tool use that never happened.
+# Injected for ALL models whenever tools are loaded — unconditional-by-default
+# with the same opt-out as enforcement (agent.tool_use_enforcement: false) —
+# because the failure mode was observed on the default customer model
+# (DeepSeek), which the model-name substring gate previously missed.
+GROUNDING_GUIDANCE = (
+    "# Grounding and honesty\n"
+    "<grounding>\n"
+    "- Never fabricate facts, URLs, links, file paths, phone numbers, email "
+    "addresses, profile pages, quotes, or statistics. If it did not come from "
+    "a tool result, provided context, or reliable knowledge, do not present "
+    "it as fact.\n"
+    "- Never claim to have performed an action or used a tool you did not "
+    "actually use in this conversation. Do not say 'I searched', 'I checked', "
+    "or 'I found' unless a corresponding tool call happened and returned that "
+    "information.\n"
+    "- If required information is missing, do NOT guess. Use an available "
+    "lookup tool to retrieve it; if no available tool can retrieve it, say so "
+    "plainly and ask the user or offer an alternative.\n"
+    "- When uncertain, state the uncertainty and label assumptions explicitly "
+    "instead of presenting guesses as facts.\n"
+    "</grounding>"
+)
+
+# Exact-substring scrubs applied to guidance text when web_search is not in
+# the session's resolved toolset — same pattern as the browser_navigate
+# description scrub in model_tools.get_tool_definitions().  Advertising
+# web_search after the key-gated tool was dropped teaches the model to claim
+# searches it cannot run.
+_WEB_SEARCH_GUIDANCE_SCRUBS = (
+    ("- Current facts (weather, news, versions) → use web_search\n", ""),
+    ("(search_files, web_search, read_file, etc.)", "(search_files, read_file, etc.)"),
+    ("basic tools like web_search or terminal", "basic tools like terminal"),
+)
+
+
+def scrub_web_search_references(text: str, available_tools: "set[str] | None") -> str:
+    """Remove web_search advertisements from *text* when the tool is unavailable.
+
+    No-op (returns *text* unchanged) when *available_tools* is None (unknown)
+    or when web_search is present — prompts stay byte-identical for
+    deployments where a search backend IS configured.
+    """
+    if available_tools is None or "web_search" in available_tools:
+        return text
+    for old, new in _WEB_SEARCH_GUIDANCE_SCRUBS:
+        text = text.replace(old, new)
+    return text
+
+
+def build_unavailable_tools_prompt(unavailable_tools: "set[str] | None") -> str:
+    """Build an honesty block naming tools dropped from this deployment.
+
+    ``registry.get_definitions()`` silently drops key-gated tools whose
+    check_fn fails (e.g. web_search without a search key).  Without this
+    block the model never learns the tool is missing and may fabricate
+    results it claims came from that tool.
+    """
+    names = sorted(unavailable_tools or set())
+    if not names:
+        return ""
+    lines = [
+        "# Tools NOT available in this deployment",
+        "The following tools are not configured here (missing API key or "
+        "required configuration) and CANNOT be used: " + ", ".join(names) + ".",
+        "Never claim to have used an unavailable tool, and never present "
+        "invented output as if it came from one.",
+    ]
+    if "web_search" in names:
+        lines.append(
+            "Web search is unavailable: never say you searched the web or "
+            "imply live web results. Say you cannot search or browse the web, "
+            "then offer an alternative (answer from existing knowledge with "
+            "its date caveat, or ask the user to provide the material)."
+        )
+    return "\n".join(lines)
+
 
 # Model name substrings that should use the 'developer' role instead of
 # 'system' for the system prompt.  OpenAI's newer models (GPT-5, Codex)
@@ -804,6 +904,9 @@ def build_skills_system_prompt(
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
         )
+        # Don't advertise web_search when it's not in the resolved toolset.
+        # Safe to apply pre-cache: available_tools is part of the cache key.
+        result = scrub_web_search_references(result, available_tools)
 
     # ── Store in LRU cache ────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:
