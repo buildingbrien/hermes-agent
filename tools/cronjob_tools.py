@@ -472,11 +472,19 @@ def check_cronjob_requirements() -> bool:
     Available in interactive CLI mode and gateway/messaging platforms.
     The cron system is internal (JSON file-based scheduler ticked by the gateway),
     so no external crontab executable is required.
+
+    HERMES_CRON_ENABLED is a dedicated, side-effect-free opt-in for embedders
+    (e.g. the Lucaryin bridge) that tick the scheduler themselves but do not run
+    the interactive CLI or a messaging gateway. Unlike HERMES_GATEWAY_SESSION /
+    HERMES_INTERACTIVE, it gates *only* cron — it does not alter terminal-command
+    or approval behavior — so a host can enable scheduled tasks without widening
+    any other tool's blast radius.
     """
     return bool(
         os.getenv("HERMES_INTERACTIVE")
         or os.getenv("HERMES_GATEWAY_SESSION")
         or os.getenv("HERMES_EXEC_ASK")
+        or os.getenv("HERMES_CRON_ENABLED")
     )
 
 

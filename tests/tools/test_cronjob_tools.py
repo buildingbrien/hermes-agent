@@ -85,7 +85,18 @@ class TestCronjobRequirements:
     def test_accepts_exec_ask(self, monkeypatch):
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_CRON_ENABLED", raising=False)
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+
+        assert check_cronjob_requirements() is True
+
+    def test_accepts_cron_enabled(self, monkeypatch):
+        """A dedicated opt-in for embedders that tick the scheduler themselves
+        (e.g. the Lucaryin bridge) — unlocks cron without any other session env."""
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setenv("HERMES_CRON_ENABLED", "1")
 
         assert check_cronjob_requirements() is True
 
@@ -94,6 +105,7 @@ class TestCronjobRequirements:
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_CRON_ENABLED", raising=False)
 
         assert check_cronjob_requirements() is False
 
