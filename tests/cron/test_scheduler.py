@@ -1457,3 +1457,92 @@ class TestSendMediaViaAdapter:
         self._run_with_loop(adapter, "123", media_files, None, {"id": "j3"})
         adapter.send_voice.assert_called_once()
         adapter.send_image_file.assert_called_once()
+
+
+class TestLucaryinDelivery:
+    """The 'lucaryin' delivery target writes cron output into the origin chat
+    session in state.db instead of sending via a messenger. This is what makes a
+    cron created in the Lucaryin desktop/mobile chat deliver back into that
+    same thread (root-caused: the app was created cron jobs whose deliver
+    resolved to origin.platform='lucaryin', a platform with no adapter)."""
+
+    def test_lucaryin_is_a_known_platform(self):
+        # So an explicit `deliver=lucaryin:<session>` also validates.
+        from cron.scheduler import _KNOWN_DELIVERY_PLATFORMS
+        assert "lucaryin" in _KNOWN_DELIVERY_PLATFORMS
+
+    def test_origin_lucaryin_resolves_without_whitelist_rejection(self):
+        from cron.scheduler import _resolve_single_delivery_target
+        job = {
+            "id": "j1",
+            "deliver": "origin",
+            "origin": {"platform": "lucaryin", "chat_id": "sess-abc"},
+        }
+        target = _resolve_single_delivery_target(job, "origin")
+        assert target is not None
+        assert target["platform"] == "lucaryin"
+        assert target["chat_id"] == "sess-abc"
+
+    def _run_deliver(self, job, content, monkeypatch, tmp_path):
+        """Drive _deliver_result for a lucaryin job with SessionDB + hint dir stubbed."""
+        appended = {}
+
+        class FakeSessionDB:
+            def append_message(self, session_id, role, content):
+                appended["session_id"] = session_id
+                appended["role"] = role
+                appended["content"] = content
+                return 1
+
+        import hermes_state
+        import hermes_constants
+        monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+
+        # _deliver_result loads gateway config before the loop; the lucaryin
+        # branch never uses it, but it must not raise.
+        with patch("gateway.config.load_gateway_config", return_value=MagicMock()):
+            err = _deliver_result(job, content)
+        return err, appended
+
+    def test_writes_wrapped_assistant_message_to_origin_session(self, monkeypatch, tmp_path):
+        job = {
+            "id": "job-7",
+            "name": "morning-brief",
+            "deliver": "origin",
+            "origin": {"platform": "lucaryin", "chat_id": "sess-xyz"},
+        }
+        err, appended = self._run_deliver(job, "Your brief for today.", monkeypatch, tmp_path)
+        assert err is None
+        assert appended["session_id"] == "sess-xyz"
+        assert appended["role"] == "assistant"
+        assert "Your brief for today." in appended["content"]
+        # Uses the same cron wrapper as messenger deliveries.
+        assert "Cronjob Response: morning-brief" in appended["content"]
+
+    def test_writes_flush_hint_for_mobile(self, monkeypatch, tmp_path):
+        job = {
+            "id": "job-8",
+            "deliver": "origin",
+            "origin": {"platform": "lucaryin", "chat_id": "sess-mob"},
+        }
+        err, _ = self._run_deliver(job, "hi", monkeypatch, tmp_path)
+        assert err is None
+        hint = tmp_path / "cron" / ".pending_hub_flush"
+        assert hint.exists()
+        assert "sess-mob" in hint.read_text()
+
+    def test_does_not_call_messenger_send(self, monkeypatch, tmp_path):
+        job = {
+            "id": "job-9",
+            "deliver": "origin",
+            "origin": {"platform": "lucaryin", "chat_id": "sess-1"},
+        }
+        with patch("tools.send_message_tool._send_to_platform", new=AsyncMock()) as send_mock:
+            self._run_deliver(job, "x", monkeypatch, tmp_path)
+        send_mock.assert_not_called()
+
+    def test_missing_session_id_returns_error(self):
+        from cron.scheduler import _deliver_to_lucaryin_session
+        err = _deliver_to_lucaryin_session({"id": "j"}, "", "content")
+        assert err is not None and "session id" in err

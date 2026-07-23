@@ -47,6 +47,12 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot",
+    # "lucaryin" is not a messenger: its adapter writes the run output straight
+    # into the origin chat session in state.db (see _deliver_to_lucaryin_session),
+    # so a cron created in the Lucaryin desktop/mobile chat delivers back into
+    # that same thread. Listed here so an explicit `deliver=lucaryin:<session>`
+    # also validates.
+    "lucaryin",
 })
 
 # Platforms that support a configured cron/notification home target, mapped to
@@ -262,6 +268,50 @@ def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata: 
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
+def _deliver_to_lucaryin_session(job: dict, session_id: str, content: str) -> Optional[str]:
+    """Deliver cron output into a Lucaryin chat thread by writing it to state.db.
+
+    The "lucaryin" platform is not a messenger — the origin chat_id IS a
+    SessionDB session id, and the Lucaryin app renders that session from
+    ~/.hermes/state.db. So we append the run output as an assistant message on
+    that session; the desktop app shows it when the thread reloads.
+
+    Mobile is a second surface: it only mirrors state.db via hub_sync, and the
+    node's hub_sync poller is not always running (a chat turn triggers a
+    fast-flush, but a cron run has no turn). So we drop a best-effort flush
+    hint that the Lucaryin bridge's cron ticker drains and flushes. On a plain
+    hermes-agent host (no lucaryin delivery ever resolved) the hint is simply
+    never written. Returns None on success, or an error string.
+    """
+    if not session_id:
+        return "lucaryin delivery has no session id (origin chat_id missing)"
+    try:
+        from hermes_state import SessionDB
+        SessionDB().append_message(
+            session_id=str(session_id),
+            role="assistant",
+            content=content,
+        )
+    except Exception as e:  # pragma: no cover — defensive
+        logger.error("Job '%s': lucaryin state.db write failed: %s", job.get("id"), e)
+        return f"lucaryin delivery failed: {e}"
+
+    # Best-effort flush hint (see docstring). Never fails the delivery.
+    try:
+        from hermes_constants import get_hermes_home  # same helper SessionDB uses
+        hint_dir = get_hermes_home() / "cron"
+    except Exception:
+        hint_dir = None
+    if hint_dir is not None:
+        try:
+            hint_dir.mkdir(parents=True, exist_ok=True)
+            with open(hint_dir / ".pending_hub_flush", "a", encoding="utf-8") as fh:
+                fh.write(f"{session_id}\n")
+        except Exception:  # pragma: no cover — hint is optional
+            pass
+    return None
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -344,6 +394,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+
+        # Lucaryin: not a messenger — write the output into the origin chat
+        # session in state.db (chat_id IS the session id). Deliver the CLEANED
+        # content (MEDIA: tags stripped) with the same wrapper as messengers.
+        if platform_name.lower() == "lucaryin":
+            err = _deliver_to_lucaryin_session(job, str(chat_id), cleaned_delivery_content)
+            if err:
+                delivery_errors.append(err)
+            else:
+                logger.info("Job '%s': delivered into Lucaryin session %s", job["id"], chat_id)
+            continue
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = job.get("origin") or {}
