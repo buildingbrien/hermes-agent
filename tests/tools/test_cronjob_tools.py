@@ -243,3 +243,48 @@ class TestUnifiedCronjobTool:
         assert updated["success"] is True
         assert updated["job"]["skills"] == []
         assert updated["job"]["skill"] is None
+
+
+class TestOriginFromEnv:
+    """_origin_from_env captures where a cron was created so it can deliver
+    back there. Embedders that don't run the gateway (e.g. the Lucaryin bridge)
+    use the dedicated HERMES_CRON_ORIGIN_* vars, which must be preferred over
+    the session platform AND must not require touching HERMES_SESSION_PLATFORM
+    (that var also drives send_message/skills/tts/terminal behavior)."""
+
+    def test_no_env_returns_none(self, monkeypatch):
+        for k in ("HERMES_CRON_ORIGIN_PLATFORM", "HERMES_CRON_ORIGIN_CHAT_ID",
+                  "HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID"):
+            monkeypatch.delenv(k, raising=False)
+        from tools.cronjob_tools import _origin_from_env
+        assert _origin_from_env() is None
+
+    def test_dedicated_cron_origin_vars_captured(self, monkeypatch):
+        for k in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID"):
+            monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv("HERMES_CRON_ORIGIN_PLATFORM", "lucaryin")
+        monkeypatch.setenv("HERMES_CRON_ORIGIN_CHAT_ID", "sess-9")
+        from tools.cronjob_tools import _origin_from_env
+        origin = _origin_from_env()
+        assert origin == {
+            "platform": "lucaryin", "chat_id": "sess-9",
+            "chat_name": None, "thread_id": None,
+        }
+
+    def test_cron_origin_wins_over_session_platform(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "tg-1")
+        monkeypatch.setenv("HERMES_CRON_ORIGIN_PLATFORM", "lucaryin")
+        monkeypatch.setenv("HERMES_CRON_ORIGIN_CHAT_ID", "sess-2")
+        from tools.cronjob_tools import _origin_from_env
+        origin = _origin_from_env()
+        assert origin["platform"] == "lucaryin" and origin["chat_id"] == "sess-2"
+
+    def test_falls_back_to_session_platform_when_no_cron_override(self, monkeypatch):
+        monkeypatch.delenv("HERMES_CRON_ORIGIN_PLATFORM", raising=False)
+        monkeypatch.delenv("HERMES_CRON_ORIGIN_CHAT_ID", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "tg-7")
+        from tools.cronjob_tools import _origin_from_env
+        origin = _origin_from_env()
+        assert origin["platform"] == "telegram" and origin["chat_id"] == "tg-7"

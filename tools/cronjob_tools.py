@@ -69,11 +69,30 @@ def _scan_cron_prompt(prompt: str) -> str:
 
 
 def _origin_from_env() -> Optional[Dict[str, str]]:
+    import os
     from gateway.session_context import get_session_env
-    origin_platform = get_session_env("HERMES_SESSION_PLATFORM")
-    origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID")
+
+    # Dedicated cron-origin override, preferred over the session platform.
+    # Embedders that don't run the gateway (e.g. the Lucaryin bridge) must be
+    # able to name a cron's delivery origin WITHOUT setting
+    # HERMES_SESSION_PLATFORM — that variable also drives send_message
+    # availability, skill-surface detection, TTS format and terminal-watcher
+    # routing, so overloading it to mean "cron origin" would change agent
+    # behavior on every turn. These vars are read only here.
+    origin_platform = (
+        os.environ.get("HERMES_CRON_ORIGIN_PLATFORM")
+        or get_session_env("HERMES_SESSION_PLATFORM")
+    )
+    origin_chat_id = (
+        os.environ.get("HERMES_CRON_ORIGIN_CHAT_ID")
+        or get_session_env("HERMES_SESSION_CHAT_ID")
+    )
     if origin_platform and origin_chat_id:
-        thread_id = get_session_env("HERMES_SESSION_THREAD_ID") or None
+        thread_id = (
+            os.environ.get("HERMES_CRON_ORIGIN_THREAD_ID")
+            or get_session_env("HERMES_SESSION_THREAD_ID")
+            or None
+        )
         if thread_id:
             logger.debug(
                 "Cron origin captured thread_id=%s for %s:%s",
@@ -82,7 +101,11 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
         return {
             "platform": origin_platform,
             "chat_id": origin_chat_id,
-            "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
+            "chat_name": (
+                os.environ.get("HERMES_CRON_ORIGIN_CHAT_NAME")
+                or get_session_env("HERMES_SESSION_CHAT_NAME")
+                or None
+            ),
             "thread_id": thread_id,
         }
     return None
