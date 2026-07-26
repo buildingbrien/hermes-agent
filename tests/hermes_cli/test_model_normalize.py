@@ -191,3 +191,36 @@ class TestDetectVendor:
     ])
     def test_detects_known_vendors(self, model, expected):
         assert detect_vendor(model) == expected
+
+
+class TestDeepSeekV4:
+    """DeepSeek deprecated deepseek-chat/deepseek-reasoner (HTTP 400); the API
+    now requires deepseek-v4-pro / deepseek-v4-flash. Every normalization path
+    must land on a supported name — this broke every customer's bots when the
+    deprecation went live (2026-07-26)."""
+
+    def test_never_returns_deprecated_names(self):
+        from hermes_cli.model_normalize import _normalize_for_deepseek
+        for m in ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro",
+                  "deepseek/deepseek-chat", "deepseek", "r1", "think", ""]:
+            out = _normalize_for_deepseek(m)
+            assert out in ("deepseek-v4-pro", "deepseek-v4-flash"), \
+                f"{m!r} -> {out!r} is not a supported DeepSeek model"
+
+    def test_legacy_and_default_map_to_pro(self):
+        from hermes_cli.model_normalize import _normalize_for_deepseek
+        assert _normalize_for_deepseek("deepseek-chat") == "deepseek-v4-pro"
+        assert _normalize_for_deepseek("anything") == "deepseek-v4-pro"
+
+    def test_flash_keywords_map_to_flash(self):
+        from hermes_cli.model_normalize import _normalize_for_deepseek
+        assert _normalize_for_deepseek("flash") == "deepseek-v4-flash"
+        assert _normalize_for_deepseek("deepseek-fast") == "deepseek-v4-flash"
+
+    def test_provider_default_is_v4_pro(self):
+        from hermes_cli.model_switch import MODEL_ALIASES
+        ident = MODEL_ALIASES.get("deepseek")
+        assert ident is not None
+        # family/default model must be a supported name, not the dead one
+        fam = getattr(ident, "family", None) or getattr(ident, "model", None)
+        assert fam == "deepseek-v4-pro", f"deepseek provider default is {fam!r}"
