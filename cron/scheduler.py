@@ -366,13 +366,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     if wrap_response:
         task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
+        # No raw job ids or "cronjob" plumbing at the customer — the header
+        # names the task in plain language; management goes through chat or
+        # the Jobs panel (Lucaryin) by NAME, never by id.
         delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
+            f"⏰ {task_name} — scheduled update\n"
             f"-------------\n\n"
             f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+            f"To pause or change this, just tell me (e.g. \"pause {task_name}\")."
         )
     else:
         delivery_content = content
