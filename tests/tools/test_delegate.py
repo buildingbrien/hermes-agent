@@ -114,6 +114,44 @@ class TestDelegateTask(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("depth limit", result["error"].lower())
 
+    def test_session_budget_blocks_runaway(self):
+        """The guard that was missing on 2026-07-04: depth and per-turn
+        breadth were enforced, but nothing capped delegations ACROSS turns —
+        a customer machine ran 2,895 of them in six hours."""
+        parent = _make_mock_parent()
+        parent._delegation_budget = {"spent": 60}
+        result = json.loads(delegate_task(goal="more research", parent_agent=parent))
+        self.assertIn("error", result)
+        self.assertIn("budget exhausted", result["error"].lower())
+        # The message must tell the model what to do instead of retrying.
+        self.assertIn("do not delegate again", result["error"].lower())
+
+    def test_session_budget_under_limit_not_blocked(self):
+        """Under budget, the guard must not fire (asserted on the guard
+        itself — the full delegate path needs real child agents)."""
+        from tools.delegate_tool import _get_max_session_delegations, _session_budget
+        parent = _make_mock_parent()
+        parent._delegation_budget = {"spent": 5}
+        self.assertLess(_session_budget(parent)["spent"], _get_max_session_delegations())
+
+    def test_session_budget_can_be_disabled(self):
+        from tools.delegate_tool import _get_max_session_delegations
+        with patch.dict(os.environ, {"DELEGATION_MAX_SESSION_DELEGATIONS": "0"}):
+            with patch("tools.delegate_tool._load_config", return_value={}):
+                self.assertEqual(_get_max_session_delegations(), 0)
+
+    def test_session_budget_is_shared_with_children(self):
+        """Children must draw from the parent's pool, not a fresh one —
+        otherwise each level resets the cap and the tree is unbounded."""
+        from tools.delegate_tool import _session_budget
+        parent = _make_mock_parent()
+        budget = _session_budget(parent)
+        budget["spent"] += 3
+        child = _make_mock_parent(depth=1)
+        child._delegation_budget = parent._delegation_budget
+        self.assertIs(_session_budget(child), budget)
+        self.assertEqual(_session_budget(child)["spent"], 3)
+
     def test_no_goal_or_tasks(self):
         parent = _make_mock_parent()
         result = json.loads(delegate_task(parent_agent=parent))

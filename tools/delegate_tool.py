@@ -52,6 +52,54 @@ _TOOLSET_LIST_STR = ", ".join(f"'{n}'" for n in _SUBAGENT_TOOLSETS)
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 
+# Cumulative per-session delegation budget.
+#
+# Depth (<=2) and per-turn breadth (<=3) were already enforced, but nothing
+# capped delegations ACROSS turns: an agent working a large task can legally
+# spawn 3 children per turn, forever. A customer machine did exactly that on
+# 2026-07-04 — one research request ("execute ALL 14 queries, report EVERY
+# result") produced 2,895 delegations and 19,577 messages in six hours,
+# unattended, on an unmetered token budget.
+#
+# The budget is shared by every agent in a session (children inherit the
+# parent's counter object), so a subagent's children draw from the same pool.
+_DEFAULT_MAX_SESSION_DELEGATIONS = 60
+
+
+def _get_max_session_delegations() -> int:
+    """delegation.max_session_delegations from config, else the
+    DELEGATION_MAX_SESSION_DELEGATIONS env var, else the default (60).
+    0 or negative disables the cap (escape hatch for deliberate big jobs)."""
+    cfg = _load_config()
+    val = (cfg or {}).get("max_session_delegations")
+    if val is None:
+        env_val = os.getenv("DELEGATION_MAX_SESSION_DELEGATIONS")
+        val = env_val if env_val is not None else _DEFAULT_MAX_SESSION_DELEGATIONS
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid max_session_delegations %r — using default %d",
+            val, _DEFAULT_MAX_SESSION_DELEGATIONS,
+        )
+        return _DEFAULT_MAX_SESSION_DELEGATIONS
+
+
+def _session_budget(parent_agent) -> dict:
+    """The session-wide delegation counter, created on first use and shared
+    with every descendant (see the child construction below)."""
+    budget = getattr(parent_agent, "_delegation_budget", None)
+    # isinstance rather than a None check: the attribute may exist but hold
+    # something that isn't a counter (a mock in tests, a stale value after a
+    # refactor). A non-dict must never crash a delegation.
+    if not isinstance(budget, dict) or "spent" not in budget:
+        budget = {"spent": 0}
+        try:
+            parent_agent._delegation_budget = budget
+        except Exception:
+            pass  # read-only agent object: budget just won't persist
+    return budget
+
 
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
@@ -406,6 +454,9 @@ def _build_child_agent(
     child._print_fn = getattr(parent_agent, '_print_fn', None)
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
+    # Share the session delegation budget (same dict, not a copy) so the whole
+    # tree draws from one pool rather than each level getting a fresh one.
+    child._delegation_budget = getattr(parent_agent, '_delegation_budget', None)
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -709,6 +760,24 @@ def delegate_task(
             )
         })
 
+    # Cumulative session budget — the guard that was missing when a customer
+    # machine spent six unattended hours delegating.
+    _max_session = _get_max_session_delegations()
+    _budget = _session_budget(parent_agent)
+    if _max_session > 0 and _budget["spent"] >= _max_session:
+        logger.warning(
+            "Session delegation budget exhausted (%d) — refusing further "
+            "delegate_task calls", _max_session,
+        )
+        return json.dumps({
+            "error": (
+                f"Session delegation budget exhausted ({_max_session} "
+                "subagent tasks already run in this session). Do NOT delegate "
+                "again — finish the job with the results you already have, "
+                "or tell the user which parts you could not complete and why."
+            )
+        })
+
     # Load config
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
@@ -753,6 +822,9 @@ def delegate_task(
     results = []
 
     n_tasks = len(task_list)
+    # Spend from the session budget now that the task list is final. Counted
+    # even if a child later fails — the cost was incurred either way.
+    _budget["spent"] += n_tasks
     # Track goal labels for progress display (truncated for readability)
     task_labels = [t["goal"][:40] for t in task_list]
 
