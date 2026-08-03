@@ -2,12 +2,16 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    # prod-hardening/base is the branch the desktop app actually bundles at
+    # build time.  It was absent here, so the branch that ships was the one
+    # branch never tested — and on 2026-08-02 a delegation fix landed on main,
+    # passed CI, and shipped in nothing.  Test what we ship.
+    branches: [main, prod-hardening/base]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
   pull_request:
-    branches: [main]
+    branches: [main, prod-hardening/base]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
