@@ -288,3 +288,66 @@ class TestOriginFromEnv:
         from tools.cronjob_tools import _origin_from_env
         origin = _origin_from_env()
         assert origin["platform"] == "telegram" and origin["chat_id"] == "tg-7"
+
+
+# =========================================================================
+# Update read-back — a claim of success must be checkable
+# =========================================================================
+
+
+class TestUpdateReadBack:
+    """A customer asked twice for named sources in his morning brief.  The
+    agent researched them live, the conversation read as success, and the
+    stored job was never touched.  Nothing in the tool's reply could have
+    exposed that: `prompt_preview` truncates at 100 characters, and his
+    prompt was 405, so the response is byte-identical whether the edit
+    landed or not.  These tests keep that hole closed."""
+
+    def _make_job(self, monkeypatch, tmp_path, prompt):
+        import cron.jobs as jobs_mod
+        monkeypatch.setattr(jobs_mod, "JOBS_FILE", tmp_path / "jobs.json", raising=False)
+        created = json.loads(
+            cronjob(action="create", name="brief", prompt=prompt, schedule="0 8 * * *")
+        )
+        assert created.get("success"), created
+        return created["job"]["job_id"]
+
+    def test_update_returns_persisted_prompt(self, monkeypatch, tmp_path):
+        long_prefix = "You are an executive assistant. " + "x" * 120
+        job_id = self._make_job(monkeypatch, tmp_path, long_prefix + " Cover: news.")
+
+        new_prompt = long_prefix + " Cover: news — prioritize The New York Times."
+        result = json.loads(cronjob(action="update", job_id=job_id, prompt=new_prompt))
+
+        assert result["success"] is True
+        # The full stored prompt comes back, so the edit is verifiable past
+        # the 100-char preview cutoff.
+        assert result["persisted_prompt"] == new_prompt
+        assert result["prompt_written"] is True
+        assert "New York Times" in result["persisted_prompt"]
+
+    def test_prompt_len_exposes_change_beyond_preview(self, monkeypatch, tmp_path):
+        base = "A" * 300
+        job_id = self._make_job(monkeypatch, tmp_path, base)
+
+        before = json.loads(cronjob(action="list"))
+        result = json.loads(cronjob(action="update", job_id=job_id, prompt=base + " ESPN"))
+
+        assert result["job"]["prompt_len"] == len(base) + 5
+        # The preview alone is unchanged — which is exactly why it is not
+        # sufficient evidence on its own.
+        assert result["job"]["prompt_preview"] == before["jobs"][0]["prompt_preview"]
+
+    def test_non_prompt_update_still_returns_job(self, monkeypatch, tmp_path):
+        job_id = self._make_job(monkeypatch, tmp_path, "do the thing")
+        result = json.loads(cronjob(action="update", job_id=job_id, name="renamed"))
+
+        assert result["success"] is True
+        assert result["job"]["name"] == "renamed"
+        # No prompt change, so no read-back payload is promised.
+        assert "persisted_prompt" not in result
+
+    def test_missing_job_reports_failure(self, monkeypatch, tmp_path):
+        self._make_job(monkeypatch, tmp_path, "do the thing")
+        result = json.loads(cronjob(action="update", job_id="nope", prompt="x"))
+        assert result.get("success") is False

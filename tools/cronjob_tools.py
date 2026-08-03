@@ -221,6 +221,11 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "skill": skills[0] if skills else None,
         "skills": skills,
         "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
+        # A preview truncated at 100 chars cannot distinguish an edit that
+        # landed from one that silently did nothing — most prompts are longer
+        # than that, and edits usually land past the cutoff.  The length is
+        # the cheap half of the answer; update returns the full prompt.
+        "prompt_len": len(prompt),
         "model": job.get("model"),
         "provider": job.get("provider"),
         "base_url": job.get("base_url"),
@@ -399,7 +404,26 @@ def cronjob(
             if not updates:
                 return tool_error("No updates provided.", success=False)
             updated = update_job(job_id, updates)
-            return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
+            if updated is None:
+                return tool_error(f"Job '{job_id}' not found", success=False)
+
+            # Read back from disk rather than trusting the in-memory object we
+            # just wrote.  A customer asked twice for named sources in his
+            # morning brief; the agent answered the question live and never
+            # persisted the change, and nothing in the tool's reply could have
+            # revealed that.  When the prompt changed, hand back what is
+            # actually stored so a claim of success is checkable.
+            payload: Dict[str, Any] = {"success": True}
+            if "prompt" in updates:
+                persisted = get_job(job_id) or updated
+                payload["job"] = _format_job(persisted)
+                payload["persisted_prompt"] = persisted.get("prompt", "")
+                payload["prompt_written"] = (
+                    persisted.get("prompt", "") == updates["prompt"]
+                )
+            else:
+                payload["job"] = _format_job(updated)
+            return json.dumps(payload, indent=2)
 
         return tool_error(f"Unknown cron action '{action}'", success=False)
 

@@ -190,6 +190,21 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+STANDING_BEHAVIOR_GUIDANCE = (
+    "# Changing standing behavior\n"
+    "When someone asks to change something recurring — what goes in their "
+    "briefing, when a job runs, what you stop doing — satisfying the request "
+    "once is not the job. Persist the change with cronjob(action='update'), "
+    "then confirm from the tool's reply that it actually stuck: check "
+    "prompt_written and read persisted_prompt, not the truncated preview.\n"
+    "Answering live instead of persisting is the failure that costs trust, "
+    "because it looks exactly like success from the other side of the "
+    "conversation — they believe it is configured and find out days later "
+    "that nothing changed. If a change cannot be persisted, say so plainly in "
+    "the same reply rather than delivering the one-off result as if it were "
+    "the standing change."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "
