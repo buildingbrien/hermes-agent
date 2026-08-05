@@ -244,14 +244,19 @@ MEETING_NOTES_SCHEMA = {
     "description": (
         "Check whether a meeting recording's notes are ready, or wrap a call "
         "up now. Use action='status' WHENEVER someone asks about notes from a "
-        "call you dialed into — 'did you get the notes?', 'are the notes "
-        "ready?', 'pull up the notes from that call'. The state tells the "
-        "truth: 'recording' means the call is STILL LIVE and notes are not "
-        "written yet — they are NOT lost, so never say they are; 'processing' "
-        "means transcribing (ready in ~a minute); 'ready' means they are in "
-        "Files. Use action='wrap_up' when the person says the meeting is over "
-        "/ 'wrap up the call' / 'end it and get my notes' — it hangs up and "
-        "transcribes immediately instead of waiting for the call to time out."
+        "meeting call — 'did you get the notes?', 'are the notes ready?', "
+        "'pull up the notes from that call', 'find the transcript from the "
+        "call with <agent>'. This reads the WHOLE MACHINE's meeting notes, so "
+        "use it even when ANOTHER agent (Thoth, etc.) took the call, not just "
+        "your own — do NOT search sessions or files and conclude the notes "
+        "'don't exist'; ask here first. The state tells the truth: 'recording' "
+        "means the call is STILL LIVE and notes are not written yet — they are "
+        "NOT lost, so never say they are; 'processing' means transcribing "
+        "(ready in ~a minute, wait and check again); 'ready' returns the "
+        "transcript_path to read. Use action='wrap_up' when the person says "
+        "the meeting is over / 'wrap up the call' / 'end it and get my notes' "
+        "— it hangs up and transcribes immediately instead of waiting for the "
+        "call to time out."
     ),
     "parameters": {
         "type": "object",
