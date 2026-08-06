@@ -85,8 +85,15 @@ def meeting_notes_tool(args, **kwargs):
 MEETING_NOTES_SCHEMA = {
     "name": "meeting_notes",
     "description": (
-        "Check on, or wrap up, a meeting the fleet phone is taking notes on "
-        "(started with dial_meeting).\n"
+        "Check on, or wrap up, a meeting the fleet phone is taking notes on.\n"
+        "Reads the WHOLE MACHINE's meeting notes, so use it even when ANOTHER "
+        "agent (Thoth, etc.) took the call — not just calls you started. "
+        "Whenever someone asks about notes or a transcript from a meeting "
+        "call, ask HERE FIRST; do NOT search sessions or files and then "
+        "conclude the notes 'don't exist'. (A customer asked one agent for "
+        "the transcript of a call another agent was on; it searched, found "
+        "nothing, and reported the notes missing — the call was still "
+        "recording and they were written minutes later.)\n"
         "action='status' — is the transcript ready? Returns one of: "
         "recording (still on the call — notes come AFTER it ends), processing "
         "(call ended, transcribing now), ready (notes filed), no_audio, "
