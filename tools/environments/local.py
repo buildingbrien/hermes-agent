@@ -202,6 +202,25 @@ def _make_run_env(env: dict) -> dict:
     if "/usr/bin" not in existing_path.split(":"):
         run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
 
+    # ~/.local/bin is where the DESKTOP APP installs the binaries it ships for
+    # the agent — himalaya (fleet email), cloudflared (voice tunnel) — because
+    # customer machines have no Homebrew. It must be on PATH regardless of how
+    # sane the inherited PATH already looks: the check above only fires when
+    # PATH is missing /usr/bin, so a normal-looking PATH was never augmented
+    # and the agent could not see tools we installed for it.
+    #
+    # 2026-08-04, a real customer machine: the agent ran `himalaya` to read a
+    # meeting invite the user had just forwarded, got "command not found"
+    # (exit 127), and had to improvise a full path. Same root cause as the
+    # app's own binary resolver missing ~/.local/bin (lucaryin-ai 8754058).
+    #
+    # Uses the REAL home, not any per-profile HOME override applied below —
+    # the binaries live in the actual user's directory.
+    local_bin = os.path.join(os.path.expanduser("~"), ".local", "bin")
+    current = run_env.get("PATH", "")
+    if local_bin not in current.split(":"):
+        run_env["PATH"] = f"{local_bin}:{current}" if current else local_bin
+
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
     # npm …) into {HERMES_HOME}/home/ when that directory exists.  Only the
     # subprocess sees the override — the Python process keeps the real HOME.
