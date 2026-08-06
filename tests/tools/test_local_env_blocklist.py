@@ -313,10 +313,20 @@ class TestSanePathIncludesHomebrew:
         assert "/opt/homebrew/sbin" in result["PATH"]
 
     def test_make_run_env_does_not_duplicate_on_full_path(self):
-        """When PATH already has /usr/bin, _make_run_env should not append."""
+        """When PATH already has /usr/bin, _SANE_PATH is not appended.
+
+        ~/.local/bin IS still prepended — the app installs himalaya and
+        cloudflared there on customer machines (no Homebrew), and the old
+        behavior of leaving a healthy-looking PATH completely untouched meant
+        the agent got "command not found" for tools we had installed for it
+        (real customer machine, 2026-08-04).
+        """
         from tools.environments.local import _make_run_env
         full_env = {"PATH": "/usr/bin:/bin"}
         with patch.dict(os.environ, full_env, clear=True):
             result = _make_run_env({})
-        # Should keep existing PATH unchanged
-        assert result["PATH"] == "/usr/bin:/bin"
+        local_bin = os.path.join(os.path.expanduser("~"), ".local", "bin")
+        assert result["PATH"] == f"{local_bin}:/usr/bin:/bin"
+        # _SANE_PATH must NOT have been appended — that is the no-duplication
+        # guarantee this test exists for.
+        assert "/opt/homebrew/bin" not in result["PATH"]
