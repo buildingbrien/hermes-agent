@@ -214,6 +214,29 @@ class ToolRegistry:
                         name, toolset, existing.toolset,
                     )
                     return
+            elif existing is not None:
+                # SAME toolset. The shadow check above only compares toolsets,
+                # so two different modules claiming one name inside the same
+                # toolset overwrote each other in total silence — import order
+                # decided which implementation the agent actually got.
+                #
+                # That happened for real: 'meeting_notes' was registered by
+                # both tools/meeting_notes.py and tools/dial_meeting.py; the
+                # alphabetically-later module won, silently shadowing the copy
+                # that carried a bug fix, so the fix was inert in production
+                # with nothing logged anywhere (2026-08-05).
+                #
+                # A module re-importing itself is benign; two DIFFERENT modules
+                # are a bug that must be visible.
+                old_mod = getattr(existing.handler, "__module__", "?")
+                new_mod = getattr(handler, "__module__", "?")
+                if old_mod != new_mod:
+                    logger.error(
+                        "DUPLICATE tool registration: '%s' (toolset '%s') "
+                        "defined in BOTH %s and %s — %s wins by import order. "
+                        "One implementation is dead code; delete it.",
+                        name, toolset, old_mod, new_mod, new_mod,
+                    )
             self._tools[name] = ToolEntry(
                 name=name,
                 toolset=toolset,
