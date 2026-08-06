@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -525,15 +526,38 @@ WSL_ENVIRONMENT_HINT = (
 )
 
 
+MACOS_SHELL_HINT = (
+    "# Shell on macOS\n"
+    "Quote every path. User directories here have spaces and ampersands "
+    "('Brand Assets', 'Logos & Marketing'), and an unquoted path silently "
+    "splits into separate words — a real run turned one path into "
+    "'Marketing: command not found' and deleted nothing it was asked to. "
+    "Use \"$HOME/Documents/Lucaryin/Brand Assets\", never bare or "
+    "backslash-escaped paths.\n"
+    "This is macOS, not Linux: there is no `free`, `nproc`, `readlink -f`, "
+    "`sed -i` without an argument, or GNU `date -d`. Use `vm_stat`, "
+    "`sysctl -n hw.ncpu`, `sed -i ''`, `date -j`.\n"
+    "A command that prints 'command not found' but exits 0 has still FAILED "
+    "— shell exit status reflects the last command in a chain, so check the "
+    "output, not just the exit code, before reporting success."
+)
+
+
 def build_environment_hints() -> str:
     """Return environment-specific guidance for the system prompt.
 
-    Detects WSL, and can be extended for Termux, Docker, etc.
+    Detects WSL and macOS; can be extended for Termux, Docker, etc.
     Returns an empty string when no special environment is detected.
     """
     hints: list[str] = []
     if is_wsl():
         hints.append(WSL_ENVIRONMENT_HINT)
+    elif sys.platform == "darwin":
+        # Every customer machine is a Mac. Two failure modes seen in real
+        # transcripts: unquoted paths with spaces/ampersands fragmenting into
+        # bogus commands, and Linux-only tools (`free`) being reached for.
+        # Both exited 0, so the agent reported success either way.
+        hints.append(MACOS_SHELL_HINT)
     return "\n\n".join(hints)
 
 
