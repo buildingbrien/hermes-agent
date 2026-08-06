@@ -201,81 +201,6 @@ DIAL_MEETING_SCHEMA = {
 }
 
 
-def meeting_notes_tool(args, **kwargs):
-    """Check the state of a meeting recording, or wrap one up now."""
-    action = (args.get("action") or "status").strip().lower()
-    call_sid = (args.get("call_sid") or "").strip()
-
-    if action in ("wrap_up", "wrapup", "end", "finish"):
-        req = urllib.request.Request(
-            _bridge_url("/api/voice/notetaker/end"),
-            data=json.dumps({"call_sid": call_sid}).encode(),
-            headers=_auth_headers(),
-            method="POST",
-        )
-    else:
-        q = f"?call_sid={call_sid}" if call_sid else ""
-        req = urllib.request.Request(
-            _bridge_url(f"/api/voice/notetaker/status{q}"),
-            headers=_auth_headers(),
-            method="GET",
-        )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        try:
-            detail = json.loads(e.read().decode()).get("error", "")
-        except Exception:
-            detail = ""
-        return tool_error(detail or f"The bridge refused the request (HTTP {e.code}).")
-    except urllib.error.URLError as e:
-        return tool_error(
-            f"Could not reach this machine's bridge ({e.reason}). "
-            "The Lucaryin app needs to be running."
-        )
-    except Exception as e:  # noqa: BLE001
-        return tool_error(f"Could not check the meeting notes: {e}")
-    return json.dumps(result)
-
-
-MEETING_NOTES_SCHEMA = {
-    "name": "meeting_notes",
-    "description": (
-        "Check whether a meeting recording's notes are ready, or wrap a call "
-        "up now. Use action='status' WHENEVER someone asks about notes from a "
-        "meeting call — 'did you get the notes?', 'are the notes ready?', "
-        "'pull up the notes from that call', 'find the transcript from the "
-        "call with <agent>'. This reads the WHOLE MACHINE's meeting notes, so "
-        "use it even when ANOTHER agent (Thoth, etc.) took the call, not just "
-        "your own — do NOT search sessions or files and conclude the notes "
-        "'don't exist'; ask here first. The state tells the truth: 'recording' "
-        "means the call is STILL LIVE and notes are not written yet — they are "
-        "NOT lost, so never say they are; 'processing' means transcribing "
-        "(ready in ~a minute, wait and check again); 'ready' returns the "
-        "transcript_path to read. Use action='wrap_up' when the person says "
-        "the meeting is over / 'wrap up the call' / 'end it and get my notes' "
-        "— it hangs up and transcribes immediately instead of waiting for the "
-        "call to time out."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["status", "wrap_up"],
-                "description": "status = check if notes are ready; wrap_up = end the call now and transcribe.",
-            },
-            "call_sid": {
-                "type": "string",
-                "description": "The call's Twilio SID (from dial_meeting). Omit to use the most recent call.",
-            },
-        },
-        "required": ["action"],
-    },
-}
-
-
 # --- Registry ---
 from tools.registry import registry
 
@@ -285,12 +210,4 @@ registry.register(
     schema=DIAL_MEETING_SCHEMA,
     handler=dial_meeting_tool,
     emoji="📞",
-)
-
-registry.register(
-    name="meeting_notes",
-    toolset="voice",
-    schema=MEETING_NOTES_SCHEMA,
-    handler=meeting_notes_tool,
-    emoji="📝",
 )
