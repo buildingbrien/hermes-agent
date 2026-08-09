@@ -831,6 +831,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # no grants can read and report but not act, which is the right default
     # for a goal-less heartbeat.
     try:
+        # cron_gate ships with hermes-bridge (the app bundle), not with this
+        # tree, so its directory has to reach sys.path BEFORE the import —
+        # the module's own locator cannot help us find the module.
+        import sys as _sys
+        for _cand in (
+            os.environ.get("LUCARYIN_BRIDGE_DIR", ""),
+            "/Applications/Lucaryin AI.app/Contents/Resources/"
+            "app.asar.unpacked/hermes-bridge",
+            os.path.expanduser("~/.lucaryin/hermes-bridge"),
+        ):
+            if _cand and os.path.exists(os.path.join(_cand, "cron_gate.py")):
+                if _cand not in _sys.path:
+                    _sys.path.insert(0, _cand)
+                break
         import cron_gate
         _agent_key = job.get("agent")
         if not _agent_key:
