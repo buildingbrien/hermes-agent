@@ -817,6 +817,43 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # scheduler process — every job this process runs is a cron job.
     os.environ["HERMES_CRON_SESSION"] = "1"
 
+    # ── Approval gate ────────────────────────────────────────────────
+    # The line above was, until 2026-08-09, the whole of "the approval
+    # system applies cron_mode": nothing anywhere read HERMES_CRON_SESSION,
+    # and because cron jobs build AIAgent directly instead of going through
+    # the bridge, no pre_tool_call hook was ever registered for them. Every
+    # scheduled job on every machine ran ungated at any trust level.
+    #
+    # cron_gate installs the same gate the interactive path uses, with
+    # unattended=True. `grants` are the actions this job was authorized to
+    # perform when the user created it — a job does its own work without
+    # asking, and only steps outside that remit stop for a human. A job with
+    # no grants can read and report but not act, which is the right default
+    # for a goal-less heartbeat.
+    try:
+        import cron_gate
+        _agent_key = job.get("agent")
+        if not _agent_key:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                _agent_key = get_active_profile_name() or "thoth"
+            except Exception:
+                _agent_key = "thoth"
+        # The unnamed/"default" profile is Thoth — same convention the bridge
+        # and hub_sync use (`_BRIDGE_PROFILE or "thoth"`). Without this the
+        # gate would look up ask_before config for an agent named "default".
+        if str(_agent_key).lower() in ("", "default", "none"):
+            _agent_key = "thoth"
+        cron_gate.install(
+            agent_key=str(_agent_key).lower(),
+            trust_level=(job.get("trust_level") or "cautious"),
+            grants=(job.get("grants") or []),
+        )
+    except Exception:
+        # Never let gate wiring break job execution — but cron_gate itself
+        # logs CRON UNGATED loudly when it cannot arm, so this is visible.
+        logger.warning("cron approval gate could not be installed", exc_info=True)
+
     try:
         # Inject origin context so the agent's send_message tool knows the chat.
         # Must be INSIDE the try block so the finally cleanup always runs.
