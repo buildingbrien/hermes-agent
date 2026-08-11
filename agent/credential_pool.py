@@ -71,6 +71,13 @@ SUPPORTED_POOL_STRATEGIES = {
 # Provider-supplied reset_at timestamps override these defaults.
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+# Balance errors recover by a human topping up, which can happen at any
+# moment — an hour-long lockout after a 402 is the wrong shape. On
+# 2026-08-11 the fleet's DeepSeek balance was restored at ~14:20 and the
+# 14:30 tick still failed: the credential's cooldown had 32 seconds left,
+# so the run fell over to a fallback provider that was also dry. Five
+# minutes keeps retry pressure trivial while making recovery near-live.
+EXHAUSTED_TTL_402_SECONDS = 5 * 60
 
 # Pool key prefix for custom OpenAI-compatible endpoints.
 # Custom endpoints all share provider='custom' but are keyed by their
@@ -191,6 +198,8 @@ def _exhausted_ttl(error_code: Optional[int]) -> int:
     """Return cooldown seconds based on the HTTP status that caused exhaustion."""
     if error_code == 429:
         return EXHAUSTED_TTL_429_SECONDS
+    if error_code == 402:
+        return EXHAUSTED_TTL_402_SECONDS
     return EXHAUSTED_TTL_DEFAULT_SECONDS
 
 
