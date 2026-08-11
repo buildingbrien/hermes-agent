@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import tempfile
+import time as time_module
 import os
 import re
 import uuid
@@ -740,12 +741,47 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     return due
 
 
+# Retention for saved job output. Nothing ever pruned these: a founder
+# machine reached 20,026 files / 88MB, and a wake-gated */2 job alone writes
+# 720 files a day even when the agent never runs. Customer Minis run for
+# months unattended, so unbounded growth is a when, not an if.
+#
+# Both limits are generous on purpose — output files are the audit trail for
+# "what did my agent do", and deleting recent history to save megabytes would
+# be the wrong trade. Newest are always kept; only the old AND excess go.
+OUTPUT_KEEP_PER_JOB = 500          # newest N files per job
+OUTPUT_KEEP_DAYS = 30              # and nothing younger than this is pruned
+
+
+def _prune_job_output(job_output_dir) -> None:
+    """Best-effort retention sweep for one job's output directory."""
+    try:
+        files = sorted(
+            (p for p in job_output_dir.glob("*.md")),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if len(files) <= OUTPUT_KEEP_PER_JOB:
+            return
+        cutoff = time_module.time() - OUTPUT_KEEP_DAYS * 86400
+        for p in files[OUTPUT_KEEP_PER_JOB:]:
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                continue  # a vanished or locked file is not our problem
+    except Exception:
+        # Retention must never break the save it rides on.
+        logger.debug("output retention sweep failed", exc_info=True)
+
+
 def save_job_output(job_id: str, output: str):
     """Save job output to file."""
     ensure_dirs()
     job_output_dir = OUTPUT_DIR / job_id
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
+    _prune_job_output(job_output_dir)
     
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
