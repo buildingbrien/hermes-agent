@@ -4,6 +4,7 @@ Pure display functions and classes with no AIAgent dependency.
 Used by AIAgent._execute_tool_calls for CLI feedback.
 """
 
+import json
 import logging
 import os
 import sys
@@ -810,6 +811,15 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     """
     if result is None:
         return False, ""
+    if not isinstance(result, str):
+        # Belt-and-suspenders: registry.dispatch normalizes results to
+        # strings, but this sniffer must survive a raw dict regardless —
+        # `result[:500]` on a dict is KeyError(slice) on Python 3.12+, and a
+        # cosmetic helper crashing killed a turn after a real email sent.
+        try:
+            result = json.dumps(result, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            result = str(result)
 
     if tool_name == "terminal":
         data = safe_json_loads(result)
@@ -835,6 +845,18 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
 
 
 def get_cute_tool_message(
+    tool_name: str, args: dict, duration: float, result: str | None = None,
+) -> str:
+    """Non-raising facade — a status line must never kill the turn it reports
+    on (a KeyError here once erased a completed, approved email send)."""
+    try:
+        return _cute_tool_message_unguarded(tool_name, args, duration, result=result)
+    except Exception:
+        logger.debug("cute-message generation failed for %s", tool_name, exc_info=True)
+        return f"| {tool_name}  {duration:.1f}s"
+
+
+def _cute_tool_message_unguarded(
     tool_name: str, args: dict, duration: float, result: str | None = None,
 ) -> str:
     """Generate a formatted tool completion line for CLI quiet mode.

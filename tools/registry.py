@@ -342,11 +342,24 @@ class ToolRegistry:
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+                result = _run_async(entry.handler(args, **kwargs))
+            else:
+                result = entry.handler(args, **kwargs)
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             return json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
+        # Everything downstream — message content, failure sniffing, previews —
+        # assumes tool results are strings. A handler returning a dict leaked
+        # all the way to `result[:500]` in the display layer, which on
+        # Python 3.12+ (hashable slices) raises KeyError(slice(...)) and killed
+        # an entire turn AFTER an approved email had already sent (2026-08-12).
+        # Normalize here, at the single seam every tool passes through.
+        if not isinstance(result, str):
+            try:
+                result = json.dumps(result, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                result = str(result)
+        return result
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)
