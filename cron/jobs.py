@@ -379,6 +379,9 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    job_type: str = "prompt",
+    meeting: Optional[Dict[str, Any]] = None,
+    grants: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -432,6 +435,16 @@ def create_job(
     label_source = (prompt or (normalized_skills[0] if normalized_skills else None)) or "cron job"
     job = {
         "id": job_id,
+        # A plain "prompt" job runs the agent; a "meeting_join" job is executed
+        # deterministically by the scheduler (no model) — see run_meeting_join.
+        "type": (job_type or "prompt"),
+        # Structured payload for non-prompt job types (e.g. meeting_join dial
+        # info). None for ordinary prompt jobs.
+        "meeting": meeting,
+        # Standing authorizations captured when the job was scheduled in an
+        # attended turn; the approval gate / meeting executor honor these so a
+        # future unattended action the user already approved isn't re-asked.
+        "grants": grants or [],
         "name": name or label_source[:50].strip(),
         "prompt": prompt,
         "skills": normalized_skills,

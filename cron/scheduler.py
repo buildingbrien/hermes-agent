@@ -845,6 +845,19 @@ def _wrap_job_output(job_name: str, job_id: str, prompt: str, response: str,
     )
 
 
+def _persist_job_grants(job: dict) -> None:
+    """Write the job's (possibly grant-mutated) state back to the store. Used
+    after a meeting_join consumes its single-use dial grant, so the grant can't
+    be reused across a restart."""
+    from cron.jobs import load_jobs, save_jobs
+    jobs = load_jobs()
+    for i, j in enumerate(jobs):
+        if j.get("id") == job.get("id"):
+            jobs[i]["grants"] = job.get("grants", [])
+            save_jobs(jobs)
+            return
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -1325,7 +1338,20 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # One-shot jobs are left alone so they can retry on restart.
                 advance_next_run(job["id"])
 
-                success, output, final_response, error = run_job(job)
+                if job.get("type") == "meeting_join":
+                    # Deterministic dial — no model. See cron/meeting_join.py.
+                    from cron.meeting_join import run_meeting_join
+                    _mj_agent = str(job.get("agent") or "thoth").lower() or "thoth"
+                    success, output, final_response, error = run_meeting_join(job, _mj_agent)
+                    # The executor consumes a single-use grant in-place; persist
+                    # the mutated job so a restart can't re-dial on the same grant.
+                    try:
+                        _persist_job_grants(job)
+                    except Exception:
+                        logger.warning("could not persist consumed meeting grant for %s",
+                                       job.get("id"), exc_info=True)
+                else:
+                    success, output, final_response, error = run_job(job)
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
