@@ -1518,8 +1518,10 @@ class TestLucaryinDelivery:
         assert appended["session_id"] == "sess-xyz"
         assert appended["role"] == "assistant"
         assert "Your brief for today." in appended["content"]
-        # Uses the same cron wrapper as messenger deliveries.
-        assert "Cronjob Response: morning-brief" in appended["content"]
+        # The human-readable wrapper: names the job and offers the pause
+        # affordance (replaced the old "Cronjob Response:" header).
+        assert "morning-brief — scheduled update" in appended["content"]
+        assert "pause" in appended["content"].lower()
 
     def test_writes_flush_hint_for_mobile(self, monkeypatch, tmp_path):
         job = {

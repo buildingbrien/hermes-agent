@@ -118,6 +118,7 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     body = args.get("body") or ""
     attachments = _as_list(args.get("attachments"))
     account = (args.get("account") or "fleet").strip()
+    draft = bool(args.get("draft"))
 
     if not to:
         return {"error": "No recipient. Pass 'to' as an address or list of addresses."}
@@ -145,22 +146,49 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     except (FileNotFoundError, ValueError) as e:
         return {"error": str(e)}
 
+    # draft:true saves to the account's Drafts folder instead of sending —
+    # the user reviews and presses send in their own mail client. Addressed
+    # and validated identically, so "turn this draft into a send" is only a
+    # flag flip away.
+    if draft:
+        cmd = [binary, "message", "save", "-a", account, "--folder", "Drafts"]
+        verb = "Saving the draft"
+    else:
+        cmd = [binary, "message", "send", "-a", account]
+        verb = "Sending"
+
     try:
         proc = subprocess.run(
-            [binary, "message", "send", "-a", account],
+            cmd,
             input=msg.as_bytes(),
             capture_output=True,
             timeout=SEND_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
-        return {"error": f"Sending timed out after {SEND_TIMEOUT_S}s — the message may "
-                         f"or may not have gone out. Check the Sent folder before retrying."}
+        return {"error": f"{verb} timed out after {SEND_TIMEOUT_S}s — the message may "
+                         f"or may not have gone through. Check the "
+                         f"{'Drafts' if draft else 'Sent'} folder before retrying."}
     except Exception as e:  # noqa: BLE001 — surface the real reason
         return {"error": f"Could not run himalaya: {e}"}
 
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or b"").decode(errors="replace").strip()
-        return {"error": f"Send failed: {detail[:400] or 'himalaya exited non-zero'}"}
+        return {"error": f"{verb} failed: {detail[:400] or 'himalaya exited non-zero'}"}
+
+    if draft:
+        return {
+            "drafted": True,
+            "sent": False,
+            "to": to,
+            "cc": cc,
+            "subject": subject,
+            "attachments": [os.path.basename(a) for a in attachments],
+            "account": account,
+            "summary": (
+                f"Saved “{subject}” to the {account} Drafts folder, addressed to "
+                f"{', '.join(to)} — nothing was sent; the user reviews and sends it."
+            ),
+        }
 
     recipients = len(to) + len(cc) + len(bcc)
     return {
@@ -219,6 +247,16 @@ EMAIL_SEND_SCHEMA = {
             "from": {
                 "type": "string",
                 "description": "Optional explicit From header, e.g. 'Lucaryin Fleet <fleet-001@lucaryin.com>'.",
+            },
+            "draft": {
+                "type": "boolean",
+                "description": (
+                    "When true, save the fully addressed message to the "
+                    "account's Drafts folder instead of sending — the user "
+                    "reviews and sends it from their own mail client. Use "
+                    "this when the user says 'draft it', wants to review "
+                    "wording first, or the send feels consequential."
+                ),
             },
         },
         "required": ["to", "subject", "body"],

@@ -16,6 +16,7 @@ import logging
 import os
 import subprocess
 import sys
+import time
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -754,6 +755,57 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     return "\n".join(parts)
 
 
+def _await_agent_result(future, agent, inactivity_limit=None, wall_clock_limit=None,
+                        poll_interval=5.0, started_at=None):
+    """Wait for an agent run under two independent caps.
+
+    Returns (result, timeout_kind) where timeout_kind is None on completion,
+    "inactivity" when the agent went quiet, or "wall_clock" when the run
+    exceeded its total allowance regardless of activity.
+
+    Both caps exist for different failure modes. Inactivity catches a hung
+    API call or stuck tool. The wall clock catches the opposite: on
+    2026-08-11 a heartbeat streamed happily for 26 minutes — never idle for
+    even a second — while every other job on this machine's serial cron
+    queue sat blocked behind it. An agent that is busy forever is just as
+    dead to the queue as one that is hung.
+    """
+    if started_at is None:
+        started_at = time.time()
+    if inactivity_limit is None and wall_clock_limit is None:
+        return future.result(), None
+    while True:
+        done, _ = concurrent.futures.wait({future}, timeout=poll_interval)
+        if done:
+            return future.result(), None
+        if wall_clock_limit is not None and (time.time() - started_at) >= wall_clock_limit:
+            return None, "wall_clock"
+        if inactivity_limit is not None:
+            idle_secs = 0.0
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    idle_secs = agent.get_activity_summary().get(
+                        "seconds_since_activity", 0.0)
+                except Exception:
+                    pass
+            if idle_secs >= inactivity_limit:
+                return None, "inactivity"
+
+
+def _get_wall_clock_limit(job: dict):
+    """Per-job wall_clock_seconds, else HERMES_CRON_WALL_CLOCK, else 45 min.
+    0 (either source) = unlimited."""
+    for raw in (job.get("wall_clock_seconds"), os.getenv("HERMES_CRON_WALL_CLOCK")):
+        if raw is None or raw == "":
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        return value if value > 0 else None
+    return 2700.0
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -1017,45 +1069,44 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # _touch_activity() on every tool call, API call, and stream delta).
         _cron_timeout = float(os.getenv("HERMES_CRON_TIMEOUT", 600))
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-        _POLL_INTERVAL = 5.0
+        _cron_wall_limit = _get_wall_clock_limit(job)
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
+        _run_started = time.time()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
-        _inactivity_timeout = False
         try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — just wait for the result.
-                result = _cron_future.result()
-            else:
-                result = None
-                while True:
-                    done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
-                    )
-                    if done:
-                        result = _cron_future.result()
-                        break
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
-                        break
+            result, _timeout_kind = _await_agent_result(
+                _cron_future, agent,
+                inactivity_limit=_cron_inactivity_limit,
+                wall_clock_limit=_cron_wall_limit,
+                started_at=_run_started,
+            )
         except Exception:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
 
-        if _inactivity_timeout:
+        if _timeout_kind == "wall_clock":
+            _elapsed = time.time() - _run_started
+            logger.error(
+                "Job '%s' ran %.0fs of wall clock (limit %.0fs) without "
+                "finishing — killed so it stops blocking the cron queue",
+                job_name, _elapsed, _cron_wall_limit,
+            )
+            if hasattr(agent, "interrupt"):
+                agent.interrupt("Cron job timed out (wall clock)")
+            raise TimeoutError(
+                f"Cron job '{job_name}' ran {int(_elapsed)}s of wall clock "
+                f"(limit {int(_cron_wall_limit)}s) without finishing. The job "
+                f"was still active — consider a smaller scope, or raise "
+                f"wall_clock_seconds on the job if it legitimately needs longer."
+            )
+
+        if _timeout_kind == "inactivity":
             # Build diagnostic summary from the agent's activity tracker.
             _activity = {}
             if hasattr(agent, "get_activity_summary"):
