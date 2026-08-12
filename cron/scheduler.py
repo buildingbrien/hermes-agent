@@ -806,6 +806,45 @@ def _get_wall_clock_limit(job: dict):
     return 2700.0
 
 
+# Runtime-emitted sentinels that mean the turn failed even though the agent
+# returned them as ordinary text instead of raising. Anchored at the START of
+# the response so a job legitimately *discussing* an error isn't misjudged.
+_RESPONSE_FAILURE_PREFIXES = (
+    "API call failed after",
+    "Error during OpenAI-compatible API call",
+    "Error executing tool",
+    "All API providers failed",
+    "Provider error:",
+)
+
+
+def _response_failure_reason(final_response: str) -> Optional[str]:
+    """Return a short reason when a final response is itself a failure
+    sentinel, else None. Only the leading line is inspected."""
+    head = (final_response or "").strip()
+    if not head:
+        return None
+    first_line = head.splitlines()[0].strip()
+    for prefix in _RESPONSE_FAILURE_PREFIXES:
+        if first_line.startswith(prefix):
+            return first_line[:200]
+    return None
+
+
+def _wrap_job_output(job_name: str, job_id: str, prompt: str, response: str,
+                     schedule_display: str = "N/A") -> str:
+    """The standard cron output document. Shared so the success and
+    response-failure paths render identically."""
+    return (
+        f"# Cron Job: {job_name}\n\n"
+        f"**Job ID:** {job_id}\n"
+        f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"**Schedule:** {schedule_display}\n\n"
+        f"## Prompt\n\n{prompt}\n\n"
+        f"## Response\n\n{response if response else '(No response generated)'}\n"
+    )
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -1139,6 +1178,26 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
+
+        # The agent swallows some failures (a spent API budget, a provider
+        # outage) and returns the error AS its final text instead of raising.
+        # Without this the run counts as "ok": the 9:09 Heartbeat whose whole
+        # response was "API call failed after 3 retries" showed green, the
+        # Errored filter said "none", and the consecutive-failure alert never
+        # armed. A run whose entire output is a runtime failure sentinel is a
+        # failed run.
+        _resp_error = _response_failure_reason(final_response)
+        if _resp_error:
+            logger.warning("Job '%s' response is a failure signal: %s", job_name, _resp_error)
+            if _p7_task_end:
+                try:
+                    _p7_task_end(_cron_session_id, "failed")
+                except Exception:
+                    pass
+            return False, _wrap_job_output(
+                job_name, job_id, prompt, final_response,
+                job.get("schedule_display", "N/A"),
+            ), "", _resp_error
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
