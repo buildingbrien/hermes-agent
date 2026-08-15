@@ -213,6 +213,31 @@ def browser_cdp(
     """
     del task_id  # unused — stateless
 
+    # ── Session-material denylist (Lucaryin UI-access doctrine, 2026-08-15) ──
+    # The agent may USE a signed-in browser session; it may never EXTRACT it.
+    # Reading cookies/storage would turn a non-portable local capability into
+    # a portable secret — denied structurally, no approval path. See
+    # lucaryin-ai/docs/ui-access-scope-2026-08-14.md (hard condition 1).
+    _m = (method or "").strip().lower()
+    _SESSION_MATERIAL = (
+        "network.getcookies", "network.getallcookies", "network.setcookie",
+        "network.setcookies", "network.clearbrowsercookies",
+        "page.getcookies", "page.deletecookie",
+        "storage.getcookies", "storage.setcookies", "storage.clearcookies",
+        "storage.getstorageitems", "domstorage.getdomstorageitems",
+        "domstorage.enable",
+    )
+    if _m in _SESSION_MATERIAL:
+        return json.dumps({
+            "error": (
+                f"CDP method '{method}' is blocked: browser session material "
+                "(cookies/storage) is structurally unreachable to agents. "
+                "You can USE the signed-in session by driving pages; you can "
+                "never read or export its credentials."
+            ),
+            "blocked": "session_material",
+        })
+
     if not method or not isinstance(method, str):
         return tool_error(
             "'method' is required (e.g. 'Target.getTargets')",

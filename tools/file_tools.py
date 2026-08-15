@@ -367,10 +367,27 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         _blocked_dirs = [
             _hermes_home / "skills" / ".hub" / "index-cache",
             _hermes_home / "skills" / ".hub",
+            # Lucaryin UI-access doctrine (2026-08-15): the agent-browser
+            # profile holds the customer's signed-in session material
+            # (cookie store, tokens). Agents may USE those sessions via the
+            # browser tools — never read the material itself. Structural
+            # deny, no approval path.
+            Path.home() / ".lucaryin" / "agent-browser",
         ]
+        _agent_browser_dir = Path.home() / ".lucaryin" / "agent-browser"
         for _blocked in _blocked_dirs:
             try:
                 _resolved.relative_to(_blocked)
+                if _blocked == _agent_browser_dir:
+                    return json.dumps({
+                        "error": (
+                            f"Access denied: {path} is inside the agent-browser "
+                            "profile, which holds the user's signed-in session "
+                            "material. Session material is structurally "
+                            "unreachable — use the browser tools to operate "
+                            "signed-in sites instead."
+                        )
+                    })
                 return json.dumps({
                     "error": (
                         f"Access denied: {path} is an internal Hermes cache file "
