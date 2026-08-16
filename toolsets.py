@@ -167,8 +167,19 @@ TOOLSETS = {
     },
     
     "memory": {
-        "description": "Persistent memory across sessions (personal notes + user profile)",
-        "tools": ["memory"],
+        "description": "Persistent memory across sessions (personal notes + user "
+                       "profile) plus read access to the compiled long-term brain",
+        # gbrain_search/gbrain_read register with toolset="memory" (see
+        # tools/gbrain_tool.py), but registration does NOT grant exposure —
+        # resolve_toolset() returns exactly this list, so a tool that registers
+        # into an EXISTING toolset without being named here is silently
+        # invisible to every agent. That is what happened: v4.6.38 shipped
+        # "agents can finally read gbrain" and on 2026-08-16 both Ptah and
+        # Neith, asked directly which tools they had, listed ask_agent and
+        # fleet_send and no gbrain at all. 854 compiled pages, unreadable.
+        # (ask_agent escaped this only because "fleet" is not a declared
+        # toolset, so it never hit this filter.)
+        "tools": ["memory", "gbrain_search", "gbrain_read"],
         "includes": []
     },
     
