@@ -8,6 +8,8 @@ Tracks processes spawned via terminal(background=true), providing:
   - Process killing
   - Crash recovery via JSON checkpoint file
   - Session-scoped tracking for gateway reset protection
+  - Durable lifecycle records: status/exit_code/ended_at survive the process
+    that launched them, and dead PIDs are reconciled when the registry is READ
 
 Background processes execute THROUGH the environment interface -- nothing
 runs on the host machine unless TERMINAL_ENV=local. For Docker, Singularity,
@@ -43,6 +45,7 @@ import uuid
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _sanitize_subprocess_env
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
@@ -63,6 +66,33 @@ WATCH_MAX_PER_WINDOW = 8        # Max notifications delivered per window
 WATCH_WINDOW_SECONDS = 10       # Rolling window length
 WATCH_OVERLOAD_KILL_SECONDS = 45  # Sustained overload duration before disabling watch
 
+# Lifecycle vocabulary.  `status` in poll()/list_sessions() stays "running"/
+# "exited" for backwards compatibility (gateway/run.py, tui_gateway/server.py
+# and cli.py all filter on those exact strings) -- these values live in the
+# separate `lifecycle` field and in the on-disk records.
+LIFECYCLE_RUNNING = "running"
+LIFECYCLE_EXITED = "exited"                    # we observed the exit, exit_code is real
+LIFECYCLE_KILLED = "killed"                    # we sent the signal ourselves
+LIFECYCLE_FINISHED_UNKNOWN = "finished_unknown"  # PID is gone but nobody saw it go
+
+# Exit records outlive the in-memory ProcessSession objects.  FINISHED_TTL_SECONDS
+# (30 min) is the right window for "poll the thing I just started"; it is far too
+# short for the failure this file exists to prevent -- on 2026-08-16 Ptah's
+# focus_group.py had been dead for over an hour and nothing on disk said so, so
+# when the founder asked "how is the project going" the agent had no record at
+# all and invented one.  A later session must still be able to answer.
+EXIT_RECORD_TTL_SECONDS = 7 * 24 * 3600
+MAX_EXIT_RECORDS = 100
+
+# Where a finished process's output tail is parked so a later session (which
+# holds none of the in-memory rolling buffer) can actually read what happened.
+# BLAST RADIUS: this writes command output to the HOST disk, including output
+# produced inside a sandbox.  Kept deliberately narrow -- 0600 files in a 0700
+# directory under the hermes home (same trust boundary as processes.json, which
+# is already 0600), only the tail, never the full buffer, and only on exit.
+PROCESS_LOG_DIR = get_hermes_home() / "process-logs"
+OUTPUT_TAIL_CHARS = 32_000
+
 
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
@@ -73,6 +103,21 @@ def format_uptime_short(seconds: int) -> str:
         return f"{mins}m {secs}s"
     hours, mins = divmod(mins, 60)
     return f"{hours}h {mins}m"
+
+
+def _iso(ts: Optional[float]) -> Optional[str]:
+    """Local-time ISO string for a timestamp, or None. Never raises on junk."""
+    if not ts:
+        return None
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(float(ts)))
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _output_log_path(session_id: str) -> Path:
+    """Host path where a background process's output tail is parked on exit."""
+    return PROCESS_LOG_DIR / f"{session_id}.log"
 
 
 @dataclass
@@ -93,6 +138,16 @@ class ProcessSession:
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+    # Lifecycle -- written when the process ENDS, not only when it launches.
+    lifecycle: str = ""                         # "" while running; LIFECYCLE_* once finished
+    ended_at: Optional[float] = None            # Set ONLY when the exit was actually observed
+    reconciled_at: Optional[float] = None       # Set when a reader noticed the PID was already gone
+    output_path: Optional[str] = None           # Host path where the output tail is parked on exit
+    # `ps -o lstart=` fingerprint taken at launch.  PIDs are recycled (macOS
+    # wraps at 99999), so "PID 48695 is alive" is not proof that OUR 48695 is
+    # alive -- an hour later it is somebody else's shell.  Empty means we could
+    # not fingerprint it, which callers must read as "unverified".
+    pid_start_key: str = ""
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -136,6 +191,12 @@ class ProcessRegistry:
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+
+        # Durable "what did I start, and did it finish?" records, keyed by
+        # session_id.  Deliberately separate from self._finished: those get
+        # pruned after 30 minutes / MAX_PROCESSES, while these are what a later
+        # session reads off disk hours later.
+        self._exit_records: Dict[str, Dict[str, Any]] = {}
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -260,12 +321,77 @@ class ProcessRegistry:
         except (ProcessLookupError, PermissionError):
             return False
 
+    @staticmethod
+    def _host_pid_start_key(pid: Optional[int]) -> str:
+        """Fingerprint a host PID by its start time so a recycled PID cannot pass as ours.
+
+        `ps -o lstart=` is the cheapest stdlib-only identity available here: a
+        fixed-format wall-clock string that we only ever compare against another
+        reading taken on the SAME host, so nothing is parsed and no locale or
+        timezone assumption is made.  One-second granularity is fine -- a wrapped
+        PID landing in the same second as ours is not a case worth engineering
+        for, and the alternative (psutil) is a dependency we will not take.
+
+        Returns "" when the PID is gone or `ps` is unusable (Windows, stripped
+        container).  Callers MUST read "" as "unverified", never as "matches".
+        """
+        if not pid or _IS_WINDOWS:
+            return ""
+        try:
+            proc = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception as exc:
+            logger.debug("Could not fingerprint pid %s: %s", pid, exc)
+            return ""
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout.strip()
+
+    @staticmethod
+    def _stamp_observed_exit(session: ProcessSession, lifecycle: str = LIFECYCLE_EXITED) -> None:
+        """Record an exit we actually watched happen.
+
+        Does not clobber a lifecycle that is already set: kill_process() stamps
+        KILLED and then the reader thread wakes up on the closed pipe a moment
+        later — without this guard a deliberate kill would be re-reported as a
+        clean exit.
+        """
+        with session._lock:
+            if not session.lifecycle:
+                session.lifecycle = lifecycle
+            if session.ended_at is None:
+                session.ended_at = time.time()
+
+    @classmethod
+    def _host_pid_state(cls, pid: Optional[int], pid_start_key: str) -> str:
+        """Return "alive", "gone", or "unverified" for a host PID.
+
+        "unverified" means the PID is alive but we cannot prove it is still the
+        process we launched (nothing was fingerprinted at launch, or `ps` is
+        unavailable now).  It is deliberately NOT folded into either answer:
+        claiming "finished" would throw away real work, and claiming "running"
+        with confidence is the exact fiction that made this fix necessary.
+        """
+        if not cls._is_host_pid_alive(pid):
+            return "gone"
+        if not pid_start_key:
+            return "unverified"
+        current = cls._host_pid_start_key(pid)
+        if not current:
+            return "unverified"
+        return "alive" if current == pid_start_key else "gone"
+
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
         if session is None or session.exited or not session.detached or session.pid_scope != "host":
             return session
 
-        if self._is_host_pid_alive(session.pid):
+        # Only "gone" is actionable.  "unverified" leaves the session running.
+        if self._host_pid_state(session.pid, session.pid_start_key) != "gone":
             return session
 
         with session._lock:
@@ -275,6 +401,11 @@ class ProcessRegistry:
             # Recovered sessions no longer have a waitable handle, so the real
             # exit code is unavailable once the original process object is gone.
             session.exit_code = None
+            session.lifecycle = LIFECYCLE_FINISHED_UNKNOWN
+            # NOT ended_at: we never saw it end, we only just noticed it was
+            # already gone.  Stamping a finish time here would manufacture a
+            # fact, which is the failure class this whole change is about.
+            session.reconciled_at = time.time()
 
         self._move_to_finished(session)
         return session
@@ -333,6 +464,10 @@ class ProcessRegistry:
             cwd=cwd or os.getcwd(),
             started_at=time.time(),
         )
+        # Fixed at launch so the record is self-describing from the first write:
+        # an entry that reaches a later session without an id or an output path
+        # is not usable by it.
+        session.output_path = str(_output_log_path(session.id))
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -351,6 +486,7 @@ class ProcessRegistry:
                     dimensions=(30, 120),
                 )
                 session.pid = pty_proc.pid
+                session.pid_start_key = self._host_pid_start_key(pty_proc.pid)
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
@@ -400,6 +536,7 @@ class ProcessRegistry:
 
         session.process = proc
         session.pid = proc.pid
+        session.pid_start_key = self._host_pid_start_key(proc.pid)
 
         # Start output reader thread
         reader = threading.Thread(
@@ -448,6 +585,10 @@ class ProcessRegistry:
             env_ref=env,
             pid_scope="sandbox",
         )
+        # No pid_start_key: the PID is sandbox-local, so a host `ps` reading of
+        # it would fingerprint an unrelated host process.  Reconciliation skips
+        # sandbox scope entirely for the same reason.
+        session.output_path = str(_output_log_path(session.id))
 
         # Run the command in the sandbox with output capture
         temp_dir = self._env_temp_dir(env)
@@ -479,6 +620,14 @@ class ProcessRegistry:
             session.exited = True
             session.exit_code = -1
             session.output_buffer = f"Failed to start: {e}"
+            # This branch never reaches _move_to_finished, and _write_checkpoint
+            # skips exited sessions -- without an explicit record a failed launch
+            # would leave nothing on disk at all, which is the same blind spot
+            # from the other direction.
+            session.lifecycle = LIFECYCLE_EXITED
+            session.ended_at = time.time()
+            with self._lock:
+                self._exit_records[session.id] = self._exit_record(session)
 
         if not session.exited:
             # Start a poller thread that periodically reads the log file
@@ -526,6 +675,7 @@ class ProcessRegistry:
                 logger.debug("Process wait timed out or failed: %s", e)
             session.exited = True
             session.exit_code = session.process.returncode
+            self._stamp_observed_exit(session)
             self._move_to_finished(session)
 
     def _env_poller_loop(
@@ -571,6 +721,7 @@ class ProcessRegistry:
                     except (ValueError, IndexError):
                         session.exit_code = -1
                     session.exited = True
+                    self._stamp_observed_exit(session)
                     self._move_to_finished(session)
                     return
 
@@ -578,6 +729,7 @@ class ProcessRegistry:
                 # Environment might be gone (sandbox reaped, etc.)
                 session.exited = True
                 session.exit_code = -1
+                self._stamp_observed_exit(session)
                 self._move_to_finished(session)
                 return
 
@@ -610,7 +762,62 @@ class ProcessRegistry:
             logger.debug("PTY wait timed out or failed: %s", e)
         session.exited = True
         session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
+        self._stamp_observed_exit(session)
         self._move_to_finished(session)
+
+    def _exit_record(self, session: ProcessSession) -> Dict[str, Any]:
+        """Build the durable, JSON-safe lifecycle record for a finished session."""
+        return {
+            "session_id": session.id,
+            "command": session.command,
+            "cwd": session.cwd,
+            "pid": session.pid,
+            "pid_scope": session.pid_scope,
+            "pid_start_key": session.pid_start_key,
+            "task_id": session.task_id,
+            "session_key": session.session_key,
+            "started_at": session.started_at,
+            "status": session.lifecycle or LIFECYCLE_FINISHED_UNKNOWN,
+            "exit_code": session.exit_code,
+            "ended_at": session.ended_at,
+            "reconciled_at": session.reconciled_at,
+            "output_path": session.output_path,
+        }
+
+    def _park_output_tail(self, session: ProcessSession) -> None:
+        """Persist the tail of a finished process's output next to its record.
+
+        The rolling buffer lives only in the launching process's memory, so
+        without this a later session can learn THAT a job finished but nothing
+        about what it produced.  Best-effort by design: a host that cannot write
+        here still gets the lifecycle record, which is the part that matters.
+        """
+        if not session.output_path:
+            return
+        try:
+            from tools.ansi_strip import strip_ansi
+
+            with session._lock:
+                raw = session.output_buffer or ""
+            tail = strip_ansi(raw[-OUTPUT_TAIL_CHARS:]) if raw else ""
+
+            path = Path(session.output_path)
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            header = (
+                f"# session_id: {session.id}\n"
+                f"# command: {session.command}\n"
+                f"# cwd: {session.cwd}\n"
+                f"# status: {session.lifecycle or LIFECYCLE_FINISHED_UNKNOWN}\n"
+                f"# exit_code: {session.exit_code}\n"
+                f"# started_at: {_iso(session.started_at)}\n"
+                f"# ended_at: {_iso(session.ended_at)}\n"
+                f"# (tail only — last {OUTPUT_TAIL_CHARS} chars of output)\n\n"
+            )
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as fh:
+                fh.write(header + tail)
+        except Exception as exc:
+            logger.debug("Could not park output for %s: %s", session.id, exc)
 
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
@@ -619,9 +826,29 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        # Every exit path should have stamped a lifecycle already; this is the
+        # backstop so a record can never be written with status=None, which is
+        # exactly what Ptah's processes.json held on 2026-08-16.
+        with session._lock:
+            if not session.lifecycle:
+                session.lifecycle = (
+                    LIFECYCLE_EXITED if session.exit_code is not None
+                    else LIFECYCLE_FINISHED_UNKNOWN
+                )
+            if session.lifecycle != LIFECYCLE_FINISHED_UNKNOWN and session.ended_at is None:
+                session.ended_at = time.time()
+
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
+
+        if was_running:
+            self._park_output_tail(session)
+
+        with self._lock:
+            self._exit_records[session.id] = self._exit_record(session)
+            self._prune_exit_records()
+
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without
@@ -671,10 +898,26 @@ class ProcessRegistry:
         }
         if session.exited:
             result["exit_code"] = session.exit_code
+            # `status` stays "exited" for existing callers; `lifecycle` is where
+            # "we never saw the exit" is actually sayable.
+            result["lifecycle"] = session.lifecycle or LIFECYCLE_EXITED
+            result["ended_at"] = _iso(session.ended_at)
+            if session.lifecycle == LIFECYCLE_FINISHED_UNKNOWN:
+                result["note"] = (
+                    "Process is gone but its exit was never observed — exit code "
+                    "is unknown. Do not report this as still running or as successful."
+                )
+            if session.output_path:
+                result["output_path"] = session.output_path
             self._completion_consumed.add(session_id)
         if session.detached:
             result["detached"] = True
-            result["note"] = "Process recovered after restart -- output history unavailable"
+            detached_note = "Process recovered after restart -- output history unavailable"
+            # Appended, never assigned: the unknown-exit warning above is the
+            # more important half and must not be overwritten by this one.
+            result["note"] = (
+                f"{result['note']} {detached_note}" if result.get("note") else detached_note
+            )
         return result
 
     def read_log(self, session_id: str, offset: int = 0, limit: int = 200) -> dict:
@@ -815,10 +1058,12 @@ class ProcessRegistry:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
             elif session.detached and session.pid_scope == "host" and session.pid:
-                if not self._is_host_pid_alive(session.pid):
+                if self._host_pid_state(session.pid, session.pid_start_key) == "gone":
                     with session._lock:
                         session.exited = True
                         session.exit_code = None
+                        session.lifecycle = LIFECYCLE_FINISHED_UNKNOWN
+                        session.reconciled_at = time.time()
                     self._move_to_finished(session)
                     return {
                         "status": "already_exited",
@@ -835,6 +1080,8 @@ class ProcessRegistry:
                 }
             session.exited = True
             session.exit_code = -15  # SIGTERM
+            session.lifecycle = LIFECYCLE_KILLED
+            session.ended_at = time.time()
             self._move_to_finished(session)
             self._write_checkpoint()
             return {"status": "killed", "session_id": session.id}
@@ -919,6 +1166,10 @@ class ProcessRegistry:
             }
             if s.exited:
                 entry["exit_code"] = s.exit_code
+                entry["lifecycle"] = s.lifecycle or LIFECYCLE_EXITED
+                entry["ended_at"] = _iso(s.ended_at)
+                if s.output_path:
+                    entry["output_path"] = s.output_path
             if s.detached:
                 entry["detached"] = True
             result.append(entry)
@@ -998,10 +1249,66 @@ class ProcessRegistry:
         if stale:
             self._completion_consumed -= stale
 
+    def _record_reconciled_death(self, entry: Dict[str, Any]) -> None:
+        """Turn a stale "running" checkpoint entry into a finished_unknown record.
+
+        Deliberately keeps ended_at None: we did not see this process end, we
+        only just noticed it was already gone, and inventing a finish time is
+        how a missing lifecycle becomes confident fiction.
+        """
+        sid = entry.get("session_id")
+        if not sid:
+            return
+        record = dict(entry)
+        record.update({
+            "status": LIFECYCLE_FINISHED_UNKNOWN,
+            "exit_code": None,
+            "ended_at": None,
+            "reconciled_at": time.time(),
+        })
+        with self._lock:
+            self._exit_records[sid] = record
+            self._prune_exit_records()
+        logger.info(
+            "Reconciled dead background process: %s (pid=%s) — exit code unknown",
+            str(entry.get("command", "unknown"))[:60],
+            entry.get("pid"),
+        )
+
+    def _prune_exit_records(self):
+        """Trim durable exit records by age then count. Must hold _lock.
+
+        Kept far longer than _finished (see EXIT_RECORD_TTL_SECONDS) because a
+        later session asking "did it finish?" is the whole point; bounded so the
+        checkpoint file cannot grow without limit on a long-lived gateway.
+        """
+        now = time.time()
+        expired = [
+            sid for sid, rec in self._exit_records.items()
+            if (now - (rec.get("started_at") or 0)) > EXIT_RECORD_TTL_SECONDS
+        ]
+        for sid in expired:
+            del self._exit_records[sid]
+
+        while len(self._exit_records) > MAX_EXIT_RECORDS:
+            oldest = min(
+                self._exit_records,
+                key=lambda sid: self._exit_records[sid].get("started_at") or 0,
+            )
+            del self._exit_records[oldest]
+
     # ----- Checkpoint (crash recovery) -----
 
     def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file atomically."""
+        """Write process lifecycle metadata to the checkpoint file atomically.
+
+        Still a flat JSON list for backwards compatibility (recover_from_checkpoint
+        and hermes_cli/profiles.py both read it), now carrying finished entries
+        too — before this, a process that ended was simply deleted from the file,
+        so "it finished cleanly" and "it was never here" looked identical to the
+        next session.  Entries are distinguished by "status"; readers that predate
+        this field see only running rows because those keep every old key.
+        """
         try:
             with self._lock:
                 entries = []
@@ -1012,8 +1319,13 @@ class ProcessRegistry:
                             "command": s.command,
                             "pid": s.pid,
                             "pid_scope": s.pid_scope,
+                            "pid_start_key": s.pid_start_key,
                             "cwd": s.cwd,
                             "started_at": s.started_at,
+                            "status": LIFECYCLE_RUNNING,
+                            "exit_code": None,
+                            "ended_at": None,
+                            "output_path": s.output_path,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
                             "watcher_platform": s.watcher_platform,
@@ -1025,7 +1337,9 @@ class ProcessRegistry:
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
                         })
-            
+                self._prune_exit_records()
+                entries.extend(self._exit_records.values())
+
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
             atomic_json_write(CHECKPOINT_PATH, entries)
@@ -1037,6 +1351,10 @@ class ProcessRegistry:
         On gateway startup, probe PIDs from checkpoint file.
 
         Returns the number of processes recovered as detached.
+
+        Entries that are already finished are re-loaded as exit records rather
+        than as sessions, so a gateway restart does not erase the answer to
+        "did the thing I started last hour finish?".
         """
         if not CHECKPOINT_PATH.exists():
             return 0
@@ -1048,6 +1366,16 @@ class ProcessRegistry:
 
         recovered = 0
         for entry in entries:
+            # Absent "status" means an entry written before lifecycle tracking
+            # existed; those files only ever held running processes.
+            status = entry.get("status") or LIFECYCLE_RUNNING
+            if status != LIFECYCLE_RUNNING:
+                sid = entry.get("session_id")
+                if sid:
+                    with self._lock:
+                        self._exit_records[sid] = entry
+                continue
+
             pid = entry.get("pid")
             if not pid:
                 continue
@@ -1057,6 +1385,10 @@ class ProcessRegistry:
                 # Sandbox-backed processes keep only in-sandbox PIDs in the
                 # checkpoint, which are not meaningful to the restarted host
                 # process once the original environment handle is gone.
+                # Dropped rather than reconciled: we genuinely cannot tell from
+                # the host whether it lived or died, and `process(action=report)`
+                # reports the pre-drop file entry as liveness="unverified"
+                # rather than asserting either answer.
                 logger.info(
                     "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
                     entry.get("command", "unknown")[:60],
@@ -1065,8 +1397,17 @@ class ProcessRegistry:
                 )
                 continue
 
-            # Check if PID is still alive
-            alive = self._is_host_pid_alive(pid)
+            # Check if the PID is still alive AND still ours (see _host_pid_state).
+            pid_start_key = entry.get("pid_start_key", "") or ""
+            alive = self._host_pid_state(pid, pid_start_key) != "gone"
+
+            if not alive:
+                # The parent that would have written the exit is gone, so this is
+                # the only moment anyone can notice.  Previously the entry was
+                # just dropped on the next checkpoint write and the work vanished
+                # from the record entirely.
+                self._record_reconciled_death(entry)
+                continue
 
             if alive:
                 session = ProcessSession(
@@ -1076,6 +1417,8 @@ class ProcessRegistry:
                     session_key=entry.get("session_key", ""),
                     pid=pid,
                     pid_scope=pid_scope,
+                    pid_start_key=pid_start_key,
+                    output_path=entry.get("output_path"),
                     cwd=entry.get("cwd"),
                     started_at=entry.get("started_at", time.time()),
                     detached=True,  # Can't read output, but can report status + kill
@@ -1117,6 +1460,213 @@ process_registry = ProcessRegistry()
 
 
 # ---------------------------------------------------------------------------
+# Reconcile-on-read — the durable answer to "what did I start, and did it finish?"
+# ---------------------------------------------------------------------------
+#
+# 2026-08-16: Ptah's ~/.hermes/profiles/ptah/processes.json held one entry,
+# written at launch, for `cd ~/.lucaryin/rebrand-v2 && python3 focus_group.py`
+# — pid 48695, started_at 1786906326.7, no status, no exit code, no end time.
+# That PID had been dead for over an hour. Asked "how is the project going",
+# the agent could not see its own work at all, fell back to session recall, and
+# told the founder a finished 25-logo focus group was "about to run".
+#
+# The fix is reconcile-on-READ rather than a reaper daemon precisely because the
+# failure mode IS the writer dying: whoever would have recorded the exit is the
+# thing that is gone. Any reader, in any later process, can still check the PID.
+
+
+def _record_liveness(record: Dict[str, Any]) -> str:
+    """Classify a checkpoint record's process as "alive", "gone", or "unverified"."""
+    if (record.get("status") or LIFECYCLE_RUNNING) != LIFECYCLE_RUNNING:
+        return "gone"
+    if (record.get("pid_scope") or "host") != "host":
+        # The PID is sandbox-local; a host `ps` would be reading some unrelated
+        # host process. We cannot prove it either way from here, and guessing in
+        # either direction is worse than saying so.
+        return "unverified"
+    return ProcessRegistry._host_pid_state(
+        record.get("pid"), record.get("pid_start_key") or ""
+    )
+
+
+def reconcile_process_records(
+    checkpoint_path: Optional[Any] = None,
+    persist: bool = True,
+) -> List[Dict[str, Any]]:
+    """Read the on-disk process registry and correct entries whose PID is gone.
+
+    Returns the reconciled records (running first is NOT guaranteed — callers
+    sort). Safe on a host that has never run a background process: a missing or
+    unparseable file yields [] rather than an exception, because this is called
+    from inside agent turns and a plain hermes-agent host has no Lucaryin store.
+
+    ``persist`` writes the corrections back so the next reader (and the founder
+    looking at the file) sees the same truth; failure to write is not fatal.
+    """
+    path = Path(checkpoint_path) if checkpoint_path is not None else CHECKPOINT_PATH
+    try:
+        if not path.exists():
+            return []
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("Could not read process registry %s: %s", path, exc)
+        return []
+
+    if not isinstance(entries, list):
+        return []
+
+    now = time.time()
+    reconciled: List[Dict[str, Any]] = []
+    changed = False
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        record = dict(entry)
+        record.setdefault("status", LIFECYCLE_RUNNING)
+        liveness = _record_liveness(record)
+
+        if record["status"] == LIFECYCLE_RUNNING and liveness == "gone":
+            record.update({
+                "status": LIFECYCLE_FINISHED_UNKNOWN,
+                "exit_code": None,
+                "ended_at": None,          # never observed — see _record_reconciled_death
+                "reconciled_at": now,
+            })
+            changed = True
+
+        record["liveness"] = liveness
+        reconciled.append(record)
+
+    if changed and persist:
+        try:
+            from utils import atomic_json_write
+            # `liveness` is a read-time judgement, not durable state.
+            atomic_json_write(
+                path, [{k: v for k, v in r.items() if k != "liveness"} for r in reconciled]
+            )
+        except Exception as exc:
+            logger.debug("Could not persist reconciled process registry: %s", exc)
+
+    return reconciled
+
+
+def _summarize_record(record: Dict[str, Any]) -> str:
+    """One line about a process that a later session can repeat without inventing."""
+    status = record.get("status") or LIFECYCLE_RUNNING
+    started = _iso(record.get("started_at"))
+    pid = record.get("pid")
+
+    if status == LIFECYCLE_RUNNING:
+        age = format_uptime_short(int(time.time() - (record.get("started_at") or time.time())))
+        if record.get("liveness") == "unverified":
+            return (
+                f"recorded as running since {started} ({age} ago, pid {pid}), but its "
+                f"liveness cannot be verified from here — confirm before reporting progress"
+            )
+        return f"still running since {started} ({age} ago, pid {pid})"
+
+    if status == LIFECYCLE_KILLED:
+        return f"killed at {_iso(record.get('ended_at')) or 'an unrecorded time'} (SIGTERM)"
+
+    if status == LIFECYCLE_EXITED:
+        return (
+            f"finished at {_iso(record.get('ended_at')) or 'an unrecorded time'} "
+            f"with exit code {record.get('exit_code')}"
+        )
+
+    noticed = _iso(record.get("reconciled_at"))
+    return (
+        f"no longer running (started {started}); its exit was never recorded, so the "
+        f"exit code is UNKNOWN — noticed gone at {noticed or 'an unrecorded time'}. "
+        f"Check the output or the work product before claiming it succeeded or failed."
+    )
+
+
+def _present_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a raw registry record into the agent-facing shape."""
+    started_at = record.get("started_at") or 0
+    return {
+        "session_id": record.get("session_id"),
+        "command": str(record.get("command", ""))[:400],
+        "cwd": record.get("cwd"),
+        "pid": record.get("pid"),
+        "task_id": record.get("task_id", ""),
+        "status": record.get("status") or LIFECYCLE_RUNNING,
+        "exit_code": record.get("exit_code"),
+        "started_at": _iso(started_at),
+        "age_seconds": int(time.time() - started_at) if started_at else None,
+        "ended_at": _iso(record.get("ended_at")),
+        "noticed_gone_at": _iso(record.get("reconciled_at")),
+        "liveness": record.get("liveness", "unverified"),
+        "output_path": record.get("output_path"),
+        "summary": _summarize_record(record),
+    }
+
+
+def describe_background_work(task_id: Optional[str] = None, limit: int = 25) -> Dict[str, Any]:
+    """Answer "what did I start, and did it finish?" without needing prior memory.
+
+    Reads the on-disk registry (reconciling dead PIDs), then overlays whatever
+    the in-process registry knows, since that is fresher for anything started in
+    this same process. Never raises — an agent turn asking about its own work
+    must not die because the registry is missing or unreadable.
+    """
+    try:
+        records = {
+            r.get("session_id"): r
+            for r in reconcile_process_records()
+            if r.get("session_id")
+        }
+    except Exception as exc:
+        logger.debug("Background-work disk read failed: %s", exc)
+        records = {}
+
+    try:
+        with process_registry._lock:
+            live = list(process_registry._running.values()) + list(process_registry._finished.values())
+        for session in live:
+            process_registry._refresh_detached_session(session)
+        with process_registry._lock:
+            live = list(process_registry._running.values()) + list(process_registry._finished.values())
+        for session in live:
+            record = process_registry._exit_record(session)
+            if not session.exited:
+                record["status"] = LIFECYCLE_RUNNING
+                record["exit_code"] = None
+                record["ended_at"] = None
+            record["liveness"] = "alive" if not session.exited else "gone"
+            records[session.id] = record
+    except Exception as exc:
+        logger.debug("Background-work memory overlay failed: %s", exc)
+
+    presented = [_present_record(r) for r in records.values()]
+    if task_id:
+        presented = [p for p in presented if p.get("task_id") == task_id]
+    presented.sort(key=lambda p: p.get("age_seconds") or 0)
+
+    running = [p for p in presented if p["status"] == LIFECYCLE_RUNNING][:limit]
+    finished = [p for p in presented if p["status"] != LIFECYCLE_RUNNING][:limit]
+
+    result: Dict[str, Any] = {
+        "checked_at": _iso(time.time()),
+        "registry_path": str(CHECKPOINT_PATH),
+        "registry_available": CHECKPOINT_PATH.exists(),
+        "running": running,
+        "finished": finished,
+    }
+
+    unknown = [p for p in finished if p["status"] == LIFECYCLE_FINISHED_UNKNOWN]
+    if unknown:
+        result["warning"] = (
+            f"{len(unknown)} background process(es) ended without a recorded exit code. "
+            "Read output_path or inspect the work product before describing the result — "
+            "do NOT report unknown-exit work as completed, as successful, or as still to come."
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Registry -- the "process" tool schema + handler
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
@@ -1125,7 +1675,11 @@ PROCESS_SCHEMA = {
     "name": "process",
     "description": (
         "Manage background processes started with terminal(background=true). "
-        "Actions: 'list' (show all), 'poll' (check status + new output), "
+        "Actions: 'report' (durable answer to 'what did I start, and did it finish?' — "
+        "USE THIS before describing the state of any background work, including work "
+        "started in an earlier session; it reads the on-disk registry and re-checks "
+        "dead PIDs), 'list' (processes this process still holds in memory), "
+        "'poll' (check status + new output), "
         "'log' (full output with pagination), 'wait' (block until done or timeout), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
         "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
@@ -1135,7 +1689,7 @@ PROCESS_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close"],
+                "enum": ["report", "list", "poll", "log", "wait", "kill", "write", "submit", "close"],
                 "description": "Action to perform on background processes"
             },
             "session_id": {
@@ -1173,7 +1727,13 @@ def _handle_process(args, **kw):
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
 
-    if action == "list":
+    if action == "report":
+        # Deliberately NOT scoped to task_id by default: after a restart the
+        # agent asking "how is the project going" has a different task_id than
+        # the launch did, and scoping it to the current one reproduces the exact
+        # blindness this action exists to remove.
+        return _json.dumps(describe_background_work(), ensure_ascii=False)
+    elif action == "list":
         return _json.dumps({"processes": process_registry.list_sessions(task_id=task_id)}, ensure_ascii=False)
     elif action in ("poll", "log", "wait", "kill", "write", "submit", "close"):
         if not session_id:
@@ -1193,7 +1753,10 @@ def _handle_process(args, **kw):
             return _json.dumps(process_registry.submit_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
         elif action == "close":
             return _json.dumps(process_registry.close_stdin(session_id), ensure_ascii=False)
-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close")
+    return tool_error(
+        f"Unknown process action: {action}. "
+        "Use: report, list, poll, log, wait, kill, write, submit, close"
+    )
 
 
 registry.register(
