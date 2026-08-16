@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _HOME_TARGET_ENV_VARS
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -107,6 +107,62 @@ class TestResolveDeliveryTarget:
             "chat_id": chat_id,
             "thread_id": None,
         }
+
+    def test_origin_delivery_without_origin_falls_back_to_lucaryin_chat(
+        self, monkeypatch
+    ):
+        """A Lucaryin host sets none of the messenger home-channel env vars, so
+        the loop above finds nothing and the run used to be dropped on the
+        floor — silently, with last_status still 'ok'. That is how the
+        founder's Heartbeat findings and the GBrain Health Guard both went
+        mute. The host's own conversation is the last resort."""
+        for env_var in list(_HOME_TARGET_ENV_VARS.values()) + ["QQ_HOME_CHANNEL"]:
+            monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setattr(
+            "cron.scheduler._latest_lucaryin_session",
+            lambda: "20260726_115112_9d4181",
+        )
+
+        assert _resolve_delivery_target({"deliver": "origin"}) == {
+            "platform": "lucaryin",
+            "chat_id": "20260726_115112_9d4181",
+            "thread_id": None,
+        }
+
+    def test_configured_home_channel_still_beats_the_lucaryin_fallback(
+        self, monkeypatch
+    ):
+        """An operator who set a home channel chose it deliberately; the
+        inferred local chat must not override that."""
+        for env_var in list(_HOME_TARGET_ENV_VARS.values()) + ["QQ_HOME_CHANNEL"]:
+            monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setenv("SLACK_HOME_CHANNEL", "C0HOME")
+        monkeypatch.setattr(
+            "cron.scheduler._latest_lucaryin_session", lambda: "should-not-win"
+        )
+
+        assert _resolve_delivery_target({"deliver": "origin"})["platform"] == "slack"
+
+    def test_origin_delivery_still_returns_none_with_no_target_anywhere(
+        self, monkeypatch
+    ):
+        """A plain hermes-agent host has no Lucaryin store; nothing to infer."""
+        for env_var in list(_HOME_TARGET_ENV_VARS.values()) + ["QQ_HOME_CHANNEL"]:
+            monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setattr("cron.scheduler._latest_lucaryin_session", lambda: "")
+
+        assert _resolve_delivery_target({"deliver": "origin"}) is None
+
+    def test_explicit_origin_is_never_replaced_by_the_fallback(self, monkeypatch):
+        monkeypatch.setattr(
+            "cron.scheduler._latest_lucaryin_session", lambda: "wrong-chat"
+        )
+        job = {
+            "deliver": "origin",
+            "origin": {"platform": "lucaryin", "chat_id": "the-real-thread"},
+        }
+
+        assert _resolve_delivery_target(job)["chat_id"] == "the-real-thread"
 
     def test_bare_matrix_delivery_uses_matrix_home_room(self, monkeypatch):
         monkeypatch.delenv("MATRIX_HOME_CHANNEL", raising=False)

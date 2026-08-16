@@ -14,6 +14,7 @@ import contextvars
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -110,6 +111,47 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+def _latest_lucaryin_session() -> str:
+    """The conversation a human is actually reading on this host, or "".
+
+    Used only as a fallback when a job says deliver=origin but carries no
+    origin. "Most recent session" is the obvious rule and the wrong one: every
+    /api/chat/sync call (fleet ask_agent, delegation, verification) opens a
+    fresh source='web' session that is indistinguishable by id or source from a
+    real chat, so the newest session is usually a one-shot nobody will ever
+    open. A conversation with real accumulated history is the signal — hence
+    the message-count floor, with recency only breaking ties among genuine
+    threads.
+
+    Returns "" on a plain hermes-agent host with no such store, which lets the
+    caller fall through to the messenger home channels.
+    """
+    try:
+        from hermes_state import SessionDB
+        db_path = SessionDB().db_path
+    except Exception:  # noqa: BLE001 — no store here; not a Lucaryin host
+        return ""
+    if not os.path.exists(db_path):
+        return ""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    except Exception:  # noqa: BLE001
+        return ""
+    try:
+        row = conn.execute(
+            "SELECT s.id FROM sessions s "
+            "WHERE s.source IN ('web','mobile') AND s.message_count >= 20 "
+            "ORDER BY (SELECT max(m.timestamp) FROM messages m "
+            "          WHERE m.session_id = s.id) DESC "
+            "LIMIT 1"
+        ).fetchone()
+    except Exception:  # noqa: BLE001 — older schema, no sessions table
+        return ""
+    finally:
+        conn.close()
+    return str(row[0]) if row and row[0] else ""
+
+
 def _get_home_target_chat_id(platform_name: str) -> str:
     """Return the configured home target chat/room ID for a delivery platform."""
     env_var = _HOME_TARGET_ENV_VARS.get(platform_name.lower())
@@ -153,6 +195,26 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                     "chat_id": chat_id,
                     "thread_id": None,
                 }
+        # Last resort: this host's own chat. None of the env vars above are
+        # ever set on a Lucaryin machine, where the app itself IS the delivery
+        # surface — so the loop found nothing and the run was silently
+        # dropped. That is not theoretical. It ate the founder's Heartbeat
+        # findings for weeks (auto-provisioned with deliver=origin and
+        # origin=null), and the GBrain Health Guard — the watchdog whose whole
+        # job is reporting degradation — was mute the same way. Both reported
+        # last_status "ok" while delivering to nobody.
+        home_session = _latest_lucaryin_session()
+        if home_session:
+            logger.info(
+                "Job '%s' has deliver=origin but no origin; falling back to "
+                "the most recent Lucaryin conversation (%s)",
+                job.get("name", job.get("id", "?")), home_session,
+            )
+            return {
+                "platform": "lucaryin",
+                "chat_id": home_session,
+                "thread_id": None,
+            }
         return None
 
     if ":" in deliver_value:
