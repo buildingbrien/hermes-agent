@@ -23,7 +23,11 @@ Usage:
     all_tools = resolve_toolset("full_stack")
 """
 
+import logging
+import threading
 from typing import List, Dict, Any, Set, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # Shared tool list for CLI and all messaging platform toolsets.
@@ -150,7 +154,10 @@ TOOLSETS = {
     
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
-        "tools": ["read_file", "write_file", "patch", "search_files"],
+        # read_document registers into this toolset (tools/read_document_tool.py)
+        # but was never listed, so no agent could read a PDF — read_file hands
+        # back raw bytes. Same silent-shadowing bug as gbrain.
+        "tools": ["read_file", "write_file", "patch", "search_files", "read_document"],
         "includes": []
     },
     
@@ -179,13 +186,34 @@ TOOLSETS = {
         # fleet_send and no gbrain at all. 854 compiled pages, unreadable.
         # (ask_agent escaped this only because "fleet" is not a declared
         # toolset, so it never hit this filter.)
-        "tools": ["memory", "gbrain_search", "gbrain_read"],
+        #
+        # action_items was dead the same way, and it explains a complaint the
+        # founder has carried for months. The voice-call system prompt tells
+        # every agent: "never say you will note, track, mark, close, send, or
+        # follow up on something unless you make the matching tool call IN THIS
+        # TURN — use the action_items tool for tracking and closing items",
+        # citing a 2026-08-11 call where an agent said "noting it as closed
+        # everywhere" six different ways and wrote nothing. The prompt was
+        # ordering agents to call a tool they did not have. That was never a
+        # discipline problem to be fixed with sterner wording.
+        "tools": ["memory", "gbrain_search", "gbrain_read", "action_items"],
         "includes": []
     },
     
     "session_search": {
-        "description": "Search and recall past conversations with summarization",
-        "tools": ["session_search"],
+        "description": "Search and recall past conversations — your own, and "
+                       "(on a fleet machine) your teammates' delegated work",
+        # fleet_session_search/fleet_session_read register with
+        # toolset="session_search" and MUST be named here or they are
+        # invisible — the gbrain mistake directly above. They are gated at
+        # runtime by check_fn: a host with no other agent stores never sees
+        # them. Deliberately NOT added to _HERMES_CORE_TOOLS: that list is
+        # shared by every messaging-platform toolset, and handing cross-agent
+        # store reads to every Discord/Slack/Telegram deployment is a wider
+        # default than this fix needs. The Lucaryin product path (bridge
+        # worker → AIAgent with enabled_toolsets=None → union of all
+        # toolsets) picks them up from here.
+        "tools": ["session_search", "fleet_session_search", "fleet_session_read"],
         "includes": []
     },
     
@@ -492,8 +520,14 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
         List[str]: List of all tool names in the toolset
     """
     if visited is None:
+        # Top-level entry (the recursive include-walk always passes a visited
+        # set). This is the one funnel every caller that builds an agent's tool
+        # list goes through — model_tools.get_tool_definitions(), the web
+        # server, tools_config — so it is where the exposure audit can actually
+        # reach the operator. Runs once per process; see the audit block below.
+        _audit_tool_exposure_once()
         visited = set()
-    
+
     # Special aliases that represent all tools across every toolset
     # This ensures future toolsets are automatically included without changes.
     if name in {"all", "*"}:
@@ -547,6 +581,179 @@ def resolve_multiple_toolsets(toolset_names: List[str]) -> List[str]:
         all_tools.update(tools)
     
     return sorted(all_tools)
+
+
+# ==========================================================================
+# Tool-exposure audit
+#
+# Registering a tool is NOT the same as exposing it. registry.register(
+# toolset="memory") only records membership; what an agent actually receives
+# is resolve_toolset("memory") — exactly the names in
+# TOOLSETS["memory"]["tools"]. So a tool that registers into an EXISTING
+# declared toolset without being named there is invisible to every agent, and
+# nothing warned at import, at registration, or at call time.
+#
+# 2026-08-16: v4.6.38 shipped "agents can finally read gbrain". Asked directly
+# which tools they had, Ptah and Neith both answered "ask_agent, fleet_send,
+# session_search" — gbrain_search/gbrain_read had registered under "memory"
+# while that toolset listed only ["memory"]. 854 compiled pages, unreadable,
+# for a full release. ask_agent survived the same day only by accident: its
+# toolset "fleet" is not declared in TOOLSETS, so get_toolset() falls through
+# to the registry and returns whatever registered under it. Two tools added
+# the same day, one reachable and one not, for a reason neither file mentions.
+#
+# Deliberately NOT consulted here:
+#   * check_fn — a tool whose backend is down on this machine is still a
+#     registered tool, and its exposure is a static config question. Running
+#     check_fn would also shell out (gbrain's runs psql) and would hide the
+#     bug on exactly the machines least able to notice it.
+#   * undeclared toolsets — those are reachable via the registry fallback
+#     (the ask_agent case) and flagging them would train people to ignore this.
+# ==========================================================================
+
+_EXPOSURE_AUDIT_LOCK = threading.RLock()
+_exposure_audit_done = False
+
+
+def find_unexposed_tools(
+    tool_to_toolset: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Return registered tools that their own toolset does not hand to agents.
+
+    A finding is a dict::
+
+        {"tool": str, "toolset": str,
+         "exposed_by": [other declared toolsets that DO list it],
+         "severity": "invisible" | "misfiled",
+         "remedy": str}
+
+    ``severity="invisible"`` means no declared toolset lists the tool at all,
+    so no agent on any surface can see or call it — the gbrain failure.
+    ``"misfiled"`` means some other toolset does list it, so it is reachable,
+    just not through the toolset it claims to belong to.
+
+    Args:
+        tool_to_toolset: ``{tool_name: toolset}``. Defaults to the live
+            registry. Tests inject a map to reproduce a specific incident.
+
+    Returns:
+        Findings sorted by tool name; empty on a host with no tool registry
+        (a plain hermes-agent checkout must never raise out of this).
+    """
+    if tool_to_toolset is None:
+        try:
+            from tools.registry import registry
+            tool_to_toolset = registry.get_tool_to_toolset_map()
+        except Exception:
+            return []
+
+    if not tool_to_toolset:
+        return []
+
+    # Resolve every DECLARED toolset once. resolve_toolset() is the authority
+    # on what an agent receives — recomputing membership from ["tools"] here
+    # would miss composition via "includes" and could disagree with the code
+    # that actually builds the tool list, which is the whole failure mode.
+    #
+    # The explicit empty `visited` marks these as non-top-level calls, so
+    # asking the question never fires the once-per-process report below. An
+    # audit that can trigger itself is a recursion waiting to happen, and
+    # callers (tests, a doctor command) must be able to check without
+    # latching or emitting anything.
+    resolved: Dict[str, Set[str]] = {
+        ts_name: set(resolve_toolset(ts_name, set())) for ts_name in list(TOOLSETS)
+    }
+
+    findings: List[Dict[str, Any]] = []
+    for tool_name, ts_name in sorted(tool_to_toolset.items()):
+        if ts_name not in TOOLSETS:
+            continue  # registry fallback covers it (the ask_agent case)
+        if tool_name in resolved.get(ts_name, ()):
+            continue
+        exposed_by = sorted(
+            other for other, tools in resolved.items() if tool_name in tools
+        )
+        findings.append({
+            "tool": tool_name,
+            "toolset": ts_name,
+            "exposed_by": exposed_by,
+            "severity": "misfiled" if exposed_by else "invisible",
+            "remedy": (
+                f'add "{tool_name}" to TOOLSETS["{ts_name}"]["tools"] '
+                f"in toolsets.py"
+            ),
+        })
+    return findings
+
+
+def report_unexposed_tools(
+    tool_to_toolset: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Log every unexposed tool loudly and return the findings.
+
+    Separate from find_unexposed_tools() so tests can assert on the findings
+    without parsing logs, and on the logs without duplicating the rule.
+    """
+    findings = find_unexposed_tools(tool_to_toolset)
+    if not findings:
+        return findings
+
+    logger.error(
+        "TOOL-EXPOSURE AUDIT: %d registered tool(s) are not handed to agents "
+        "by the toolset they registered into. This is the gbrain class "
+        "(v4.6.38 shipped gbrain_search/gbrain_read into toolset 'memory' "
+        "while 'memory' listed only ['memory']; agents reported having no "
+        "gbrain tools at all, 2026-08-16).",
+        len(findings),
+    )
+    for f in findings:
+        if f["severity"] == "invisible":
+            logger.error(
+                "TOOL INVISIBLE TO EVERY AGENT: '%s' registered into toolset "
+                "'%s', but no toolset lists it — resolve_toolset() never "
+                "returns it, so no agent on any surface can see or call it. "
+                "Remedy: %s",
+                f["tool"], f["toolset"], f["remedy"],
+            )
+        else:
+            logger.warning(
+                "TOOL MISFILED: '%s' registered into toolset '%s', which does "
+                "not list it; agents reach it only via %s. Remedy: %s",
+                f["tool"], f["toolset"], ", ".join(f["exposed_by"]), f["remedy"],
+            )
+    return findings
+
+
+def _audit_tool_exposure_once() -> None:
+    """Run the exposure audit the first time tools are resolved in a process.
+
+    Import time is too early — toolsets.py is imported before the tool modules
+    have registered anything — so the audit hangs off the first top-level
+    resolve_toolset(), which by then is downstream of
+    discover_builtin_tools() (model_tools.py imports us, then discovers).
+    """
+    global _exposure_audit_done
+    if _exposure_audit_done:
+        return
+    with _EXPOSURE_AUDIT_LOCK:
+        if _exposure_audit_done:
+            return
+        try:
+            from tools.registry import registry
+            registered = registry.get_tool_to_toolset_map()
+        except Exception:
+            return  # no registry on this host — try again later, never raise
+        if not registered:
+            # Nothing has registered yet. Do NOT latch, or an early resolve
+            # would disable the audit for the life of the process.
+            return
+        # Latch BEFORE auditing so a failing audit degrades to one bad run
+        # instead of re-running on every resolve for the life of the process.
+        _exposure_audit_done = True
+        try:
+            report_unexposed_tools(registered)
+        except Exception:
+            logger.debug("Tool-exposure audit failed", exc_info=True)
 
 
 def _get_plugin_toolset_names() -> Set[str]:
