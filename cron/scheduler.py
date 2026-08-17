@@ -729,6 +729,31 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     prompt = job.get("prompt", "")
     skills = job.get("skills")
 
+    # Standing grants: tell the MODEL what this run may do without asking.
+    # The gate has honored job grants since 2026-08-09, but nothing ever told
+    # the agent — so a granted job either refused its own remit ("I can't
+    # send email without approval") or promised zero-tap flows it couldn't
+    # deliver. The Google Ads reply monitor did both in one morning
+    # (2026-08-17). Enforcement stays in the gate; this block only closes the
+    # gap between what the run may do and what it believes it may do.
+    grants = job.get("grants") or []
+    if grants:
+        try:
+            from cron.cron_grants import describe_grants_for_prompt
+            grant_line = describe_grants_for_prompt(grants)
+        except Exception:
+            grant_line = ""
+        if grant_line:
+            prompt = (
+                "## Standing permissions for this run\n"
+                f"{grant_line}\n"
+                "The user approved these when scheduling this job — act within "
+                "them directly, without asking for approval and without saying "
+                "you lack permission. Anything OUTSIDE them still requires "
+                "approval as usual.\n\n"
+                f"{prompt}"
+            )
+
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
     if script_path:
@@ -1442,6 +1467,23 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 if success and not final_response:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+                # A run whose gated actions were BLOCKED did not do its job,
+                # and "ok" would say it did — the Google Ads monitor wore a
+                # green light through four blocked mornings (2026-08-17). The
+                # honest status names the fix: the job needs a grant.
+                if success:
+                    try:
+                        import cron_gate
+                        _blocked = cron_gate.blocked_actions()
+                        if _blocked:
+                            success = False
+                            error = ("needs_grant: the gate blocked " +
+                                     ", ".join(sorted(set(_blocked))) +
+                                     " — grant it to this job (one approval) "
+                                     "or expect a card per run")
+                    except Exception:
+                        pass
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
                 executed += 1

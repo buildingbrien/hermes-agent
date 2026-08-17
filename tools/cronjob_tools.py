@@ -218,6 +218,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     result = {
         "job_id": job["id"],
         "name": job["name"],
+        "grants": job.get("grants") or [],
         "skill": skills[0] if skills else None,
         "skills": skills,
         "prompt_preview": prompt[:100] + "..." if len(prompt) > 100 else prompt,
@@ -246,6 +247,45 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+# Actions a job may carry as standing grants. Payment is deliberately absent
+# (locked doctrine: financial actions are never pre-authorizable), and
+# "standing_grant" itself can never appear (no self-amplification) — both are
+# ALSO refused at the gate, so this list is UX, not the security boundary.
+_GRANTABLE_ACTIONS = {
+    "email_send", "message_send", "calendar_create",
+    "meeting_schedule", "outbound_call", "file_write", "ui_action",
+}
+
+
+def _validate_grants(grants: Any) -> Optional[str]:
+    """Human-quality error or None. The gate re-checks all of this; failing
+    here just gives the model a fixable message instead of a filed card that
+    the user then has to read and reject."""
+    if grants is None:
+        return None
+    if not isinstance(grants, list):
+        return "grants must be a list of grant objects"
+    for g in grants:
+        act = g if isinstance(g, str) else (g.get("action") if isinstance(g, dict) else None)
+        if not act:
+            return f"malformed grant (needs an 'action'): {g!r}"
+        if act in ("payment_execute", "standing_grant"):
+            return (f"'{act}' can never be a standing grant — payment and "
+                    "grant-creation always require a live human decision")
+        if act not in _GRANTABLE_ACTIONS:
+            return (f"'{act}' is not a grantable action "
+                    f"(grantable: {', '.join(sorted(_GRANTABLE_ACTIONS))})")
+        if act == "outbound_call" and not (isinstance(g, dict) and g.get("unattended") is True):
+            return ("an outbound_call grant must be the object form with "
+                    "explicit unattended:true — autonomous dialling is a "
+                    "separate decision from calling")
+        if isinstance(g, dict) and act in ("email_send", "message_send") and not g.get("to"):
+            return (f"an {act} grant needs a 'to' allowlist — 'may email these "
+                    "specific people' is grantable, 'may email anyone' is not "
+                    "something to hand an unattended job")
+    return None
+
+
 def cronjob(
     action: str,
     job_id: Optional[str] = None,
@@ -262,6 +302,7 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
+    grants: Optional[List[Any]] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -287,6 +328,10 @@ def cronjob(
                 if script_error:
                     return tool_error(script_error, success=False)
 
+            grant_error = _validate_grants(grants)
+            if grant_error:
+                return tool_error(grant_error, success=False)
+
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
@@ -299,6 +344,7 @@ def cronjob(
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
+                grants=grants or [],
             )
             return json.dumps(
                 {
@@ -388,6 +434,12 @@ def cronjob(
                     if script_error:
                         return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
+            if grants is not None:
+                grant_error = _validate_grants(grants)
+                if grant_error:
+                    return tool_error(grant_error, success=False)
+                updates["grants"] = grants
+
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -502,6 +554,24 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 },
                 "required": ["model"]
             },
+            "grants": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": (
+                    "Standing permissions this job carries, approved by the user "
+                    "ONCE at creation — runs then act within them with no "
+                    "per-action approval. Use the narrowest scope that covers the "
+                    "job's remit: {\"action\": \"email_send\", \"to\": "
+                    "[\"person@example.com\"], \"max_per_run\": 1, "
+                    "\"max_per_day\": 4, \"expires\": \"YYYY-MM-DD\"}. "
+                    "Creating or updating a job WITH grants raises one approval "
+                    "card naming the powers — tell the user to expect that single "
+                    "tap. email_send/message_send require a 'to' allowlist; "
+                    "payment can never be granted; outbound_call needs explicit "
+                    "unattended:true. Actions outside the grants still gate "
+                    "normally at run time."
+                ),
+            },
             "script": {
                 "type": "string",
                 "description": f"Optional path to a Python script that runs before each cron job execution. Its stdout is injected into the prompt as context. Use for data collection and change detection. Relative paths resolve under {display_hermes_home()}/scripts/. On update, pass empty string to clear."
@@ -558,6 +628,7 @@ registry.register(
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),
+        grants=args.get("grants"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,
