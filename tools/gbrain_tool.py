@@ -2,7 +2,7 @@
 """
 GBrain Recall — read the compiled memory the dream cycle writes every night.
 
-Until now gbrain was WRITE-ONLY from an agent's point of view: the nightly
+Until v4.6.38 gbrain was WRITE-ONLY from an agent's point of view: the nightly
 dream cycle consolidated the day into 850+ compiled pages, and not one tool in
 the runtime could read them back. Recall therefore meant grepping the
 filesystem and re-deriving settled facts from raw markdown — six tool calls and
@@ -18,15 +18,25 @@ This exposes two verbs:
   gbrain_search(query)  — find compiled pages by title/slug/content
   gbrain_read(slug)     — read one page's compiled truth in full
 
-Degrades quietly: a machine without gbrain (or with it stopped) reports that
-recall is unavailable rather than failing the turn.
+WHY A DRIVER AND NOT psql: the first version shelled out to the `psql` binary
+and gated availability on a PATH lookup of that binary. That check passes in every
+terminal (where Homebrew's /opt/homebrew/bin is on PATH) and fails inside the
+actual product: a Finder-launched app inherits launchd's PATH, which has no
+Homebrew, so every worker the bridge spawned reported "gbrain is not reachable"
+against a perfectly healthy database — for the entire release that shipped the
+feature. The founder found it by asking an agent a question the brain could
+answer and watching it come back empty. A Python driver has no PATH dependency
+and works the same from a terminal, from Finder, and on a customer Mac that
+never had Homebrew. (psycopg ships via hermes-bridge/requirements.txt, so the
+same provisioning pass that delivers this file delivers the driver.)
+
+Degrades quietly either way: a machine without gbrain (or with the driver
+missing) reports that recall is unavailable rather than failing the turn.
 """
 
 import json
 import logging
 import os
-import shutil
-import subprocess
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -34,30 +44,31 @@ logger = logging.getLogger(__name__)
 GBRAIN_URL = os.environ.get("GBRAIN_URL", "postgres://localhost:5432/gbrain")
 _MAX_CHARS = 6000          # one page's truth, trimmed for a context window
 _SNIPPET = 320
+_CONNECT_TIMEOUT = 6.0     # local postgres; anything slower is "down"
 
 
-def _psql(sql: str, timeout: float = 15.0) -> Optional[List[List[str]]]:
-    """Run one read-only query. Returns rows split on the unit separator, or
-    None when gbrain is simply not reachable on this machine."""
-    if not shutil.which("psql"):
+def _query(sql: str, params: tuple = ()) -> Optional[List[List[str]]]:
+    """Run one read-only, parameterized query. Returns rows as strings, or
+    None when gbrain is simply not reachable on this machine.
+
+    Parameterization replaces the old hand-rolled quote-escaping that the
+    psql shell-out required — the driver does it properly.
+    """
+    try:
+        import psycopg
+    except ImportError:
+        logger.warning("gbrain recall unavailable: psycopg driver not installed")
         return None
     try:
-        out = subprocess.run(
-            ["psql", GBRAIN_URL, "-tA", "-F", "\x1f", "-c", sql],
-            capture_output=True, text=True, timeout=timeout,
-        )
+        with psycopg.connect(GBRAIN_URL, connect_timeout=_CONNECT_TIMEOUT) as conn:
+            conn.read_only = True
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+        return [["" if v is None else str(v) for v in row] for row in rows]
     except Exception as e:  # noqa: BLE001
         logger.warning("gbrain query failed: %s", e)
         return None
-    if out.returncode != 0:
-        logger.warning("gbrain query error: %s", (out.stderr or "")[:200])
-        return None
-    return [ln.split("\x1f") for ln in out.stdout.splitlines() if ln.strip()]
-
-
-def _q(text: str) -> str:
-    """Single-quote escape for inline SQL literals."""
-    return (text or "").replace("'", "''")
 
 
 def gbrain_search(query: str, limit: int = 5) -> str:
@@ -65,21 +76,22 @@ def gbrain_search(query: str, limit: int = 5) -> str:
     q = (query or "").strip()
     if not q:
         return json.dumps({"error": "query is required"})
-    like = f"%{_q(q)}%"
+    like = f"%{q}%"
+    n = max(1, min(int(limit or 5), 12))
     # Title/slug hits first — an entity page named for the thing you asked
     # about is a better answer than a passing mention inside another page.
-    rows = _psql(
+    rows = _query(
         "SELECT slug, coalesce(title,''), "
-        "left(regexp_replace(coalesce(compiled_truth,''), '\\s+', ' ', 'g'), "
-        f"{_SNIPPET}), length(coalesce(compiled_truth,'')), "
+        "left(regexp_replace(coalesce(compiled_truth,''), '\\s+', ' ', 'g'), %s), "
+        "length(coalesce(compiled_truth,'')), "
         "coalesce(to_char(updated_at,'YYYY-MM-DD'),'') "
         "FROM pages "
-        f"WHERE (title ILIKE '{like}' OR slug ILIKE '{like}' "
-        f"       OR compiled_truth ILIKE '{like}') "
+        "WHERE (title ILIKE %s OR slug ILIKE %s OR compiled_truth ILIKE %s) "
         "AND coalesce(compiled_truth,'') <> '' "
-        f"ORDER BY (title ILIKE '{like}' OR slug ILIKE '{like}') DESC, "
+        "ORDER BY (title ILIKE %s OR slug ILIKE %s) DESC, "
         "updated_at DESC NULLS LAST, length(compiled_truth) DESC "
-        f"LIMIT {max(1, min(int(limit or 5), 12))};"
+        "LIMIT %s;",
+        (_SNIPPET, like, like, like, like, like, n),
     )
     if rows is None:
         return json.dumps({
@@ -105,10 +117,11 @@ def gbrain_read(slug: str) -> str:
     s = (slug or "").strip()
     if not s:
         return json.dumps({"error": "slug is required"})
-    rows = _psql(
+    rows = _query(
         "SELECT slug, coalesce(title,''), coalesce(compiled_truth,''), "
         "coalesce(to_char(updated_at,'YYYY-MM-DD'),'') "
-        f"FROM pages WHERE slug = '{_q(s)}' LIMIT 1;"
+        "FROM pages WHERE slug = %s LIMIT 1;",
+        (s,),
     )
     if rows is None:
         return json.dumps({"error": "gbrain is not reachable on this machine",
@@ -126,10 +139,20 @@ def gbrain_read(slug: str) -> str:
 
 
 def check_gbrain_requirements() -> Dict[str, Any]:
-    """Available only where the brain actually is."""
-    if not shutil.which("psql"):
-        return {"available": False, "reason": "psql not installed"}
-    if _psql("SELECT 1;", timeout=6.0) is None:
+    """Available only where the brain actually is.
+
+    The reasons are deliberately distinct: "driver not installed" means the
+    venv needs a refresh (a provisioning problem on OUR side), while
+    "database not reachable" means this machine simply has no gbrain (normal
+    for a plain hermes-agent host). The first one should never be silently
+    read as the second.
+    """
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:
+        return {"available": False,
+                "reason": "psycopg driver not installed (venv needs refresh)"}
+    if _query("SELECT 1;") is None:
         return {"available": False, "reason": "gbrain database not reachable"}
     return {"available": True}
 
