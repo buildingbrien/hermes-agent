@@ -74,3 +74,21 @@ class RunPromptAwareness(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SleepImmuneWallClock(unittest.TestCase):
+    """A hibernating laptop must not execute its own cron jobs on wake.
+
+    2026-08-17: the founder's MacBook hit 1% battery two minutes into a
+    45-minute-capped run, hibernated for 2h19m, and the job was killed ONE
+    SECOND after he plugged it in — "ran 8465s of wall clock". time.time()
+    counts the afternoon; time.monotonic() pauses with the machine, which is
+    what a cap on the machine's attention means."""
+
+    def test_elapsed_is_measured_monotonic(self):
+        with open(SCHED) as f:
+            src = f.read()
+        self.assertIn("started_at = time.monotonic()", src)
+        self.assertIn("time.monotonic() - started_at", src)
+        self.assertIn("_run_started = time.monotonic()", src)
+        self.assertNotIn("time.time() - _run_started", src)

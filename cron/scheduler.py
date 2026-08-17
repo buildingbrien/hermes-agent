@@ -857,15 +857,23 @@ def _await_agent_result(future, agent, inactivity_limit=None, wall_clock_limit=N
     queue sat blocked behind it. An agent that is busy forever is just as
     dead to the queue as one that is hung.
     """
+    # time.monotonic(), never time.time(): on macOS the monotonic clock
+    # pauses while the machine sleeps, and that is exactly the behavior a
+    # wall-clock cap wants. Measured with time.time(), a founder's laptop
+    # that hibernated at 1%% battery mid-run (14:42, 2026-08-17) "ran" its
+    # 45-minute job for 8,465 seconds and was executed ONE SECOND after he
+    # plugged it back in — with about two minutes of real compute done. A
+    # sleeping laptop is not a runaway job; the cap should meter the
+    # machine's attention, not the passage of the afternoon.
     if started_at is None:
-        started_at = time.time()
+        started_at = time.monotonic()
     if inactivity_limit is None and wall_clock_limit is None:
         return future.result(), None
     while True:
         done, _ = concurrent.futures.wait({future}, timeout=poll_interval)
         if done:
             return future.result(), None
-        if wall_clock_limit is not None and (time.time() - started_at) >= wall_clock_limit:
+        if wall_clock_limit is not None and (time.monotonic() - started_at) >= wall_clock_limit:
             return None, "wall_clock"
         if inactivity_limit is not None:
             idle_secs = 0.0
@@ -1214,7 +1222,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _run_started = time.time()
+        _run_started = time.monotonic()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         try:
             result, _timeout_kind = _await_agent_result(
@@ -1230,7 +1238,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
 
         if _timeout_kind == "wall_clock":
-            _elapsed = time.time() - _run_started
+            _elapsed = time.monotonic() - _run_started
             logger.error(
                 "Job '%s' ran %.0fs of wall clock (limit %.0fs) without "
                 "finishing — killed so it stops blocking the cron queue",
