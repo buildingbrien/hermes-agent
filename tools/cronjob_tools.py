@@ -491,6 +491,7 @@ CRONJOB_SCHEMA = {
 Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
+For a job that carries GRANTS, always prefer action='update' over remove+recreate: the user's standing approval lives on the job, so deleting it burns their consent and recreating files a fresh approval card they must tap again. Update preserves the grant.
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 
