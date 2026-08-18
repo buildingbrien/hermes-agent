@@ -91,20 +91,45 @@ def dial_meeting_tool(args, **kwargs):
         minutes = 120
     time_limit_s = max(60, min(minutes * 60, 14400))  # 1 min – 4 h
 
-    payload = {
-        "to": to,
-        "pin": pin,
-        "label": label,
-        "time_limit_s": time_limit_s,
-        "session_id": os.environ.get("HERMES_SESSION_ID", "")[:80],
-    }
-    for key in ("email_to", "email_cc"):
-        val = (args.get(key) or "").strip()
-        if val:
-            payload[key] = val[:200]
+    # Two very different ways to be on a call (founder finding 2026-08-18:
+    # he added a bot to a live call, addressed it by name, and it could not
+    # answer — because this tool only ever reached the notetaker, which has
+    # NO live audio path at all; the transcript is batch, after the call):
+    #   notetaker — silent recorder, transcript afterward (the default).
+    #   clerk     — live participant via the voice server stream: hears the
+    #               call in real time and SPEAKS when addressed by wake word
+    #               ("copilot" or the agent's name).
+    mode = (args.get("mode") or "notetaker").strip().lower()
+    if mode not in ("notetaker", "clerk"):
+        mode = "notetaker"
+
+    if mode == "clerk":
+        agent = (os.environ.get("BRIDGE_PROFILE", "") or "thoth").strip().lower()
+        payload = {
+            "to": to,
+            "pin": pin,
+            "label": label,
+            "style": "clerk",
+            "agent": agent,
+            "time_limit_s": time_limit_s,
+        }
+        endpoint = "/api/voice/dial-meeting"
+    else:
+        payload = {
+            "to": to,
+            "pin": pin,
+            "label": label,
+            "time_limit_s": time_limit_s,
+            "session_id": os.environ.get("HERMES_SESSION_ID", "")[:80],
+        }
+        for key in ("email_to", "email_cc"):
+            val = (args.get(key) or "").strip()
+            if val:
+                payload[key] = val[:200]
+        endpoint = "/api/voice/notetaker"
 
     req = urllib.request.Request(
-        _bridge_url("/api/voice/notetaker"),
+        _bridge_url(endpoint),
         data=json.dumps(payload).encode(),
         headers=_auth_headers(),
         method="POST",
@@ -140,33 +165,52 @@ def dial_meeting_tool(args, **kwargs):
             recap += f" (cc {payload['email_cc']})"
         recap += " once it ends."
 
+    if mode == "clerk":
+        message = (
+            f"Dialing into {where} now from the fleet line as a LIVE "
+            f"participant. I can hear the call in real time — address me as "
+            f"\"copilot\" or by my name and I will answer out loud. I stay on "
+            f"for up to {minutes} minutes; the transcript is filed after."
+        )
+    else:
+        message = (
+            f"Dialing into {where} now from the fleet line. I will stay on the "
+            f"call silently for up to {minutes} minutes, then transcribe it. "
+            f"The notes land in Files → Meeting notes and I will post here when "
+            f"they are ready.{recap} (I cannot hear or speak live in this "
+            f"mode — ask for mode=clerk if you want me participating.)"
+        )
+
     return json.dumps({
         "success": True,
+        "mode": mode,
         "call_sid": result.get("call_sid", ""),
         "dialed": to,
         "label": label,
         "status": result.get("status", ""),
-        "message": (
-            f"Dialing into {where} now from the fleet line. I will stay on the "
-            f"call silently for up to {minutes} minutes, then transcribe it. "
-            f"The notes land in Files → Meeting notes and I will post here when "
-            f"they are ready.{recap}"
-        ),
+        "message": message,
     })
 
 
 DIAL_MEETING_SCHEMA = {
     "name": "dial_meeting",
     "description": (
-        "Call into a phone/conference meeting from this machine's fleet number "
-        "and take notes. Joins silently as a participant, records what it "
-        "hears, transcribes after the call, and files the notes (optionally "
-        "emailing a recap).\n"
-        "Use whenever someone wants you to sit in on, listen to, join, or take "
-        "notes at a meeting — e.g. 'join my 12 o'clock', 'take notes on this "
-        "call'. Needs the dial-in PHONE NUMBER from the invite; a video link "
-        "alone will not work, so ask for the number if you only have a URL.\n"
-        "Say plainly that the notes come after the meeting ends, not live."
+        "Call into a phone/conference meeting from this machine's fleet "
+        "number. Two modes:\n"
+        "mode='notetaker' (default) — join SILENTLY, record, transcribe after "
+        "the call, file the notes (optionally email a recap). It cannot hear "
+        "or speak live.\n"
+        "mode='clerk' — join as a LIVE participant: hears the call in real "
+        "time and speaks when addressed by wake word ('copilot' or the "
+        "agent's name). Use clerk whenever the person wants you to "
+        "PARTICIPATE, answer questions, or be available on the call — e.g. "
+        "'join and answer questions', 'be on the call with me', 'add you to "
+        "a call so I can ask you things'. Writing 'clerk' in the label does "
+        "NOT do this — only mode='clerk' does.\n"
+        "Needs the dial-in PHONE NUMBER from the invite; a video link alone "
+        "will not work, so ask for the number if you only have a URL.\n"
+        "Be honest about the mode you chose: notetaker notes come after the "
+        "meeting ends; clerk answers live."
     ),
     "parameters": {
         "type": "object",
@@ -174,6 +218,11 @@ DIAL_MEETING_SCHEMA = {
             "to": {
                 "type": "string",
                 "description": "Dial-in phone number from the invite, e.g. '+1 941-800-3261'.",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["notetaker", "clerk"],
+                "description": "notetaker = silent recorder (default). clerk = live participant that hears the call and answers when addressed ('copilot' or agent name).",
             },
             "pin": {
                 "type": "string",
