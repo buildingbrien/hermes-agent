@@ -1474,7 +1474,19 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # (issue #8585)
                 if success and not final_response:
                     success = False
-                    error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+                    # Name what the run DID, not just that it ended empty —
+                    # "empty response" alone left a tester's every-run failure
+                    # undiagnosable from his screen for a day (2026-08-17).
+                    _diag = ""
+                    try:
+                        _a = agent.get_activity_summary() if hasattr(agent, "get_activity_summary") else {}
+                        _diag = (f" [diagnostic: {_a.get('api_calls', '?')} api calls, "
+                                 f"{_a.get('tool_calls', '?')} tool calls, "
+                                 f"last: {str(_a.get('last_activity', '?'))[:80]}]")
+                    except Exception:
+                        pass
+                    error = ("Agent completed but produced empty response "
+                             "(model error, timeout, or misconfiguration)" + _diag)
 
                 # A run whose gated actions were BLOCKED did not do its job,
                 # and "ok" would say it did — the Google Ads monitor wore a

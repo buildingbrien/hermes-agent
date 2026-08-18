@@ -9285,6 +9285,7 @@ class AIAgent:
         self._invalid_tool_retries = 0
         self._invalid_json_retries = 0
         self._empty_content_retries = 0
+        self._grace_call_used = False  # each turn gets its own exhaustion grace call
         self._incomplete_scratchpad_retries = 0
         self._codex_incomplete_retries = 0
         self._thinking_prefill_retries = 0
@@ -9602,6 +9603,31 @@ class AIAgent:
                 _turn_exit_reason = "budget_exhausted"
                 if not self.quiet_mode:
                     self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
+                # One grace call, then out. Nothing ever armed this flag, so
+                # exhaustion-during-tool-flow ended the turn with an EMPTY
+                # final_response — the run did real work and reported none of
+                # it. A tester's fresh-machine Heartbeat failed every single
+                # run this way ("Agent completed but produced empty response",
+                # 2026-08-17): discovery burns the budget before the model
+                # gets a turn to write anything. The grace call tells it to
+                # stop working and say what it has — a partial report beats a
+                # blank one every time (same principle as the cron budget
+                # message: "stop calling tools now and report what you have").
+                if not getattr(self, "_grace_call_used", False):
+                    self._grace_call_used = True
+                    self._budget_grace_call = True
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM: Your tool budget for this run is exhausted. "
+                            "Do NOT call any more tools. Write your final answer "
+                            "now from what you have already found — a partial "
+                            "result with a note about what remains is expected "
+                            "and useful. If you truly found nothing, say what "
+                            "you tried.]"
+                        ),
+                    })
+                    continue
                 break
 
             # Fire step_callback for gateway hooks (agent:step event)
