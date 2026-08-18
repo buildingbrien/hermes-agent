@@ -280,10 +280,68 @@ def _get_cdp_override() -> str:
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
+            configured = str(browser_cfg.get("cdp_url", "") or "").strip()
+            if configured:
+                return _resolve_cdp_override(configured)
     except Exception as e:
         logger.debug("Could not read browser.cdp_url from config: %s", e)
 
+    # 3. The signed-in agent browser, discovered on its own. This is what
+    # makes "Sign in to a tool" a FEATURE rather than a demo: the user signs
+    # into the agent-browser Chrome profile, and the browser tools drive that
+    # same browser — with no YAML for anyone to hand-edit. Until 2026-08-17
+    # this fallback did not exist, so every sign-in landed in a browser no
+    # agent tool ever touched (the tools drove cloud/stealth providers with
+    # their own empty cookie stores), and the capability had never once
+    # worked end to end. Explicit env/config above still wins.
+    return _agent_browser_cdp()
+
+
+_AGENT_BROWSER_PROFILE = os.path.expanduser(
+    os.path.join(os.environ.get("LUCARYIN_HOME") or "~/.lucaryin", "agent-browser"))
+_AGENT_BROWSER_CDP_PORT = int(os.environ.get("LUCARYIN_CDP_PORT", "9222"))
+# The bridges that can launch the agent browser (any of them opens the same
+# shared profile — /api/ui-access/open-browser). Same map ask_agent uses.
+_BRIDGE_PORTS = (9001, 9005, 9006, 9007)
+
+
+def _agent_browser_cdp() -> str:
+    """CDP endpoint of the signed-in agent browser, or "" on a machine that
+    has never used one. If the profile exists but the browser is closed, ask
+    a local bridge to launch it — falling back silently to a DIFFERENT
+    browser would be worse than failing, because the agent would report an
+    authwall on a site the user is signed into (which reads as "the feature
+    is broken" and cost days of exactly that confusion)."""
+    if not os.path.isdir(_AGENT_BROWSER_PROFILE):
+        return ""
+    version_url = f"http://127.0.0.1:{_AGENT_BROWSER_CDP_PORT}/json/version"
+
+    def _ping() -> str:
+        try:
+            payload = requests.get(version_url, timeout=3).json()
+            return str(payload.get("webSocketDebuggerUrl") or "").strip()
+        except Exception:
+            return ""
+
+    ws = _ping()
+    if ws:
+        return ws
+    # Closed — ask a bridge to bring it up (single launcher lives bridge-side).
+    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    for port in _BRIDGE_PORTS:
+        try:
+            requests.post(f"http://127.0.0.1:{port}/api/ui-access/open-browser",
+                          headers=headers, timeout=35)
+        except Exception:
+            continue
+        ws = _ping()
+        if ws:
+            logger.info("agent browser relaunched via bridge :%s", port)
+            return ws
+    logger.warning(
+        "agent-browser profile exists but the browser could not be reached "
+        "or launched — signed-in sites will be unavailable this turn")
     return ""
 
 
