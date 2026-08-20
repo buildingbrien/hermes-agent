@@ -88,8 +88,16 @@ class TestNormalizeCustomProviderEntry:
             "unknownField": "value",
             "anotherBad": 42,
         }
-        logging.disable(logging.NOTSET)  # undo any global logging.disable() a prior test left set (pollution)
-        with caplog.at_level(logging.WARNING):
+        # Propagation-proof capture: another test in the suite can leave the
+        # config logger with propagate=False or a raised level (caplog reaches
+        # records only via propagation to root), which silently emptied
+        # caplog.records here. Force a clean logging state for THIS logger and
+        # capture at it directly.
+        logging.disable(logging.NOTSET)
+        _cfg = logging.getLogger("hermes_cli.config")
+        _cfg.propagate = True
+        _cfg.setLevel(logging.NOTSET)
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
             result = _normalize_custom_provider_entry(entry, provider_key="test")
         assert result is not None
         assert any("unknown config keys" in r.message.lower() for r in caplog.records)
@@ -100,8 +108,16 @@ class TestNormalizeCustomProviderEntry:
             "baseUrl": "https://api.example.com/v1",
             "apiKey": "sk-test-key",
         }
-        logging.disable(logging.NOTSET)  # undo any global logging.disable() a prior test left set (pollution)
-        with caplog.at_level(logging.WARNING):
+        # Propagation-proof capture: another test in the suite can leave the
+        # config logger with propagate=False or a raised level (caplog reaches
+        # records only via propagation to root), which silently emptied
+        # caplog.records here. Force a clean logging state for THIS logger and
+        # capture at it directly.
+        logging.disable(logging.NOTSET)
+        _cfg = logging.getLogger("hermes_cli.config")
+        _cfg.propagate = True
+        _cfg.setLevel(logging.NOTSET)
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
             result = _normalize_custom_provider_entry(entry, provider_key="test")
         assert result is not None
         camel_warnings = [r for r in caplog.records if "camelcase" in r.message.lower() or "auto-mapped" in r.message.lower()]
