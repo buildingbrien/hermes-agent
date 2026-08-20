@@ -190,6 +190,30 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 
 
 @pytest.fixture(autouse=True)
+def _reset_session_contextvars():
+    """Kill ContextVar pollution between tests. The gateway session context and
+    the approval session key are worker-global ContextVars; a test that sets one
+    and never resets leaks into later tests on the same xdist worker — a stale
+    context made cron origin fall back wrong (NoneType), and made approval waits
+    register under a leaked key. Reset to the 'never set' baseline so
+    get_session_env falls back to os.environ as it does in CLI/cron/tests."""
+    try:
+        import gateway.session_context as _sc
+        for _v in (_sc._SESSION_PLATFORM, _sc._SESSION_CHAT_ID, _sc._SESSION_CHAT_NAME,
+                   _sc._SESSION_THREAD_ID, _sc._SESSION_USER_ID, _sc._SESSION_USER_NAME,
+                   _sc._SESSION_KEY):
+            _v.set(_sc._UNSET)
+    except Exception:
+        pass
+    try:
+        import tools.approval as _ap
+        _ap._approval_session_key.set("")
+    except Exception:
+        pass
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
 

@@ -67,11 +67,13 @@ class TestNormalizeCustomProviderEntry:
         assert result is not None
         assert result["base_url"] == "https://integrate.api.nvidia.com/v1"
 
-    def test_base_url_preferred_over_api(self):
-        """base_url should be checked before api field."""
+    def test_api_preferred_over_base_url(self):
+        """`api` is the canonical endpoint field and wins over base_url when
+        both are present (precedence api > url > base_url — see
+        test_config.test_compatible_custom_providers_prefers_api_then_url_then_base_url)."""
         entry = {
-            "base_url": "https://correct.example.com/v1",
-            "api": "https://wrong.example.com/v1",
+            "api": "https://correct.example.com/v1",
+            "base_url": "https://wrong.example.com/v1",
             "api_key": "sk-test-key",
         }
         result = _normalize_custom_provider_entry(entry, provider_key="test")
@@ -86,6 +88,7 @@ class TestNormalizeCustomProviderEntry:
             "unknownField": "value",
             "anotherBad": 42,
         }
+        logging.disable(logging.NOTSET)  # undo any global logging.disable() a prior test left set (pollution)
         with caplog.at_level(logging.WARNING):
             result = _normalize_custom_provider_entry(entry, provider_key="test")
         assert result is not None
@@ -97,6 +100,7 @@ class TestNormalizeCustomProviderEntry:
             "baseUrl": "https://api.example.com/v1",
             "apiKey": "sk-test-key",
         }
+        logging.disable(logging.NOTSET)  # undo any global logging.disable() a prior test left set (pollution)
         with caplog.at_level(logging.WARNING):
             result = _normalize_custom_provider_entry(entry, provider_key="test")
         assert result is not None
