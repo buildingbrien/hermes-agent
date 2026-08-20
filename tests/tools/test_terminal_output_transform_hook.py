@@ -185,6 +185,20 @@ def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp
         encoding="utf-8",
     )
 
+    # Plugins are opt-in: enable this one in <HERMES_HOME>/config.yaml so
+    # discovery actually loads it (and registers its hook).
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - terminal_transform\n",
+        encoding="utf-8",
+    )
+
+    # Plugins are opt-in: enable this one in <HERMES_HOME>/config.yaml so
+    # discovery actually loads it (and registers its hook).
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - terminal_transform\n",
+        encoding="utf-8",
+    )
+
     plugins_mod.discover_plugins()
 
     long_output = "X" * 60000

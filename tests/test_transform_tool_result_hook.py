@@ -173,6 +173,20 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
         encoding="utf-8",
     )
 
+    # Plugins are opt-in: enable this one in <HERMES_HOME>/config.yaml so
+    # discovery actually loads it (and registers its hook).
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - transform_result_canon\n",
+        encoding="utf-8",
+    )
+
+    # Plugins are opt-in: enable this one in <HERMES_HOME>/config.yaml so
+    # discovery actually loads it (and registers its hook).
+    (hermes_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - transform_result_canon\n",
+        encoding="utf-8",
+    )
+
     plugins_mod.discover_plugins()
 
     out = _run_handle_function_call(

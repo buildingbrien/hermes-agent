@@ -128,8 +128,12 @@ class TestGeminiModelCatalog:
     def test_provider_models_exist(self):
         assert "gemini" in _PROVIDER_MODELS
         models = _PROVIDER_MODELS["gemini"]
-        assert "gemini-2.5-pro" in models
-        assert "gemini-2.5-flash" in models
+        # The gemini catalog is a hand-picked static list that churns as Google
+        # deprecates versions (e.g. gemini-2.5-pro/flash). Assert shape rather
+        # than specific version strings that keep getting deprecated.
+        assert models, "gemini catalog must be non-empty"
+        assert any(m.startswith("gemini-") for m in models)
+        # Gemma (base LLM family) is intentionally excluded from the chat catalog.
         assert "gemma-4-31b-it" not in models
 
     def test_provider_models_has_3x(self):

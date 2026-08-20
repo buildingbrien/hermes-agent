@@ -155,7 +155,7 @@ def test_wall_clock_applies_even_without_inactivity_limit():
 
 
 def test_wall_clock_counts_from_started_at():
-    started_long_ago = time.time() - 100
+    started_long_ago = time.monotonic() - 100
     result, kind = _run(BusyForeverAgent(), wall_clock_limit=50.0,
                         started_at=started_long_ago)
     assert kind == "wall_clock"

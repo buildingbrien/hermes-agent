@@ -218,7 +218,7 @@ def browser_cdp(
     # Reading cookies/storage would turn a non-portable local capability into
     # a portable secret — denied structurally, no approval path. See
     # lucaryin-ai/docs/ui-access-scope-2026-08-14.md (hard condition 1).
-    _m = (method or "").strip().lower()
+    _m = method.strip().lower() if isinstance(method, str) else ""
     _SESSION_MATERIAL = (
         "network.getcookies", "network.getallcookies", "network.setcookie",
         "network.setcookies", "network.clearbrowsercookies",

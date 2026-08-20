@@ -74,6 +74,20 @@ class TestInterruptPropagationToChild(unittest.TestCase):
         child.api_mode = "chat_completions"
         child.log_prefix = ""
         child._client_kwargs = {"api_key": "test", "base_url": "http://localhost:1234"}
+        # _interruptible_api_call computes a non-stream stale timeout, which reads
+        # provider/model/base_url (always set by AIAgent.__init__; the bare fixture
+        # built via __new__ must supply them). Local base_url => infinite stale
+        # timeout, so the interrupt (not the stale detector) is what fires.
+        child.provider = ""
+        child.model = "test"
+        child.base_url = "http://localhost:1234"
+        # _interruptible_api_call computes a non-stream stale timeout, which reads
+        # provider/model/base_url (always set by AIAgent.__init__; the bare fixture
+        # built via __new__ must supply them). Local base_url => infinite stale
+        # timeout, so the interrupt (not the stale detector) is what fires.
+        child.provider = ""
+        child.model = "test"
+        child.base_url = "http://localhost:1234"
 
         # Mock a slow API call
         mock_client = MagicMock()
