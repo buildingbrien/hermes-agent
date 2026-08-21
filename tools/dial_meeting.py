@@ -250,6 +250,71 @@ DIAL_MEETING_SCHEMA = {
 }
 
 
+def hangup_call_tool(args, **kwargs):
+    """Leave a call this machine is CURRENTLY on (#101). The bridge ends the
+    Twilio leg (Status=completed). Only works while on a call — the call_sid
+    comes from the agent's active-call context."""
+    call_sid = (args.get("call_sid") or "").strip()
+    if not re.fullmatch(r"CA[0-9a-fA-F]{32}", call_sid):
+        return tool_error(
+            "Need the call_sid of the call to leave (a Twilio 'CA…' id). It is in "
+            "your active-call context — you only have one when you are currently "
+            "on a call, so there is nothing to hang up otherwise."
+        )
+    req = urllib.request.Request(
+        _bridge_url("/api/voice/hangup"),
+        data=json.dumps({"call_sid": call_sid}).encode(),
+        headers=_auth_headers(),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            result = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read().decode()).get("error", "")
+        except Exception:
+            detail = ""
+        return tool_error(detail or f"The bridge refused the hangup (HTTP {e.code}).")
+    except urllib.error.URLError as e:
+        return tool_error(
+            f"Could not reach this machine's bridge to hang up ({e.reason}). "
+            "The Lucaryin app needs to be running."
+        )
+    except Exception as e:  # noqa: BLE001
+        return tool_error(f"Could not hang up the call: {e}")
+    if not result.get("success"):
+        return tool_error(result.get("error", "The call could not be hung up."))
+    return json.dumps({
+        "success": True,
+        "call_sid": call_sid,
+        "status": result.get("status", ""),
+        "message": "Left the call — I've hung up.",
+    })
+
+
+HANGUP_CALL_SCHEMA = {
+    "name": "hangup_call",
+    "description": (
+        "Hang up / leave a phone call this machine is CURRENTLY on. Use it when "
+        "the user asks you to hop off, leave, or end the call, OR when you can "
+        "tell from the live transcript that the meeting is over and everyone has "
+        "left. You can only do this while on a call — the call_sid is given to "
+        "you in your active-call context; there is nothing to hang up otherwise."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "call_sid": {
+                "type": "string",
+                "description": "The Twilio 'CA…' id of the live call to leave (from your active-call context).",
+            },
+        },
+        "required": ["call_sid"],
+    },
+}
+
+
 # --- Registry ---
 from tools.registry import registry
 
@@ -258,5 +323,13 @@ registry.register(
     toolset="voice",
     schema=DIAL_MEETING_SCHEMA,
     handler=dial_meeting_tool,
+    emoji="📞",
+)
+
+registry.register(
+    name="hangup_call",
+    toolset="voice",
+    schema=HANGUP_CALL_SCHEMA,
+    handler=hangup_call_tool,
     emoji="📞",
 )
