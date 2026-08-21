@@ -1287,22 +1287,28 @@ async def web_extract_tool(
 
                     try:
                         logger.info("Scraping: %s", url)
-                        # Run synchronous Firecrawl scrape in a thread with a
-                        # 60s timeout so a hung fetch doesn't block the session.
+                        # Run the synchronous Firecrawl scrape in a thread with a
+                        # bounded timeout so a hung fetch can't stall the turn.
+                        # Budget is configurable (WEB_SCRAPE_TIMEOUT, default 35s,
+                        # was a hardcoded 60s) — 60s of dead time per URL dominated
+                        # the tool-first-turn latency. The client acquisition
+                        # (_get_firecrawl_client: first-call construct + Nous token
+                        # fetch, up to ~15s) runs INSIDE the thread so it is
+                        # time-boxed too, instead of blocking the event loop
+                        # off-budget before the wait_for even starts.
+                        _scrape_timeout = float(os.getenv("WEB_SCRAPE_TIMEOUT", "35"))
                         try:
+                            def _acquire_and_scrape():
+                                return _get_firecrawl_client().scrape(url=url, formats=formats)
                             scrape_result = await asyncio.wait_for(
-                                asyncio.to_thread(
-                                    _get_firecrawl_client().scrape,
-                                    url=url,
-                                    formats=formats,
-                                ),
-                                timeout=60,
+                                asyncio.to_thread(_acquire_and_scrape),
+                                timeout=_scrape_timeout,
                             )
                         except asyncio.TimeoutError:
                             logger.warning("Firecrawl scrape timed out for %s", url)
                             results.append({
                                 "url": url, "title": "", "content": "",
-                                "error": "Scrape timed out after 60s — page may be too large or unresponsive. Try browser_navigate instead.",
+                                "error": f"Scrape timed out after {int(_scrape_timeout)}s — page may be too large or unresponsive. Try browser_navigate instead.",
                             })
                             continue
 

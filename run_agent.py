@@ -789,6 +789,7 @@ class AIAgent:
         verbose_logging: bool = False,
         quiet_mode: bool = False,
         ephemeral_system_prompt: str = None,
+        ephemeral_user_context: str = None,
         log_prefix_chars: int = 100,
         log_prefix: str = "",
         providers_allowed: List[str] = None,
@@ -883,6 +884,15 @@ class AIAgent:
         self.verbose_logging = verbose_logging
         self.quiet_mode = quiet_mode
         self.ephemeral_system_prompt = ephemeral_system_prompt
+        # Per-turn VOLATILE context (current date/time, email-feed snapshot,
+        # memory snapshot) that the bridge would otherwise prepend to the system
+        # prompt — which byte-changes the cached prefix every turn and DEFEATS
+        # DeepSeek's automatic prefix cache (its cache is exact-prefix; Anthropic
+        # cache_control markers are inert for it). Routed instead onto the tail
+        # of the current-turn USER message (see the _injections block in
+        # run_conversation), keeping the system prefix byte-stable so the cache
+        # hits across turns AND across a turn's tool-result round-trips.
+        self.ephemeral_user_context = ephemeral_user_context
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
@@ -9686,6 +9696,11 @@ class AIAgent:
                             _injections.append(_fenced)
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
+                    # Per-turn volatile context from the bridge (date/feeds/
+                    # memory). Lands on the user-message TAIL so the system
+                    # prefix stays byte-stable and DeepSeek's prefix cache hits.
+                    if getattr(self, "ephemeral_user_context", None):
+                        _injections.append(self.ephemeral_user_context)
                     if _injections:
                         _base = api_msg.get("content", "")
                         if isinstance(_base, str):
