@@ -154,7 +154,11 @@ def _find_bash() -> str:
         return custom
 
     found = shutil.which("bash")
-    if found:
+    # Skip the Microsoft Store "bash.exe" App-Execution-Alias — the WSL launcher
+    # stub in %LOCALAPPDATA%\Microsoft\WindowsApps. It is NOT a usable bash for
+    # running commands: with no WSL distro it exits 126, which is why EVERY
+    # terminal command failed on the Windows smoke. A real Git bash on PATH is ok.
+    if found and "\\windowsapps\\" not in found.replace("/", "\\").lower():
         return found
 
     for candidate in (

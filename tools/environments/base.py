@@ -10,7 +10,7 @@ import codecs
 import json
 import logging
 import os
-import select
+import queue
 import shlex
 import subprocess
 import threading
@@ -465,30 +465,48 @@ class BaseEnvironment(ABC):
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         def _drain():
+            # A background pump does the blocking os.read; this loop consumes it
+            # through a queue so it can still poll proc.poll() on idle. The old
+            # code used select() on the pipe fd — POSIX-only (Windows select
+            # accepts sockets only), so it hit OSError on the FIRST iteration and
+            # broke, leaving output empty for EVERY command on Windows. This is
+            # equivalent on POSIX and works on both (same "stop ~3 idle cycles
+            # after bash exits" grandchild-pipe behavior).
             fd = proc.stdout.fileno()
             idle_after_exit = 0
+            chunk_q: "queue.Queue" = queue.Queue()
+
+            def _pump():
+                try:
+                    while True:
+                        data = os.read(fd, 4096)
+                        if not data:
+                            break  # true EOF — all writers closed
+                        chunk_q.put(data)
+                except (ValueError, OSError):
+                    pass  # fd closed underneath us
+                finally:
+                    chunk_q.put(None)  # EOF sentinel
+
+            pump = threading.Thread(target=_pump, name="terminal-pump", daemon=True)
+            pump.start()
             try:
                 while True:
                     try:
-                        ready, _, _ = select.select([fd], [], [], 0.1)
-                    except (ValueError, OSError):
-                        break  # fd already closed
-                    if ready:
-                        try:
-                            chunk = os.read(fd, 4096)
-                        except (ValueError, OSError):
-                            break
-                        if not chunk:
-                            break  # true EOF — all writers closed
-                        output_chunks.append(decoder.decode(chunk))
-                        idle_after_exit = 0
-                    elif proc.poll() is not None:
-                        # bash is gone and the pipe was idle for ~100ms.  Give
-                        # it two more cycles to catch any buffered tail, then
-                        # stop — otherwise we wait forever on a grandchild pipe.
-                        idle_after_exit += 1
-                        if idle_after_exit >= 3:
-                            break
+                        data = chunk_q.get(timeout=0.1)
+                    except queue.Empty:
+                        if proc.poll() is not None:
+                            # bash is gone and the pipe was idle for ~100ms.  Give
+                            # it two more cycles to catch any buffered tail, then
+                            # stop — otherwise we wait forever on a grandchild pipe.
+                            idle_after_exit += 1
+                            if idle_after_exit >= 3:
+                                break
+                        continue
+                    if data is None:
+                        break  # EOF sentinel from the pump
+                    output_chunks.append(decoder.decode(data))
+                    idle_after_exit = 0
             finally:
                 # Flush any bytes buffered mid-sequence.  With ``errors="replace"``
                 # this emits U+FFFD for any final incomplete sequence rather than
