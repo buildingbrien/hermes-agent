@@ -127,7 +127,16 @@ TOOLSETS = {
         ],
         "includes": []
     },
-    
+
+    "desktop": {
+        "description": "Operate NAMED native macOS desktop apps (#54): screenshot, click, type, key. Reads are free on an allowlisted app; every state-changing action is human-approved; financial apps are excluded. Use only when the browser/API path cannot do it.",
+        "tools": [
+            "desktop_list_apps", "desktop_screenshot",
+            "desktop_click", "desktop_type", "desktop_key"
+        ],
+        "includes": []
+    },
+
     "cronjob": {
         "description": "Cronjob management tool - create, list, update, pause, resume, remove, and trigger scheduled tasks",
         "tools": ["cronjob"],
