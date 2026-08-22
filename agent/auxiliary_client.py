@@ -198,6 +198,12 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = {
 _PROVIDER_VISION_MODELS: Dict[str, str] = {
     "xiaomi": "mimo-v2-omni",
     "zai": "glm-5v-turbo",
+    # DeepSeek's only image-input model (released 2026-08-21). The main chat
+    # models (v4-pro / v4-flash) reject images, so a deepseek-main user MUST
+    # route vision to this id — same endpoint, same DEEPSEEK_API_KEY, priced
+    # like v4-flash. This makes DeepSeek the primary vision pathway for the
+    # whole deepseek-main fleet with no extra credential.
+    "deepseek": "deepseek-v4-flash-vision-exp",
 }
 
 # OpenRouter app attribution headers

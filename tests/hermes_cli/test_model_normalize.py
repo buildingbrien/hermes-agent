@@ -204,7 +204,8 @@ class TestDeepSeekV4:
         for m in ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro",
                   "deepseek/deepseek-chat", "deepseek", "r1", "think", ""]:
             out = _normalize_for_deepseek(m)
-            assert out in ("deepseek-v4-pro", "deepseek-v4-flash"), \
+            assert out in ("deepseek-v4-pro", "deepseek-v4-flash",
+                           "deepseek-v4-flash-vision-exp"), \
                 f"{m!r} -> {out!r} is not a supported DeepSeek model"
 
     def test_legacy_and_default_map_to_pro(self):
@@ -216,6 +217,32 @@ class TestDeepSeekV4:
         from hermes_cli.model_normalize import _normalize_for_deepseek
         assert _normalize_for_deepseek("flash") == "deepseek-v4-flash"
         assert _normalize_for_deepseek("deepseek-fast") == "deepseek-v4-flash"
+
+    def test_vision_exp_passes_through_uncollapsed(self):
+        """THE landmine: the vision id contains 'flash', so without canonical
+        membership the keyword rule rewrites it to the vision-less v4-flash and
+        every image call 400s. It must survive normalization verbatim."""
+        from hermes_cli.model_normalize import (
+            _normalize_for_deepseek,
+            normalize_model_for_provider,
+        )
+        assert _normalize_for_deepseek("deepseek-v4-flash-vision-exp") \
+            == "deepseek-v4-flash-vision-exp"
+        # Vendor-prefixed + mixed case also survive
+        assert normalize_model_for_provider(
+            "deepseek/deepseek-v4-flash-vision-exp", "deepseek"
+        ) == "deepseek-v4-flash-vision-exp"
+        assert _normalize_for_deepseek("DeepSeek-V4-Flash-Vision-Exp") \
+            == "deepseek-v4-flash-vision-exp"
+
+    def test_vision_keyword_beats_flash_keyword(self):
+        """Vision intent wins: only vision-exp accepts images, so any name
+        expressing vision must not land on the vision-less flash model."""
+        from hermes_cli.model_normalize import _normalize_for_deepseek
+        assert _normalize_for_deepseek("deepseek-vision") \
+            == "deepseek-v4-flash-vision-exp"
+        assert _normalize_for_deepseek("flash-vision") \
+            == "deepseek-v4-flash-vision-exp"
 
     def test_provider_default_is_v4_pro(self):
         from hermes_cli.model_switch import MODEL_ALIASES

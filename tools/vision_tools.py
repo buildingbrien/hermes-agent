@@ -412,17 +412,21 @@ async def vision_analyze_tool(
     
     This tool accepts either an HTTP/HTTPS URL or a local file path. For URLs,
     it downloads the image first. In both cases, the image is converted to base64
-    and processed using Gemini 3 Flash Preview via OpenRouter API.
-    
+    and sent to the auxiliary vision router. With no explicit model, the router
+    prefers the user's MAIN provider — on a DeepSeek-main machine that means
+    deepseek-v4-flash-vision-exp (same endpoint + API key as the chat model) —
+    then falls back to OpenRouter / Nous aggregators.
+
     The user_prompt parameter is expected to be pre-formatted by the calling
     function (typically model_tools.py) to include both full description
     requests and specific questions.
-    
+
     Args:
         image_url (str): The URL or local file path of the image to analyze.
                          Accepts http://, https:// URLs or absolute/relative file paths.
         user_prompt (str): The pre-formatted prompt for the vision model
-        model (str): The vision model to use (default: google/gemini-3-flash-preview)
+        model (str): Explicit vision model override (default: router-resolved,
+                     main-provider-first — e.g. deepseek-v4-flash-vision-exp)
     
     Returns:
         str: JSON string containing the analysis results with the following structure:
@@ -607,10 +611,23 @@ async def vision_analyze_tool(
         
         logger.info("Image analysis completed (%s characters)", analysis_length)
         
-        # Prepare successful response
+        # Prepare successful response. model_used reports what ACTUALLY served
+        # the call: the explicit arg when given, else the router's resolution —
+        # never a guess (previously it echoed the arg, so router-resolved calls
+        # reported model_used=None even though a real model answered).
+        resolved_model_used = model
+        if not resolved_model_used:
+            try:
+                from agent.auxiliary_client import resolve_vision_provider_client
+                _prov, _client, _resolved = resolve_vision_provider_client()
+                if _resolved:
+                    resolved_model_used = f"{_prov}/{_resolved}" if _prov else _resolved
+            except Exception:
+                pass
         result = {
             "success": True,
-            "analysis": analysis or "There was a problem with the request and the image could not be analyzed."
+            "analysis": analysis or "There was a problem with the request and the image could not be analyzed.",
+            "model_used": resolved_model_used,
         }
         
         debug_call_data["success"] = True

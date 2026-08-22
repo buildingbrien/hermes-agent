@@ -96,6 +96,38 @@ class TestResolveAutoMainFirst:
         assert model == "deepseek-chat"
         assert mock_resolve.call_args.args[0] == "deepseek"
 
+    def test_deepseek_main_vision_routes_to_flash_vision_exp(self, monkeypatch):
+        """DeepSeek-main machines route VISION to deepseek-v4-flash-vision-exp
+        — the only DeepSeek model that accepts images (v4-pro/v4-flash reject
+        them). This is the primary vision pathway for the DeepSeek-locked
+        fleet: same endpoint, same DEEPSEEK_API_KEY, no extra credential."""
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-test")
+
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="deepseek",
+        ), patch(
+            "agent.auxiliary_client._read_main_model", return_value="deepseek-v4-pro",
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client"
+        ) as mock_resolve:
+            mock_client = MagicMock()
+            mock_resolve.return_value = (mock_client, "deepseek-v4-flash-vision-exp")
+
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client()
+
+        assert provider == "deepseek"
+        assert client is mock_client
+        assert model == "deepseek-v4-flash-vision-exp"
+        # The router must ASK for the vision model, not the main chat model —
+        # deepseek-v4-pro cannot see.
+        assert mock_resolve.call_args.args[0] == "deepseek"
+        assert mock_resolve.call_args.args[1] == "deepseek-v4-flash-vision-exp"
+
     def test_main_unavailable_falls_through_to_chain(self, monkeypatch):
         """Main provider with no working client → fall back to aux chain."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")

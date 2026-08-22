@@ -12,8 +12,10 @@ Different LLM providers expect model identifiers in different formats:
   model IDs, but Claude still uses hyphenated native names like
   ``claude-sonnet-4-6``.
 - **OpenCode Go** preserves dots in model names: ``minimax-m2.7``.
-- **DeepSeek** only accepts two model identifiers:
-  ``deepseek-chat`` and ``deepseek-reasoner``.
+- **DeepSeek** only accepts the v4 family identifiers: ``deepseek-v4-pro``,
+  ``deepseek-v4-flash``, and ``deepseek-v4-flash-vision-exp`` (image input;
+  released 2026-08-21). Legacy names (deepseek-chat/deepseek-reasoner) are
+  deprecated — the API returns HTTP 400 for them.
 - **Custom** and remaining providers pass the name through as-is.
 
 This module centralises that translation so callers can simply write::
@@ -117,6 +119,12 @@ _DEEPSEEK_REASONER_KEYWORDS: frozenset[str] = frozenset({
 _DEEPSEEK_CANONICAL_MODELS: frozenset[str] = frozenset({
     "deepseek-v4-pro",
     "deepseek-v4-flash",
+    # Vision-capable flash (image input; released 2026-08-21). A DISTINCT id —
+    # plain v4-flash does NOT accept images and v4-pro has no vision at all.
+    # MUST be canonical: it contains "flash", so the keyword rule below would
+    # otherwise silently rewrite it to the vision-less deepseek-v4-flash and
+    # every image call would 400.
+    "deepseek-v4-flash-vision-exp",
 })
 
 
@@ -124,13 +132,20 @@ def _normalize_for_deepseek(model_name: str) -> str:
     """Map any model input to one of DeepSeek's accepted identifiers.
 
     DeepSeek deprecated deepseek-chat/deepseek-reasoner (their API returns HTTP
-    400 for them); supported names are deepseek-v4-pro (general + reasoning) and
-    deepseek-v4-flash (cheap/fast). Legacy names map to v4-pro.
+    400 for them); supported names are deepseek-v4-pro (general + reasoning),
+    deepseek-v4-flash (cheap/fast), and deepseek-v4-flash-vision-exp (image
+    input). Legacy names map to v4-pro.
     """
     bare = _strip_vendor_prefix(model_name).lower()
 
     if bare in _DEEPSEEK_CANONICAL_MODELS:
         return bare
+
+    # Vision intent beats the flash keyword: "deepseek-vision", "flash-vision"
+    # and similar all mean the multimodal model, and the only DeepSeek model
+    # that accepts images is vision-exp.
+    if "vision" in bare:
+        return "deepseek-v4-flash-vision-exp"
 
     for keyword in ("flash", "fast", "cheap", "mini", "lite"):
         if keyword in bare:
@@ -328,10 +343,10 @@ def normalize_model_for_provider(model_input: str, target_provider: str) -> str:
         'minimax-m2.5-free'
 
         >>> normalize_model_for_provider("deepseek-v3", "deepseek")
-        'deepseek-chat'
+        'deepseek-v4-pro'
 
-        >>> normalize_model_for_provider("deepseek-r1", "deepseek")
-        'deepseek-reasoner'
+        >>> normalize_model_for_provider("deepseek-v4-flash-vision-exp", "deepseek")
+        'deepseek-v4-flash-vision-exp'
 
         >>> normalize_model_for_provider("my-model", "custom")
         'my-model'
