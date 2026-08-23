@@ -309,7 +309,17 @@ _BRIDGE_PORTS = (9001, 9005, 9006, 9007)
 
 # Set when the signed-in browser existed but could not be reached/launched —
 # navigate surfaces this instead of silently proceeding cookie-less (#72).
+# Was STICKY (set true, never reset): one failed attach poisoned every later
+# navigate's result for the whole process with a false "unreachable" warning
+# (Phase 0b, 2026-08-23). Now cleared the moment an attach succeeds.
 _SIGNED_IN_BROWSER_UNREACHABLE = False
+
+
+def _mark_signed_in_reachable() -> None:
+    global _SIGNED_IN_BROWSER_UNREACHABLE
+    if _SIGNED_IN_BROWSER_UNREACHABLE:
+        logger.info("signed-in browser reachable again — clearing unreachable flag")
+    _SIGNED_IN_BROWSER_UNREACHABLE = False
 
 
 def _agent_browser_cdp() -> str:
@@ -332,6 +342,7 @@ def _agent_browser_cdp() -> str:
 
     ws = _ping()
     if ws:
+        _mark_signed_in_reachable()
         return ws
     # Closed — ask a bridge to bring it up (single launcher lives bridge-side).
     token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
@@ -345,6 +356,7 @@ def _agent_browser_cdp() -> str:
         ws = _ping()
         if ws:
             logger.info("agent browser relaunched via bridge :%s", port)
+            _mark_signed_in_reachable()
             return ws
     logger.warning(
         "agent-browser profile exists but the browser could not be reached "
@@ -833,6 +845,27 @@ BROWSER_TOOL_SCHEMAS = [
                 }
             },
             "required": ["url"]
+        }
+    },
+    {
+        "name": "browser_get_box",
+        "description": "Get an element's bounding box {x, y, width, height} in CSS pixels for a ref (e.g. '@e5'). Use this to convert a snapshot ref into real coordinates before any raw-coordinate mouse action, instead of guessing viewport math.",
+        "parameters": {
+            "type": "object",
+            "properties": {"ref": {"type": "string", "description": "Element ref, e.g. '@e5'"}},
+            "required": ["ref"]
+        }
+    },
+    {
+        "name": "browser_tab",
+        "description": "Manage browser tabs: list open tabs, open a new one, switch to one by index, or close the current tab. Use 'list' when a click may have opened a new tab and you're unsure which page you're acting on.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "new", "switch", "close"], "description": "Tab action (default: list)"},
+                "index": {"type": "integer", "description": "Tab index for 'switch'"}
+            },
+            "required": ["action"]
         }
     },
     {
@@ -1554,6 +1587,15 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "url": final_url,
             "title": title
         }
+        # Phase 0e: the cloud provider silently fell back to a LOCAL cookie-less
+        # Chromium — stamped on session_info but never surfaced. Tell the model,
+        # so "logged out" pages are read as "different browser", not "broken".
+        if isinstance(session_info, dict) and session_info.get("fallback_from_cloud"):
+            response["fallback_warning"] = (
+                f"NOTE: the cloud browser ({session_info.get('fallback_provider','?')}) "
+                f"was unavailable ({session_info.get('fallback_reason','unknown')}), so this "
+                "loaded in a local browser without your cloud session or its cookies. "
+                "Sign-in state may differ from what you expect.")
         if _SIGNED_IN_BROWSER_UNREACHABLE:
             response["signed_in_browser_unreachable"] = True
             response["signin_hint"] = (
@@ -1695,6 +1737,19 @@ def browser_snapshot(
         }, ensure_ascii=False)
 
 
+def _cursor_enabled(task_id: str) -> bool:
+    """Show the gliding cursor only where a human can SEE it: an attached CDP
+    browser (the signed-in headed Chrome, or /browser connect). Cloud + local
+    headless have no override and skip it (no wasted evals). Toggle off with
+    LUCARYIN_BROWSER_CURSOR=0."""
+    if os.environ.get("LUCARYIN_BROWSER_CURSOR", "1") == "0":
+        return False
+    try:
+        return bool(_get_cdp_override())
+    except Exception:
+        return False
+
+
 def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     """
     Click on an element.
@@ -1715,14 +1770,16 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     # Ensure ref starts with @
     if not ref.startswith("@"):
         ref = f"@{ref}"
-    
+
+    if _cursor_enabled(effective_task_id):
+        from tools.browser_cursor import show_cursor_at
+        show_cursor_at(_run_browser_command, effective_task_id, ref, pulse=True)
     result = _run_browser_command(effective_task_id, "click", [ref])
     
     if result.get("success"):
-        return json.dumps({
-            "success": True,
-            "clicked": ref
-        }, ensure_ascii=False)
+        resp = {"success": True, "clicked": ref}
+        _carry_dialog_warning(result, resp)
+        return json.dumps(resp, ensure_ascii=False)
     else:
         return json.dumps({
             "success": False,
@@ -1753,19 +1810,76 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         ref = f"@{ref}"
     
     # Use fill command (clears then types)
+    if _cursor_enabled(effective_task_id):
+        from tools.browser_cursor import show_cursor_at
+        show_cursor_at(_run_browser_command, effective_task_id, ref, pulse=False)
     result = _run_browser_command(effective_task_id, "fill", [ref, text])
     
     if result.get("success"):
-        return json.dumps({
-            "success": True,
-            "typed": text,
-            "element": ref
-        }, ensure_ascii=False)
+        resp = {"success": True, "typed": text, "element": ref}
+        _carry_dialog_warning(result, resp)
+        return json.dumps(resp, ensure_ascii=False)
     else:
         return json.dumps({
             "success": False,
             "error": result.get("error", f"Failed to type into {ref}")
         }, ensure_ascii=False)
+
+
+def _carry_dialog_warning(result: Dict[str, Any], resp: dict) -> None:
+    """Propagate the agent-browser CLI's `warning` onto a tool response.
+    A blocked confirm()/prompt() dialog wedges the page invisibly and the CLI
+    stamps a `warning`; our tools used to swallow it, so the model saw a
+    "successful" click while the real page was frozen behind a dialog (Phase
+    0c, C3). Full dialog CONTROL (accept/dismiss) arrives with the supervisor
+    (Phase 2); this at least makes the wedge visible."""
+    w = result.get("warning") or (result.get("data") or {}).get("warning")
+    if w:
+        resp["dialog_warning"] = str(w)
+
+
+def browser_get_box(ref: str, task_id: Optional[str] = None) -> str:
+    """Return an element's bounding box {x, y, width, height} in CSS pixels.
+
+    The sanctioned ref->pixel bridge (Phase 0d, C2). When a task must fall to
+    raw coordinates (Input.dispatchMouseEvent), this gives the authoritative
+    box for a ref instead of the model guessing viewport math."""
+    effective_task_id = task_id or "default"
+    if not ref.startswith("@"):
+        ref = f"@{ref}"
+    result = _run_browser_command(effective_task_id, "get", ["box", ref])
+    if result.get("success"):
+        data = result.get("data", result)
+        box = data.get("box", data) if isinstance(data, dict) else data
+        return json.dumps({"success": True, "ref": ref, "box": box}, ensure_ascii=False)
+    return json.dumps({"success": False, "ref": ref,
+                       "error": result.get("error", f"no box for {ref}")}, ensure_ascii=False)
+
+
+def browser_tab(action: str = "list", index: Optional[int] = None,
+                task_id: Optional[str] = None) -> str:
+    """Manage tabs: list | new | switch (with index) | close (Phase 0c, C3).
+
+    'which page am I on' is a top C2/C3 confusion source when a click opened a
+    new tab. Reads (list) are free; new/switch/close are navigation control of
+    the agent browser, not writes to the user's accounts, so ungated like
+    scroll/back."""
+    effective_task_id = task_id or "default"
+    act = (action or "list").strip().lower()
+    if act == "switch":
+        if index is None:
+            return json.dumps({"success": False, "error": "switch needs an index"})
+        args = [str(index)]
+    elif act in ("list", "new", "close"):
+        args = [act]
+    else:
+        return json.dumps({"success": False, "error": f"unknown tab action '{act}'"})
+    result = _run_browser_command(effective_task_id, "tab", args)
+    if result.get("success"):
+        return json.dumps({"success": True, "action": act,
+                           "data": result.get("data", {})}, ensure_ascii=False)
+    return json.dumps({"success": False, "action": act,
+                       "error": result.get("error", "tab command failed")}, ensure_ascii=False)
 
 
 def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
@@ -2609,6 +2723,22 @@ registry.register(
     handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🌐",
+)
+registry.register(
+    name="browser_get_box",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_get_box"],
+    handler=lambda args, **kw: browser_get_box(ref=args.get("ref", ""), task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
+    emoji="\U0001F4D0",
+)
+registry.register(
+    name="browser_tab",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_tab"],
+    handler=lambda args, **kw: browser_tab(action=args.get("action", "list"), index=args.get("index"), task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
+    emoji="\U0001F5C2",
 )
 registry.register(
     name="browser_snapshot",
