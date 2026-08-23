@@ -974,6 +974,28 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     job_id = job["id"]
     job_name = job["name"]
 
+    # ── Working-status marker (#111): tell the bridge WHICH job this tick is
+    # running so the sidebar can say "Working through a heartbeat" instead of
+    # a bare "Working…". Written at job start, cleared in the finally below —
+    # the bridge's /api/turn-status reads it only while a cron turn is live
+    # and only while fresh, so a crashed tick can't leave a stale label.
+    _marker_path = None
+    try:
+        _agent = (os.environ.get("BRIDGE_PROFILE") or "").strip().lower()
+        if _agent:
+            _home = os.path.expanduser(os.environ.get("LUCARYIN_HOME") or "~/.lucaryin")
+            os.makedirs(_home, exist_ok=True)
+            _marker_path = os.path.join(_home, f"cron-current-{_agent}.json")
+            _kind = ("heartbeat"
+                     if (job_id == "heartbeat_default"
+                         or "heartbeat" in (job_name or "").lower())
+                     else "scheduled")
+            with open(_marker_path, "w") as _mf:
+                json.dump({"job_id": job_id, "job_name": job_name,
+                           "kind": _kind, "started": time.time()}, _mf)
+    except Exception:
+        _marker_path = None
+
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
     # the whole agent run. We pass the result into _build_job_prompt so
@@ -1362,6 +1384,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 
     finally:
+        # Clear the working-status marker (#111) — the label must die with
+        # the job, never linger past it.
+        try:
+            if _marker_path and os.path.exists(_marker_path):
+                os.remove(_marker_path)
+        except Exception:
+            pass
         # Clean up injected env vars so they don't leak to other jobs
         for key in (
             "HERMES_SESSION_PLATFORM",
