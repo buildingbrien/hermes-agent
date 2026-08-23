@@ -1020,12 +1020,27 @@ def _create_local_session(task_id: str) -> Dict[str, str]:
     }
 
 
+def _start_supervisor(task_id: str, cdp_url: str) -> None:
+    """Best-effort: attach a CDPSupervisor to this session for dialog capture,
+    frame tracking, and a fast zero-subprocess eval channel (#113 Phase 2). A
+    supervisor that fails to start is logged and skipped — the browser tools
+    keep working over the subprocess CLI exactly as before."""
+    if os.environ.get("LUCARYIN_BROWSER_SUPERVISOR", "1") == "0":
+        return
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        SUPERVISOR_REGISTRY.get_or_start(task_id, cdp_url)
+    except Exception as e:
+        logger.debug("CDP supervisor not started for task %s: %s", task_id, e)
+
+
 def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     """Create a session that connects to a user-supplied CDP endpoint."""
     import uuid
     session_name = f"cdp_{uuid.uuid4().hex[:10]}"
     logger.info("Created CDP browser session %s → %s for task %s",
                 session_name, cdp_url, task_id)
+    _start_supervisor(task_id, cdp_url)
     return {
         "session_name": session_name,
         "bb_session_id": None,
@@ -1683,6 +1698,27 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         }, ensure_ascii=False)
 
 
+def _merge_supervisor_state(task_id: str, response: dict) -> None:
+    """Surface a wedged dialog (and its id) from the CDP supervisor onto a
+    tool response, so a blocking confirm()/prompt() is VISIBLE instead of an
+    invisible freeze (#113 Phase 2, C3). Best-effort; no supervisor → no-op."""
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        sup = SUPERVISOR_REGISTRY.get(task_id)
+        if sup is None:
+            return
+        snap = sup.snapshot()
+        dialogs = [d.to_dict() for d in snap.pending_dialogs]
+        if dialogs:
+            response["pending_dialogs"] = dialogs
+            response["dialog_hint"] = (
+                "A native dialog is blocking the page. Respond with "
+                "browser_dialog(action='accept'|'dismiss'[, prompt_text=...]) "
+                "before other actions.")
+    except Exception:
+        pass
+
+
 def browser_snapshot(
     full: bool = False,
     task_id: Optional[str] = None,
@@ -1728,7 +1764,7 @@ def browser_snapshot(
             "snapshot": snapshot_text,
             "element_count": len(refs) if refs else 0
         }
-        
+        _merge_supervisor_state(effective_task_id, response)
         return json.dumps(response, ensure_ascii=False)
     else:
         return json.dumps({
@@ -2526,7 +2562,15 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     """
     if task_id is None:
         task_id = "default"
-    
+
+    # Stop this task's CDP supervisor first (its thread + WS must not outlive
+    # the session it watched) — best-effort (#113 Phase 2).
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        SUPERVISOR_REGISTRY.stop(task_id)
+    except Exception as e:
+        logger.debug("supervisor stop for task %s: %s", task_id, e)
+
     # Also clean up Camofox session if running in Camofox mode.
     # Skip full close when managed persistence is enabled — the browser
     # profile (and its session cookies) must survive across agent tasks.

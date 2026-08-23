@@ -121,11 +121,13 @@ def _mask_token(token: str) -> str:
     return f"{token[:6]}...{token[-4:]}"
 
 
-def redact_sensitive_text(text: str) -> str:
+def redact_sensitive_text(text: str, *, force: bool = False) -> str:
     """Apply all redaction patterns to a block of text.
 
     Safe to call on any string -- non-matching text passes through unchanged.
-    Disabled when security.redact_secrets is false in config.yaml.
+    Disabled when security.redact_secrets is false in config.yaml, UNLESS
+    force=True (CDP/browser endpoint credentials must be masked even when the
+    general redactor is off — the supervisor's log-safety path, #113 Phase 2).
     """
     if text is None:
         return None
@@ -133,7 +135,7 @@ def redact_sensitive_text(text: str) -> str:
         text = str(text)
     if not text:
         return text
-    if not _REDACT_ENABLED:
+    if not _REDACT_ENABLED and not force:
         return text
 
     # Known prefixes (sk-, ghp_, etc.)
@@ -196,3 +198,28 @@ class RedactingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         original = super().format(record)
         return redact_sensitive_text(original)
+
+
+# ── CDP endpoint redaction (browser supervisor, #113) ─────────────────────
+import re as _re_cdp
+
+# ws://host:port/devtools/browser/<GUID> — the GUID is the debugging token.
+_CDP_WS_PATH_RE = _re_cdp.compile(r"(/devtools/(?:browser|page)/)[A-Za-z0-9._-]+")
+_URL_USERINFO_RE = _re_cdp.compile(r"(://)[^/@\s]+@")
+_URL_QUERY_RE = _re_cdp.compile(r"\?[^\s]*")
+
+
+def redact_cdp_url(value: object) -> str:
+    """Mask secrets in a CDP/browser endpoint URL before it is logged.
+
+    A CDP discovery/ws endpoint's path GUID, query tokens, and user:pass@
+    userinfo are pure credentials that must never reach logs. Unlike a web URL
+    (OAuth callbacks etc. the agent must follow), these carry no follow-value,
+    so we strip all three. Single source of truth for logging a CDP URL."""
+    text = redact_sensitive_text("" if value is None else str(value), force=True)
+    if not text:
+        return text
+    text = _CDP_WS_PATH_RE.sub(r"\1***", text)
+    text = _URL_USERINFO_RE.sub(r"\1***@", text)
+    text = _URL_QUERY_RE.sub("?***", text)
+    return text
