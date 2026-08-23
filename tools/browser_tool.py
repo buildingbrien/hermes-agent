@@ -162,8 +162,11 @@ _last_screenshot_cleanup_by_dir: dict[str, float] = {}
 # Configuration
 # ============================================================================
 
-# Default timeout for browser commands (seconds)
-DEFAULT_COMMAND_TIMEOUT = 30
+# Default timeout for browser commands (seconds). Was 30 — heavy SPAs
+# (LinkedIn) blew through it on every high-level command, pushing agents to
+# improvise via raw CDP (founder bump, 2026-08-23). config.yaml
+# browser.command_timeout still overrides.
+DEFAULT_COMMAND_TIMEOUT = 90
 
 # Max tokens for snapshot content before summarization
 SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
@@ -1527,7 +1530,7 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(effective_task_id)
     
-    result = _run_browser_command(effective_task_id, "open", [url], timeout=max(_get_command_timeout(), 60))
+    result = _run_browser_command(effective_task_id, "open", [url], timeout=max(_get_command_timeout(), 180))
     
     if result.get("success"):
         data = result.get("data", {})
