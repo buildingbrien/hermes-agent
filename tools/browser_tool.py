@@ -304,6 +304,10 @@ _AGENT_BROWSER_CDP_PORT = int(os.environ.get("LUCARYIN_CDP_PORT", "9222"))
 # shared profile — /api/ui-access/open-browser). Same map ask_agent uses.
 _BRIDGE_PORTS = (9001, 9005, 9006, 9007)
 
+# Set when the signed-in browser existed but could not be reached/launched —
+# navigate surfaces this instead of silently proceeding cookie-less (#72).
+_SIGNED_IN_BROWSER_UNREACHABLE = False
+
 
 def _agent_browser_cdp() -> str:
     """CDP endpoint of the signed-in agent browser, or "" on a machine that
@@ -342,6 +346,8 @@ def _agent_browser_cdp() -> str:
     logger.warning(
         "agent-browser profile exists but the browser could not be reached "
         "or launched — signed-in sites will be unavailable this turn")
+    global _SIGNED_IN_BROWSER_UNREACHABLE
+    _SIGNED_IN_BROWSER_UNREACHABLE = True
     return ""
 
 
@@ -794,6 +800,24 @@ atexit.register(_stop_browser_cleanup_thread)
 # ============================================================================
 
 BROWSER_TOOL_SCHEMAS = [
+    {
+        "name": "request_signin",
+        "description": "Ask the USER to sign in to a website the task needs. Use when a page lands on a login/sign-in wall, or when the team browser is unreachable and the task needs a signed-in site. Files a one-tap card in chat; approving opens the site's login page in the team browser in front of the user, they sign in themselves, and your turn resumes automatically once the session is live. NEVER ask for or type credentials. After calling this, end your turn.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "host": {
+                    "type": "string",
+                    "description": "The site's domain, e.g. 'linkedin.com'"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One short line on why the sign-in is needed (shown on the card)"
+                }
+            },
+            "required": ["host"]
+        }
+    },
     {
         "name": "browser_navigate",
         "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
@@ -1527,6 +1551,14 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "url": final_url,
             "title": title
         }
+        if _SIGNED_IN_BROWSER_UNREACHABLE:
+            response["signed_in_browser_unreachable"] = True
+            response["signin_hint"] = (
+                "WARNING: this page loaded in a browser WITHOUT the user's "
+                "signed-in sessions (the team browser could not be reached). "
+                "Anything that looks logged-out here may not be. If this task "
+                "needs a signed-in site, call request_signin(host=...) to pop "
+                "a sign-in card, then end your turn.")
         
         # Detect common "blocked" page patterns from title/url
         blocked_patterns = [
@@ -1538,6 +1570,32 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         ]
         title_lower = title.lower()
         
+        # ── Sign-in wall detection (#72) ─────────────────────────────
+        # A login front door is a STRUCTURED condition, not just page text:
+        # surface it so the model files a sign-in card instead of narrating
+        # an authwall snapshot (Clara's LinkedIn failure, 2026-08-23).
+        _signin_url_pat = ("/login", "/signin", "/sign-in", "/authwall",
+                           "/uas/login", "/checkpoint/", "accounts.google.com",
+                           "/auth/", "login.microsoftonline")
+        _signin_title_pat = ("sign in", "log in", "login", "sign up or log in",
+                             "authwall")
+        _fu = (final_url or "").lower()
+        if (any(p in _fu for p in _signin_url_pat)
+                or any(p == title_lower or p in title_lower[:40]
+                       for p in _signin_title_pat)):
+            try:
+                from urllib.parse import urlparse as _up
+                _host = _up(final_url).netloc.split(":")[0].lstrip("www.")
+            except Exception:
+                _host = ""
+            response["signin_wall"] = {"host": _host or "unknown", "url": final_url}
+            response["signin_hint"] = (
+                f"This landed on a login page — the user has no live session for "
+                f"{_host or 'this site'} in the team browser. Do NOT try to log in "
+                "yourself and do NOT ask for credentials. Call request_signin("
+                f"host=\"{_host}\") to pop a sign-in card for the user, then END "
+                "your turn telling them you'll continue once they're in.")
+
         if any(pattern in title_lower for pattern in blocked_patterns):
             response["bot_detection_warning"] = (
                 f"Page title '{title}' suggests bot detection. The site may have blocked this request. "
@@ -2057,6 +2115,58 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         }, ensure_ascii=False)
 
 
+def request_signin(host: str, reason: str = "") -> str:
+    """File a sign-in card so the USER can log in to a site the task needs (#72).
+
+    The card pops in chat; on approve the bridge opens + fronts the team
+    browser at the site's login page, the user signs in themselves, and the
+    turn auto-resumes when a fresh session appears. The agent never sees or
+    asks for credentials. After calling this, END the turn."""
+    h = (host or "").strip().lower()
+    if "//" in h:
+        h = h.split("//", 1)[1]
+    h = h.split("/", 1)[0].split(":", 1)[0].lstrip(".")
+    if not h or "." not in h:
+        return json.dumps({"success": False,
+                           "error": "host must be a domain like linkedin.com"})
+    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    payload = {
+        "host": h,
+        "reason": (reason or "").strip()[:300],
+        "agent": os.environ.get("BRIDGE_PROFILE", "thoth"),
+        "session_id": os.environ.get("HERMES_CRON_ORIGIN_CHAT_ID", ""),
+    }
+    for port in _BRIDGE_PORTS:
+        try:
+            r = requests.post(
+                f"http://127.0.0.1:{port}/api/ui-access/request-signin",
+                json=payload, headers=headers, timeout=10)
+        except Exception:
+            continue
+        if r.status_code == 403:
+            return json.dumps({"success": False,
+                               "error": f"{h} is excluded from signed-in tools "
+                                        "by policy (financial site)"})
+        try:
+            data = r.json()
+        except Exception:
+            continue
+        if data.get("ok"):
+            return json.dumps({
+                "success": True,
+                "approval_id": data.get("approval_id"),
+                "next_step": (
+                    "A sign-in card is now in front of the user. END YOUR TURN "
+                    f"with a short line telling them you'll continue with {h} "
+                    "as soon as they've signed in. Do not poll, do not retry "
+                    "the site, do not ask for credentials.")})
+        return json.dumps({"success": False, "error": data.get("error", "bridge refused")})
+    return json.dumps({"success": False,
+                       "error": "no bridge reachable to file the sign-in card"})
+
+
+
 def browser_vision(question: str, annotate: bool = False, task_id: Optional[str] = None) -> str:
     """
     Take a screenshot of the current page and analyze it with vision AI.
@@ -2481,6 +2591,14 @@ from tools.registry import registry, tool_error
 
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
+registry.register(
+    name="request_signin",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["request_signin"],
+    handler=lambda args, **kw: request_signin(
+        host=args.get("host", ""), reason=args.get("reason", "")),
+    emoji="🔐",
+)
 registry.register(
     name="browser_navigate",
     toolset="browser",
