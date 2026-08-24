@@ -180,3 +180,60 @@ def test_redact_cdp_url_masks_token():
     from agent.redact import redact_cdp_url
     assert "***" in redact_cdp_url("ws://127.0.0.1:9222/devtools/browser/SECRET-GUID")
     assert "SECRET-GUID" not in redact_cdp_url("ws://127.0.0.1:9222/devtools/browser/SECRET-GUID")
+
+
+# ── Phase 2 increment 2: fast eval + frame tree ──────────────────────
+def test_eval_via_supervisor_success():
+    fake = m.MagicMock()
+    fake.evaluate_runtime.return_value = {"ok": True, "result": '{"a":1}', "result_type": "string"}
+    with m.patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg:
+        reg.get.return_value = fake
+        out = bt._eval_via_supervisor("t1", "({a:1})")
+    assert out is not None
+    d = json.loads(out)
+    assert d["success"] and d["via"] == "supervisor" and d["result"] == {"a": 1}
+
+
+def test_eval_via_supervisor_none_when_no_supervisor():
+    with m.patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg:
+        reg.get.return_value = None
+        assert bt._eval_via_supervisor("t1", "1+1") is None
+
+
+def test_eval_via_supervisor_none_on_failure_falls_back():
+    fake = m.MagicMock()
+    fake.evaluate_runtime.return_value = {"ok": False, "error": "boom"}
+    with m.patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg:
+        reg.get.return_value = fake
+        assert bt._eval_via_supervisor("t1", "1+1") is None  # → subprocess path
+
+
+def test_browser_eval_prefers_supervisor():
+    with m.patch.object(bt, "_is_camofox_mode", return_value=False), \
+         m.patch.object(bt, "_eval_via_supervisor", return_value='{"success":true,"via":"supervisor"}') as fast, \
+         m.patch.object(bt, "_run_browser_command") as sub:
+        out = bt._browser_eval("document.title", "t1")
+    fast.assert_called_once()
+    sub.assert_not_called()  # never touched the subprocess CLI
+    assert json.loads(out)["via"] == "supervisor"
+
+
+def test_frame_tree_merged_only_when_children():
+    fake_sup = m.MagicMock()
+    snap = m.MagicMock()
+    snap.pending_dialogs = []
+    snap.frame_tree = {"top": {"id": "f0"}, "children": [{"id": "f1", "oopif": True}]}
+    fake_sup.snapshot.return_value = snap
+    resp = {"success": True}
+    with m.patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg:
+        reg.get.return_value = fake_sup
+        bt._merge_supervisor_state("t1", resp)
+    assert resp.get("frame_tree", {}).get("children")
+
+    # no children → not attached
+    snap.frame_tree = {"top": None, "children": []}
+    resp2 = {"success": True}
+    with m.patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg:
+        reg.get.return_value = fake_sup
+        bt._merge_supervisor_state("t1", resp2)
+    assert "frame_tree" not in resp2

@@ -1715,6 +1715,15 @@ def _merge_supervisor_state(task_id: str, response: dict) -> None:
                 "A native dialog is blocking the page. Respond with "
                 "browser_dialog(action='accept'|'dismiss'[, prompt_text=...]) "
                 "before other actions.")
+        # Frame tree (#113 increment 2): cross-origin iframes (OOPIF) live in
+        # separate CDP targets the flat snapshot can't see. Surfacing the tree
+        # ends "iframe blindness" — the model knows a nested frame exists and
+        # can target it (browser_cdp with frame_id) instead of concluding the
+        # content isn't there. Only attach it when there ARE child frames, to
+        # keep the common single-frame page's response lean.
+        tree = snap.frame_tree or {}
+        if tree.get("children"):
+            response["frame_tree"] = tree
     except Exception:
         pass
 
@@ -2086,12 +2095,54 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     }, ensure_ascii=False)
 
 
+def _eval_via_supervisor(task_id: str, expression: str) -> Optional[str]:
+    """Run `expression` over the CDP supervisor's WS. Returns a tool-shaped JSON
+    string on success, or None to signal "no supervisor / failed — use the
+    subprocess path". Never raises."""
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        sup = SUPERVISOR_REGISTRY.get(task_id)
+        if sup is None:
+            return None
+        r = sup.evaluate_runtime(expression)
+        if not isinstance(r, dict) or not r.get("ok"):
+            return None
+        raw = r.get("result")
+        parsed = raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return json.dumps({
+            "success": True,
+            "result": parsed,
+            "result_type": r.get("result_type") or type(parsed).__name__,
+            "via": "supervisor",
+        }, ensure_ascii=False, default=str)
+    except Exception:
+        return None
+
+
 def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate a JavaScript expression in the page context and return the result."""
     if _is_camofox_mode():
         return _camofox_eval(expression, task_id)
 
     effective_task_id = task_id or "default"
+
+    # Fast path (#113 Phase 2 increment 2): if a CDP supervisor is attached,
+    # evaluate over its already-open WebSocket — no fork+exec+Node+CDP-setup
+    # per call (the subprocess CLI eval's cost; the latency that forced the
+    # 90/180s timeout bump and pushed agents onto raw CDP). Gating is unchanged:
+    # the worker already decided allow on browser_console BEFORE this runs, so
+    # the fast channel is not a gate bypass. Any failure falls through to the
+    # subprocess path below — the supervisor is an accelerator, never a
+    # dependency.
+    fast = _eval_via_supervisor(effective_task_id, expression)
+    if fast is not None:
+        return fast
+
     result = _run_browser_command(effective_task_id, "eval", [expression])
 
     if not result.get("success"):
