@@ -525,6 +525,14 @@ BROWSER_SESSION_INACTIVITY_TIMEOUT = int(os.environ.get("BROWSER_INACTIVITY_TIME
 
 # Track last activity time per session
 _session_last_activity: Dict[str, float] = {}
+# Task ids whose session is ATTACHED to an external CDP browser (the signed-in
+# headed Chrome, or /browser connect). The 300s reaper is for local HEADLESS
+# daemons that cost resources; the user's own window costs nothing idle and
+# reaping it forces a slow relaunch/reattach + drops the supervisor (#113 P4).
+_cdp_attached_tasks: set = set()
+# A CDP-attached session only reaps after this much idle (1h) — a safety cap,
+# not the aggressive daemon TTL.
+CDP_ATTACHED_INACTIVITY_TIMEOUT = int(os.environ.get("BROWSER_CDP_INACTIVITY_TIMEOUT", "3600"))
 
 # Background cleanup thread state
 _cleanup_thread = None
@@ -598,7 +606,10 @@ def _cleanup_inactive_browser_sessions():
     
     with _cleanup_lock:
         for task_id, last_time in list(_session_last_activity.items()):
-            if current_time - last_time > BROWSER_SESSION_INACTIVITY_TIMEOUT:
+            ttl = (CDP_ATTACHED_INACTIVITY_TIMEOUT
+                   if task_id in _cdp_attached_tasks
+                   else BROWSER_SESSION_INACTIVITY_TIMEOUT)
+            if current_time - last_time > ttl:
                 sessions_to_cleanup.append(task_id)
     
     for task_id in sessions_to_cleanup:
@@ -1041,6 +1052,7 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     logger.info("Created CDP browser session %s → %s for task %s",
                 session_name, cdp_url, task_id)
     _start_supervisor(task_id, cdp_url)
+    _cdp_attached_tasks.add(task_id)
     return {
         "session_name": session_name,
         "bb_session_id": None,
@@ -2076,9 +2088,20 @@ def browser_back(task_id: Optional[str] = None) -> str:
     
     if result.get("success"):
         data = result.get("data", {})
+        final_url = data.get("url", "")
+        # SSRF re-check (#113 P4, upstream #56526): back-navigation can land on
+        # a private/internal address just like a redirect can. navigate already
+        # guards this; browser_back did not.
+        if (not _is_local_backend() and not _allow_private_urls()
+                and final_url and not _is_safe_url(final_url)):
+            _run_browser_command(effective_task_id, "open", ["about:blank"], timeout=10)
+            return json.dumps({
+                "success": False,
+                "error": "Blocked: back-navigation landed on a private/internal address",
+            }, ensure_ascii=False)
         return json.dumps({
             "success": True,
-            "url": data.get("url", "")
+            "url": final_url
         }, ensure_ascii=False)
     else:
         return json.dumps({
@@ -2704,6 +2727,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         SUPERVISOR_REGISTRY.stop(task_id)
     except Exception as e:
         logger.debug("supervisor stop for task %s: %s", task_id, e)
+    _cdp_attached_tasks.discard(task_id)
 
     # Also clean up Camofox session if running in Camofox mode.
     # Skip full close when managed persistence is enabled — the browser

@@ -288,3 +288,59 @@ def test_post_action_grabs_url_title_via_supervisor():
         bt._post_action_state("t1", resp)
     assert resp["url"] == "https://x.com/y" and resp["title"] == "Y Page"
     assert "refs_stale_hint" in resp
+
+
+# ── Phase 4: session lifecycle ───────────────────────────────────────
+def test_reaper_tiers_cdp_attached_sessions(monkeypatch):
+    now = 10_000.0
+    monkeypatch.setattr(bt, "BROWSER_SESSION_INACTIVITY_TIMEOUT", 300)
+    monkeypatch.setattr(bt, "CDP_ATTACHED_INACTIVITY_TIMEOUT", 3600)
+    # one headless (idle 400s → reap), one CDP-attached (idle 400s → keep)
+    bt._session_last_activity.clear(); bt._cdp_attached_tasks.clear()
+    bt._session_last_activity["headless"] = now - 400
+    bt._session_last_activity["signedin"] = now - 400
+    bt._cdp_attached_tasks.add("signedin")
+    reaped = []
+    with m.patch.object(bt, "time") as tmock, \
+         m.patch.object(bt, "cleanup_browser", side_effect=lambda t: reaped.append(t)):
+        tmock.time.return_value = now
+        bt._cleanup_inactive_browser_sessions()
+    assert "headless" in reaped and "signedin" not in reaped
+    bt._session_last_activity.clear(); bt._cdp_attached_tasks.clear()
+
+
+def test_reaper_reaps_cdp_after_long_ttl(monkeypatch):
+    now = 10_000.0
+    monkeypatch.setattr(bt, "CDP_ATTACHED_INACTIVITY_TIMEOUT", 3600)
+    bt._session_last_activity.clear(); bt._cdp_attached_tasks.clear()
+    bt._session_last_activity["signedin"] = now - 4000  # > 1h idle
+    bt._cdp_attached_tasks.add("signedin")
+    reaped = []
+    with m.patch.object(bt, "time") as tmock, \
+         m.patch.object(bt, "cleanup_browser", side_effect=lambda t: reaped.append(t)):
+        tmock.time.return_value = now
+        bt._cleanup_inactive_browser_sessions()
+    assert "signedin" in reaped
+    bt._session_last_activity.clear(); bt._cdp_attached_tasks.clear()
+
+
+def test_browser_back_blocks_private_redirect():
+    with m.patch.object(bt, "_is_camofox_mode", return_value=False), \
+         m.patch.object(bt, "_is_local_backend", return_value=False), \
+         m.patch.object(bt, "_allow_private_urls", return_value=False), \
+         m.patch.object(bt, "_is_safe_url", return_value=False), \
+         m.patch.object(bt, "_run_browser_command",
+                        return_value={"success": True, "data": {"url": "http://169.254.169.254/"}}):
+        out = json.loads(bt.browser_back("t1"))
+    assert out["success"] is False and "private/internal" in out["error"]
+
+
+def test_browser_back_allows_safe_url():
+    with m.patch.object(bt, "_is_camofox_mode", return_value=False), \
+         m.patch.object(bt, "_is_local_backend", return_value=False), \
+         m.patch.object(bt, "_allow_private_urls", return_value=False), \
+         m.patch.object(bt, "_is_safe_url", return_value=True), \
+         m.patch.object(bt, "_run_browser_command",
+                        return_value={"success": True, "data": {"url": "https://example.com/"}}):
+        out = json.loads(bt.browser_back("t1"))
+    assert out["success"] is True and out["url"] == "https://example.com/"
