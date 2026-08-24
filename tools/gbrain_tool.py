@@ -18,56 +18,65 @@ This exposes two verbs:
   gbrain_search(query)  — find compiled pages by title/slug/content
   gbrain_read(slug)     — read one page's compiled truth in full
 
-WHY A DRIVER AND NOT psql: the first version shelled out to the `psql` binary
-and gated availability on a PATH lookup of that binary. That check passes in every
-terminal (where Homebrew's /opt/homebrew/bin is on PATH) and fails inside the
-actual product: a Finder-launched app inherits launchd's PATH, which has no
-Homebrew, so every worker the bridge spawned reported "gbrain is not reachable"
-against a perfectly healthy database — for the entire release that shipped the
-feature. The founder found it by asking an agent a question the brain could
-answer and watching it come back empty. A Python driver has no PATH dependency
-and works the same from a terminal, from Finder, and on a customer Mac that
-never had Homebrew. (psycopg ships via hermes-bridge/requirements.txt, so the
-same provisioning pass that delivers this file delivers the driver.)
+WHY THE :9050 BRIDGE AND NOT A DB DRIVER: the previous version connected
+psycopg directly to a hardcoded postgres://localhost:5432/gbrain. That works on
+the founder's box (hand-built Postgres) and NOWHERE ELSE: the app provisions a
+PGLite brain on every customer machine, which has no :5432 server, so recall
+connected to a dead port, quietly returned "not reachable", and the registry
+dropped both tools against a perfectly healthy PGLite brain — for every customer
+(found 2026-08-24, the same class as the earlier psql-PATH scar). Routing
+through the local gbrain bridge (:9050, already a supervised bridge-manager
+child) fixes it for good: the bridge shells to the `gbrain` CLI, which reads
+~/.gbrain/config.json and so speaks PGLite and Postgres identically. Loopback
+HTTP has no PATH dependency and no engine assumption, and needs no psycopg.
 
-Degrades quietly either way: a machine without gbrain (or with the driver
-missing) reports that recall is unavailable rather than failing the turn.
+Degrades quietly either way: a machine without gbrain (or with the bridge down)
+reports that recall is unavailable rather than failing the turn.
 """
 
 import json
 import logging
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-GBRAIN_URL = os.environ.get("GBRAIN_URL", "postgres://localhost:5432/gbrain")
+# The local gbrain bridge — engine-agnostic recall over loopback (see the
+# module docstring). Overridable for a non-default port, but every bridge in the
+# fleet runs it on :9050.
+GBRAIN_BRIDGE = os.environ.get("GBRAIN_BRIDGE_URL", "http://127.0.0.1:9050")
 _MAX_CHARS = 6000          # one page's truth, trimmed for a context window
 _SNIPPET = 320
-_CONNECT_TIMEOUT = 6.0     # local postgres; anything slower is "down"
+_TIMEOUT = 8.0             # loopback; anything slower is "down"
+
+# Sentinel: the bridge responded with an HTTP error (it is UP, so this is a real
+# answer like 404-no-page), distinct from None (bridge unreachable = no recall).
+_HTTP_ERROR = "__http_error__"
 
 
-def _query(sql: str, params: tuple = ()) -> Optional[List[List[str]]]:
-    """Run one read-only, parameterized query. Returns rows as strings, or
-    None when gbrain is simply not reachable on this machine.
+def _bridge_get(path: str, params: Dict[str, str]) -> Optional[Any]:
+    """GET a gbrain-bridge endpoint on :9050.
 
-    Parameterization replaces the old hand-rolled quote-escaping that the
-    psql shell-out required — the driver does it properly.
+    Returns the decoded JSON body on success; a {"__http_error__": code} marker
+    when the bridge answered with an HTTP error (it is reachable — e.g. a 404
+    for an unknown slug); or None when the bridge itself is unreachable (no
+    gbrain on this machine, or the bridge is down), which the caller renders as
+    'recall unavailable' rather than failing the turn.
     """
+    url = f"{GBRAIN_BRIDGE}{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
     try:
-        import psycopg
-    except ImportError:
-        logger.warning("gbrain recall unavailable: psycopg driver not installed")
-        return None
-    try:
-        with psycopg.connect(GBRAIN_URL, connect_timeout=_CONNECT_TIMEOUT) as conn:
-            conn.read_only = True
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                rows = cur.fetchall()
-        return [["" if v is None else str(v) for v in row] for row in rows]
-    except Exception as e:  # noqa: BLE001
-        logger.warning("gbrain query failed: %s", e)
+        with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        logger.warning("gbrain bridge %s → HTTP %s", path, e.code)
+        return {_HTTP_ERROR: e.code}
+    except Exception as e:  # noqa: BLE001 — any transport failure = unavailable
+        logger.warning("gbrain bridge %s unreachable: %s", path, e)
         return None
 
 
@@ -76,40 +85,68 @@ def gbrain_search(query: str, limit: int = 5) -> str:
     q = (query or "").strip()
     if not q:
         return json.dumps({"error": "query is required"})
-    like = f"%{q}%"
     n = max(1, min(int(limit or 5), 12))
-    # Title/slug hits first — an entity page named for the thing you asked
-    # about is a better answer than a passing mention inside another page.
-    rows = _query(
-        "SELECT slug, coalesce(title,''), "
-        "left(regexp_replace(coalesce(compiled_truth,''), '\\s+', ' ', 'g'), %s), "
-        "length(coalesce(compiled_truth,'')), "
-        "coalesce(to_char(updated_at,'YYYY-MM-DD'),'') "
-        "FROM pages "
-        "WHERE (title ILIKE %s OR slug ILIKE %s OR compiled_truth ILIKE %s) "
-        "AND coalesce(compiled_truth,'') <> '' "
-        "ORDER BY (title ILIKE %s OR slug ILIKE %s) DESC, "
-        "updated_at DESC NULLS LAST, length(compiled_truth) DESC "
-        "LIMIT %s;",
-        (_SNIPPET, like, like, like, like, like, n),
-    )
-    if rows is None:
+    body = _bridge_get("/api/gbrain/search", {"q": q})
+    if body is None or (isinstance(body, dict) and _HTTP_ERROR in body):
         return json.dumps({
             "error": "gbrain is not reachable on this machine",
             "recall_available": False,
         })
-    if not rows:
+    data = body.get("results") if isinstance(body, dict) else None
+    results = _parse_search_results(data, n)
+    if not results:
         return json.dumps({"query": q, "results": [],
                            "note": "nothing compiled about this yet"})
-    return json.dumps({
-        "query": q,
-        "results": [
-            {"slug": r[0], "title": r[1], "snippet": r[2],
-             "chars": int(r[3] or 0), "updated": r[4],
-             "read_with": f"gbrain_read(slug='{r[0]}')"}
-            for r in rows if len(r) >= 5
-        ],
-    }, indent=2)
+    return json.dumps({"query": q, "results": results}, indent=2)
+
+
+def _parse_search_results(data: Any, n: int) -> List[Dict[str, Any]]:
+    """Normalise the bridge's `results` into a list of {slug,snippet,score,...}.
+
+    The gbrain CLI's `search --json` emits `data` as a formatted TEXT block —
+    one hit per record, "[score] slug -- snippet" (snippets can wrap lines) —
+    not structured rows, so we parse that. A future CLI that returns a real list
+    of dicts is also handled (the isinstance(list) branch), so this tool doesn't
+    break either way.
+    """
+    results: List[Dict[str, Any]] = []
+    if isinstance(data, list):
+        for item in data[:n]:
+            if not isinstance(item, dict):
+                continue
+            slug = str(item.get("slug") or item.get("id") or "").strip()
+            snippet = (item.get("snippet") or item.get("summary")
+                       or str(item.get("content") or ""))[:_SNIPPET]
+            results.append({
+                "slug": slug,
+                "title": item.get("title", ""),
+                "snippet": snippet,
+                "read_with": f"gbrain_read(slug='{slug}')" if slug else None,
+            })
+        return results
+    if isinstance(data, str) and data.strip():
+        import re
+        # Each hit starts with "[<score>]"; snippet runs to the next "[score]"
+        # marker or end-of-string, so multi-line snippets stay intact.
+        pat = re.compile(
+            r"\[(?P<score>[0-9.]+)\]\s+(?P<slug>\S+)"
+            r"(?:\s+--\s+(?P<snippet>.*?))?(?=\n\[[0-9.]+\]|\Z)",
+            re.S,
+        )
+        for m in pat.finditer(data):
+            slug = m.group("slug").strip()
+            snippet = (m.group("snippet") or "").strip()
+            # collapse internal whitespace so the snippet reads on one line
+            snippet = re.sub(r"\s+", " ", snippet)[:_SNIPPET]
+            results.append({
+                "slug": slug,
+                "snippet": snippet,
+                "score": float(m.group("score")),
+                "read_with": f"gbrain_read(slug='{slug}')",
+            })
+            if len(results) >= n:
+                break
+    return results
 
 
 def gbrain_read(slug: str) -> str:
@@ -117,43 +154,40 @@ def gbrain_read(slug: str) -> str:
     s = (slug or "").strip()
     if not s:
         return json.dumps({"error": "slug is required"})
-    rows = _query(
-        "SELECT slug, coalesce(title,''), coalesce(compiled_truth,''), "
-        "coalesce(to_char(updated_at,'YYYY-MM-DD'),'') "
-        "FROM pages WHERE slug = %s LIMIT 1;",
-        (s,),
-    )
-    if rows is None:
+    body = _bridge_get("/api/gbrain/page", {"slug": s})
+    if body is None:
         return json.dumps({"error": "gbrain is not reachable on this machine",
                            "recall_available": False})
-    if not rows:
+    if isinstance(body, dict) and _HTTP_ERROR in body:
+        # The bridge answered — a 404 means there is simply no such page.
         return json.dumps({"error": f"no compiled page at slug '{s}'",
                            "hint": "use gbrain_search first"})
-    r = rows[0]
-    truth = r[2] if len(r) > 2 else ""
+    content = str(body.get("content", "")) if isinstance(body, dict) else ""
+    if not content:
+        return json.dumps({"error": f"no compiled page at slug '{s}'",
+                           "hint": "use gbrain_search first"})
     return json.dumps({
-        "slug": r[0], "title": r[1], "updated": r[3] if len(r) > 3 else "",
-        "truncated": len(truth) > _MAX_CHARS,
-        "compiled_truth": truth[:_MAX_CHARS],
+        "slug": s,
+        "truncated": len(content) > _MAX_CHARS,
+        "compiled_truth": content[:_MAX_CHARS],
     }, indent=2)
 
 
 def check_gbrain_requirements() -> Dict[str, Any]:
     """Available only where the brain actually is.
 
-    The reasons are deliberately distinct: "driver not installed" means the
-    venv needs a refresh (a provisioning problem on OUR side), while
-    "database not reachable" means this machine simply has no gbrain (normal
-    for a plain hermes-agent host). The first one should never be silently
-    read as the second.
+    Probes the gbrain bridge's /health. A reachable, healthy bridge means recall
+    works (on either engine); an unreachable bridge means this machine simply
+    has no gbrain (normal for a plain hermes-agent host) — reported as
+    unavailable so the registry hides the tools rather than offering ones that
+    would only ever answer "not reachable".
     """
-    try:
-        import psycopg  # noqa: F401
-    except ImportError:
+    body = _bridge_get("/health", {})
+    if body is None:
+        return {"available": False, "reason": "gbrain bridge not reachable (:9050)"}
+    if isinstance(body, dict) and _HTTP_ERROR in body:
         return {"available": False,
-                "reason": "psycopg driver not installed (venv needs refresh)"}
-    if _query("SELECT 1;") is None:
-        return {"available": False, "reason": "gbrain database not reachable"}
+                "reason": f"gbrain bridge unhealthy (HTTP {body[_HTTP_ERROR]})"}
     return {"available": True}
 
 

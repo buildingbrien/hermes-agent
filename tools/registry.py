@@ -309,7 +309,19 @@ class ToolRegistry:
             if entry.check_fn:
                 if entry.check_fn not in check_results:
                     try:
-                        check_results[entry.check_fn] = bool(entry.check_fn())
+                        raw = entry.check_fn()
+                        # A check may return a plain bool OR a dict like
+                        # {"available": bool, "reason": str}. bool(dict) is
+                        # ALWAYS truthy for a non-empty dict, so a dict MUST be
+                        # read by its "available" key — otherwise a genuinely
+                        # unavailable tool (e.g. gbrain recall on a machine whose
+                        # brain/bridge is down) is never hidden, and the model is
+                        # handed a tool that can only ever answer "not reachable"
+                        # (silent bug found 2026-08-24).
+                        if isinstance(raw, dict):
+                            check_results[entry.check_fn] = bool(raw.get("available", True))
+                        else:
+                            check_results[entry.check_fn] = bool(raw)
                     except Exception:
                         check_results[entry.check_fn] = False
                         if not quiet:
