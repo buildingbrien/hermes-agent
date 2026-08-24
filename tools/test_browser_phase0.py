@@ -1,6 +1,7 @@
 """Phase 0 browser tools: get_box, tab, dialog-warning surfacing, sticky-flag
 reset. Mocks the CLI layer (_run_browser_command) — asserts wiring, not Chrome."""
 import json
+import os
 import importlib
 import unittest.mock as m
 import pytest
@@ -237,3 +238,53 @@ def test_frame_tree_merged_only_when_children():
         reg.get.return_value = fake_sup
         bt._merge_supervisor_state("t1", resp2)
     assert "frame_tree" not in resp2
+
+
+# ── Phase 3: snapshot / coordinate honesty ───────────────────────────
+def test_count_visible_refs_boundary_safe():
+    text = "button [ref=e5] link [ref=e12] input @e3"
+    refs = {"e5": 1, "e12": 1, "e3": 1, "e50": 1}  # e50 is NOT in text
+    n = bt._count_visible_refs(text, refs)
+    assert n == 3  # e5, e12, e3 present; e50 absent (and e5 doesn't match e50)
+
+
+def test_count_visible_refs_empty():
+    assert bt._count_visible_refs("anything", {}) == 0
+
+
+def test_snapshot_honest_count_and_paging(tmp_path, monkeypatch):
+    monkeypatch.setenv("LUCARYIN_HOME", str(tmp_path))
+    big = "x" * 9000 + " ".join(f"[ref=e{i}]" for i in range(60))
+    with m.patch.object(bt, "_is_camofox_mode", return_value=False), \
+         m.patch.object(bt, "_get_session_info", return_value={"features": {}}), \
+         m.patch.object(bt, "_run_browser_command",
+                        return_value={"success": True, "data": {"snapshot": big,
+                                      "refs": {f"e{i}": 1 for i in range(60)}}}), \
+         m.patch.object(bt, "_extract_relevant_content", side_effect=lambda t, u: "[ref=e0] [ref=e1] [ref=e2]"), \
+         m.patch.object(bt, "_merge_supervisor_state", lambda *a: None):
+        out = json.loads(bt.browser_snapshot(task_id="t1", user_task="find login"))
+    assert out["total_element_count"] == 60
+    assert out["element_count"] == 3          # only 3 refs survived summarization
+    assert out["truncated"] is True
+    assert "full_snapshot_path" in out and os.path.exists(out["full_snapshot_path"])
+    assert "3 of 60" in out["truncation_hint"]
+
+
+def test_post_action_adds_stale_hint_without_supervisor():
+    resp = {"success": True, "clicked": "@e2"}
+    with m.patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg:
+        reg.get.return_value = None
+        bt._post_action_state("t1", resp)
+    assert "refs_stale_hint" in resp
+    assert "url" not in resp  # no supervisor → no cheap url/title
+
+
+def test_post_action_grabs_url_title_via_supervisor():
+    fake = m.MagicMock()
+    fake.evaluate_runtime.return_value = {"ok": True, "result": '{"u":"https://x.com/y","t":"Y Page"}'}
+    resp = {"success": True, "clicked": "@e2"}
+    with m.patch("tools.browser_supervisor.SUPERVISOR_REGISTRY") as reg:
+        reg.get.return_value = fake
+        bt._post_action_state("t1", resp)
+    assert resp["url"] == "https://x.com/y" and resp["title"] == "Y Page"
+    assert "refs_stale_hint" in resp

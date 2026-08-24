@@ -1698,6 +1698,41 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         }, ensure_ascii=False)
 
 
+import re as _re_snap
+
+def _count_visible_refs(snapshot_text: str, refs) -> int:
+    """How many of the page's refs are ACTUALLY present in the (possibly
+    truncated/summarized) text the model received. Boundary-safe so 'e5' does
+    not match 'e50'. This is the honest count — element_count used to report
+    the full ref total even after truncation hid half of them (C2)."""
+    if not refs:
+        return 0
+    n = 0
+    for k in refs:
+        rid = str(k).lstrip("@").strip()
+        if rid and _re_snap.search(rf"(?<![A-Za-z0-9]){_re_snap.escape(rid)}(?![A-Za-z0-9])", snapshot_text):
+            n += 1
+    return n
+
+
+def _store_full_snapshot(task_id: str, full_text: str) -> Optional[str]:
+    """Persist the pre-truncation snapshot so the model can page it with
+    read_file instead of acting on a lossy view (C2, upstream #65923). Returns
+    the path, or None on failure (best-effort — never blocks the snapshot)."""
+    try:
+        import hashlib
+        cache_dir = os.path.join(os.path.expanduser(
+            os.environ.get("LUCARYIN_HOME") or "~/.hermes"), "cache", "web")
+        os.makedirs(cache_dir, exist_ok=True)
+        h = hashlib.sha1(full_text.encode("utf-8", "ignore")).hexdigest()[:12]
+        path = os.path.join(cache_dir, f"snapshot-{(task_id or 'default')}-{h}.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(full_text)
+        return path
+    except Exception:
+        return None
+
+
 def _merge_supervisor_state(task_id: str, response: dict) -> None:
     """Surface a wedged dialog (and its id) from the CDP supervisor onto a
     tool response, so a blocking confirm()/prompt() is VISIBLE instead of an
@@ -1761,18 +1796,36 @@ def browser_snapshot(
         data = result.get("data", {})
         snapshot_text = data.get("snapshot", "")
         refs = data.get("refs", {})
-        
-        # Check if snapshot needs summarization
-        if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD and user_task:
+        full_snapshot_text = snapshot_text
+        total_refs = len(refs) if refs else 0
+
+        # Summarize / truncate large snapshots.
+        was_reduced = len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD
+        if was_reduced and user_task:
             snapshot_text = _extract_relevant_content(snapshot_text, user_task)
-        elif len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+        elif was_reduced:
             snapshot_text = _truncate_snapshot(snapshot_text)
-        
+
+        # HONEST count (C2): report refs actually in the returned text, and the
+        # page total separately — never the full total as if all were visible.
+        visible = _count_visible_refs(snapshot_text, refs)
         response = {
             "success": True,
             "snapshot": snapshot_text,
-            "element_count": len(refs) if refs else 0
+            "element_count": visible,
+            "total_element_count": total_refs,
         }
+        if was_reduced:
+            response["truncated"] = True
+            hidden = max(0, total_refs - visible)
+            path = _store_full_snapshot(effective_task_id, full_snapshot_text)
+            if path:
+                response["full_snapshot_path"] = path
+                response["truncation_hint"] = (
+                    f"This snapshot was condensed: {visible} of {total_refs} elements "
+                    f"are shown ({hidden} hidden). If the element you need isn't here, "
+                    f"read_file(\"{path}\") to page the full snapshot, or narrow with a "
+                    "task-specific browser_snapshot.")
         _merge_supervisor_state(effective_task_id, response)
         return json.dumps(response, ensure_ascii=False)
     else:
@@ -1824,6 +1877,7 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     if result.get("success"):
         resp = {"success": True, "clicked": ref}
         _carry_dialog_warning(result, resp)
+        _post_action_state(effective_task_id, resp)
         return json.dumps(resp, ensure_ascii=False)
     else:
         return json.dumps({
@@ -1863,6 +1917,7 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     if result.get("success"):
         resp = {"success": True, "typed": text, "element": ref}
         _carry_dialog_warning(result, resp)
+        _post_action_state(effective_task_id, resp)
         return json.dumps(resp, ensure_ascii=False)
     else:
         return json.dumps({
@@ -1881,6 +1936,34 @@ def _carry_dialog_warning(result: Dict[str, Any], resp: dict) -> None:
     w = result.get("warning") or (result.get("data") or {}).get("warning")
     if w:
         resp["dialog_warning"] = str(w)
+
+
+def _post_action_state(task_id: str, resp: dict) -> None:
+    """After a click/type/scroll, tell the model the page may have changed so it
+    doesn't reuse stale refs (C2 — actions returned only {"clicked": ref}, and a
+    silently-mutated page then mis-targeted the next ref). When a CDP supervisor
+    is attached, also fetch url+title over its fast WS (~3ms) so a navigation is
+    visible without a full snapshot."""
+    resp["refs_stale_hint"] = (
+        "This may have changed the page. Element refs from an earlier snapshot "
+        "can now be stale — call browser_snapshot to refresh before using them.")
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+        sup = SUPERVISOR_REGISTRY.get(task_id)
+        if sup is None:
+            return
+        r = sup.evaluate_runtime(
+            "JSON.stringify({u: location.href, t: document.title})")
+        if isinstance(r, dict) and r.get("ok"):
+            raw = r.get("result")
+            info = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(info, dict):
+                if info.get("u"):
+                    resp["url"] = info["u"]
+                if info.get("t"):
+                    resp["title"] = info["t"]
+    except Exception:
+        pass
 
 
 def browser_get_box(ref: str, task_id: Optional[str] = None) -> str:
