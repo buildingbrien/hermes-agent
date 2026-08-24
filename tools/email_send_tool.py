@@ -64,6 +64,116 @@ def _valid(addr: str) -> bool:
     return "@" in email and "." in email.split("@")[-1]
 
 
+# ── Idempotent-send ledger ───────────────────────────────────────────────────
+# The send is the LAST line of defence against a double-send. Upstream approval
+# dedup reduces which sends get filed, but retries, the approval resume/re-drive,
+# the */15 auto-recap cron, and any route-around can still call this tool more
+# than once for one outcome. Reserving on (recipients + subject) within a window
+# BEFORE the himalaya call means exactly one of them physically sends; the rest
+# return the cached success. (The founder received the same recap 3x on
+# 2026-08-24 — this closes the physical duplicate regardless of the upstream
+# race.) Keyed on recipient+subject, NOT body, so a redraft of the same email is
+# recognised as the same intent instead of sending twice. Pass force=true to send
+# a deliberate second copy within the window.
+import hashlib
+import json
+import time as _time
+
+_SEND_WINDOW_S = 2700  # 45 min — matches the approval-store DOA window
+
+
+def _ledger_path() -> str:
+    home = os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes"))
+    return os.path.join(home, "email-send-ledger.json")
+
+
+def _addr_only(a: str) -> str:
+    _, e = parseaddr(a or "")
+    return (e or a or "").strip().lower()
+
+
+def _idem_key(to: List[str], cc: List[str], subject: str) -> str:
+    addrs = sorted({_addr_only(a) for a in (list(to) + list(cc)) if a})
+    subj = " ".join((subject or "").lower().split())
+    while subj[:3] in ("re:", "fw:") or subj[:4] == "fwd:":
+        subj = subj.split(":", 1)[1].strip()
+    return hashlib.sha256(("|".join(addrs) + "||" + subj).encode()).hexdigest()[:40]
+
+
+def _ledger_txn(fn):
+    """Run fn(ledger, now) under an exclusive file lock; prune the window and
+    persist. IO/lock failure runs fn against an empty ledger (a missing dedup is
+    recoverable; a stuck send is not) — but a readable ledger is authoritative,
+    so the reserve below only skips on real, fresh records."""
+    import fcntl
+    path = _ledger_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+    lf = None
+    try:
+        lf = open(path + ".lock", "w")
+        fcntl.flock(lf, fcntl.LOCK_EX)
+    except Exception:
+        lf = None
+    try:
+        try:
+            with open(path) as f:
+                ledger = json.load(f)
+            if not isinstance(ledger, dict):
+                ledger = {}
+        except Exception:
+            ledger = {}
+        now = _time.time()
+        ledger = {k: v for k, v in ledger.items()
+                  if isinstance(v, dict) and now - float(v.get("ts") or 0) < _SEND_WINDOW_S}
+        out = fn(ledger, now)
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(ledger, f)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+        return out
+    finally:
+        if lf is not None:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+                lf.close()
+            except Exception:
+                pass
+
+
+def _reserve_send(key: str):
+    """Atomically decide whether THIS call physically sends. Returns
+    ('go', None) to send, or ('skip', prior) when an equivalent send already
+    completed OR is in flight within the window — the caller returns the cached
+    result rather than sending again. A stale 'pending' (a crashed/timed-out
+    prior attempt older than the send timeout) is treated as free so a genuine
+    retry is never permanently blocked."""
+    def _op(ledger, now):
+        rec = ledger.get(key)
+        if isinstance(rec, dict):
+            age = now - float(rec.get("ts") or 0)
+            if rec.get("status") == "sent":
+                return ("skip", rec)
+            if rec.get("status") == "pending" and age < SEND_TIMEOUT_S:
+                return ("skip", rec)
+        ledger[key] = {"ts": now, "status": "pending"}
+        return ("go", None)
+    return _ledger_txn(_op)
+
+
+def _commit_send(key: str, summary: str) -> None:
+    _ledger_txn(lambda ledger, now: ledger.__setitem__(key, {"ts": now, "status": "sent", "summary": summary}))
+
+
+def _release_send(key: str) -> None:
+    _ledger_txn(lambda ledger, now: ledger.pop(key, None))
+
+
 def _build_message(
     sender: str,
     to: List[str],
@@ -150,10 +260,37 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     # the user reviews and presses send in their own mail client. Addressed
     # and validated identically, so "turn this draft into a send" is only a
     # flag flip away.
+    force = bool(args.get("force"))
+    idem = _idem_key(to, cc, subject)
+    reserved = False
     if draft:
         cmd = [binary, "message", "save", "-a", account, "--folder", "Drafts"]
         verb = "Saving the draft"
     else:
+        # Reserve BEFORE sending — one physical send per (recipients, subject)
+        # in the window. force=true bypasses for a deliberate second copy.
+        if not force:
+            decision, prior = _reserve_send(idem)
+            if decision == "skip":
+                return {
+                    "sent": True,
+                    "idempotent_skip": True,
+                    "to": to, "cc": cc, "subject": subject, "account": account,
+                    "summary": (prior or {}).get("summary")
+                    or f"“{subject}” was already sent to {', '.join(to)} moments ago — not re-sent.",
+                }
+            reserved = True
+        # Dry-run: exercise the full gate/dedup/ledger path end to end but never
+        # hand bytes to himalaya (tests + the dry-run harness). Records the send
+        # so idempotency is exercised.
+        if os.environ.get("HERMES_EMAIL_DRYRUN"):
+            if reserved:
+                _commit_send(idem, f"[dry-run] Sent “{subject}” to {', '.join(to)}.")
+            return {
+                "sent": True, "dry_run": True,
+                "to": to, "cc": cc, "subject": subject, "account": account,
+                "summary": f"[dry-run] Would send “{subject}” to {', '.join(to)} — no mail left the machine.",
+            }
         cmd = [binary, "message", "send", "-a", account]
         verb = "Sending"
 
@@ -165,13 +302,19 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
             timeout=SEND_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
+        # Uncertain outcome — DON'T release the reservation (a re-send could
+        # duplicate a message that actually went through); the window expires it.
         return {"error": f"{verb} timed out after {SEND_TIMEOUT_S}s — the message may "
                          f"or may not have gone through. Check the "
                          f"{'Drafts' if draft else 'Sent'} folder before retrying."}
     except Exception as e:  # noqa: BLE001 — surface the real reason
+        if reserved:
+            _release_send(idem)  # definitively did not send → free the reservation
         return {"error": f"Could not run himalaya: {e}"}
 
     if proc.returncode != 0:
+        if reserved:
+            _release_send(idem)  # definitively did not send → allow a retry
         detail = (proc.stderr or proc.stdout or b"").decode(errors="replace").strip()
         return {"error": f"{verb} failed: {detail[:400] or 'himalaya exited non-zero'}"}
 
@@ -191,6 +334,14 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
         }
 
     recipients = len(to) + len(cc) + len(bcc)
+    summary = (
+        f"Sent “{subject}” to {', '.join(to)}"
+        + (f" (cc {', '.join(cc)})" if cc else "")
+        + (f" with {len(attachments)} attachment(s)" if attachments else "")
+        + f" — {recipients} recipient(s) total."
+    )
+    if reserved:
+        _commit_send(idem, summary)  # confirmed sent → block equivalents in-window
     return {
         "sent": True,
         "to": to,
@@ -198,12 +349,7 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
         "subject": subject,
         "attachments": [os.path.basename(a) for a in attachments],
         "account": account,
-        "summary": (
-            f"Sent “{subject}” to {', '.join(to)}"
-            + (f" (cc {', '.join(cc)})" if cc else "")
-            + (f" with {len(attachments)} attachment(s)" if attachments else "")
-            + f" — {recipients} recipient(s) total."
-        ),
+        "summary": summary,
     }
 
 
@@ -256,6 +402,16 @@ EMAIL_SEND_SCHEMA = {
                     "reviews and sends it from their own mail client. Use "
                     "this when the user says 'draft it', wants to review "
                     "wording first, or the send feels consequential."
+                ),
+            },
+            "force": {
+                "type": "boolean",
+                "description": (
+                    "Send a DELIBERATE second copy of an email with the same "
+                    "recipient and subject within the last ~45 minutes. Normally "
+                    "an identical send is de-duplicated (returned as already "
+                    "sent) so retries and background jobs never double-mail — set "
+                    "force only when the user explicitly asks to resend."
                 ),
             },
         },
