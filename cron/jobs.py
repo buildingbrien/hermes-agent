@@ -382,6 +382,7 @@ def create_job(
     job_type: str = "prompt",
     meeting: Optional[Dict[str, Any]] = None,
     grants: Optional[List[Dict[str, Any]]] = None,
+    agent: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -446,6 +447,10 @@ def create_job(
         # future unattended action the user already approved isn't re-asked.
         "grants": grants or [],
         "name": name or label_source[:50].strip(),
+        # Which agent runs this job (run_job honors job["agent"], falling back to
+        # the ticker's profile), so a job can run under any agent's persona + gate
+        # even though the ticker is centralized on Thoth. None/"" -> Thoth default.
+        "agent": (str(agent).strip().lower() or None) if agent else None,
         "prompt": prompt,
         "skills": normalized_skills,
         "skill": normalized_skills[0] if normalized_skills else None,

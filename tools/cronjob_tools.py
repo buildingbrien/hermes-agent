@@ -303,6 +303,7 @@ def cronjob(
     reason: Optional[str] = None,
     script: Optional[str] = None,
     grants: Optional[List[Any]] = None,
+    agent: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -345,6 +346,7 @@ def cronjob(
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
                 grants=grants or [],
+                agent=_normalize_optional_job_value(agent),
             )
             return json.dumps(
                 {
@@ -427,6 +429,9 @@ def cronjob(
                 updates["provider"] = _normalize_optional_job_value(provider)
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
+            if agent is not None:
+                _a = _normalize_optional_job_value(agent)
+                updates["agent"] = (str(_a).strip().lower() or None) if _a else None
             if script is not None:
                 # Pass empty string to clear an existing script
                 if script:
