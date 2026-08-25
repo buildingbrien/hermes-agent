@@ -25,10 +25,16 @@ def _post(endpoint: str, payload: dict) -> bool:
     """Fire-and-forget POST to the bridge. Returns True on success."""
     try:
         data = json.dumps(payload).encode("utf-8")
+        # Bearer so task-ledger writes survive the BRIDGE_AUTH_ENFORCE flip
+        # (Chunk 1 Phase B); token is in the cron subprocess env.
+        _hdrs = {"Content-Type": "application/json"}
+        _tok = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+        if _tok:
+            _hdrs["Authorization"] = f"Bearer {_tok}"
         req = urllib.request.Request(
             f"http://{BRIDGE_HOST}:{BRIDGE_PORT}{endpoint}",
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=_hdrs,
         )
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             body = json.loads(resp.read().decode())

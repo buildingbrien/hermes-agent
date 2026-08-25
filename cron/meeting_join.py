@@ -81,9 +81,14 @@ def _post_dial(body: Dict[str, Any]) -> Tuple[bool, str]:
     """POST to the bridge's dial-meeting endpoint. Returns (ok, detail)."""
     url = f"http://127.0.0.1:{_bridge_port()}/api/voice/dial-meeting"
     data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}
-    )
+    # Carry the bearer so scheduled meeting-joins survive the
+    # BRIDGE_AUTH_ENFORCE flip (Chunk 1 Phase B); token is in the cron
+    # subprocess env (scheduler spawns with os.environ.copy()).
+    _hdrs = {"Content-Type": "application/json"}
+    _tok = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+    if _tok:
+        _hdrs["Authorization"] = f"Bearer {_tok}"
+    req = urllib.request.Request(url, data=data, headers=_hdrs)
     try:
         with urllib.request.urlopen(req, timeout=DIAL_TIMEOUT_S) as resp:
             raw = resp.read().decode(errors="replace")
