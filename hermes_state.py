@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -329,6 +329,26 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: tool-result rows were double-written when the flush cursor
+                # replayed already-committed rows after a mid-loop failure. Dedup
+                # existing duplicates (keep the first row per session_id +
+                # tool_call_id), then enforce uniqueness so a replay can never
+                # insert a duplicate again. Dedup MUST precede the index or the
+                # CREATE UNIQUE INDEX would fail on the existing dups.
+                cursor.execute(
+                    "DELETE FROM messages WHERE tool_call_id IS NOT NULL AND id NOT IN ("
+                    "  SELECT MIN(id) FROM messages WHERE tool_call_id IS NOT NULL "
+                    "  GROUP BY session_id, tool_call_id)"
+                )
+                try:
+                    cursor.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_tool_result_unique "
+                        "ON messages(session_id, tool_call_id) WHERE tool_call_id IS NOT NULL"
+                    )
+                except sqlite3.OperationalError:
+                    pass
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -336,6 +356,16 @@ class SessionDB:
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
                 "ON sessions(title) WHERE title IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass  # Index already exists
+
+        # Tool-result uniqueness — always ensure (partial index on tool rows only,
+        # so user/assistant rows with a NULL tool_call_id are unaffected).
+        try:
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_tool_result_unique "
+                "ON messages(session_id, tool_call_id) WHERE tool_call_id IS NOT NULL"
             )
         except sqlite3.OperationalError:
             pass  # Index already exists
@@ -949,7 +979,7 @@ class SessionDB:
 
         def _do(conn):
             cursor = conn.execute(
-                """INSERT INTO messages (session_id, role, content, tool_call_id,
+                """INSERT OR IGNORE INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_details, codex_reasoning_items)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -969,15 +999,19 @@ class SessionDB:
                 ),
             )
             msg_id = cursor.lastrowid
+            # INSERT OR IGNORE: a replayed duplicate tool-result row (blocked by
+            # idx_messages_tool_result_unique) is a no-op — skip the counter bump
+            # for it, or message_count/tool_call_count drift on every replay.
+            inserted = cursor.rowcount > 0
 
-            # Update counters
-            if num_tool_calls > 0:
+            # Update counters (only when a row was actually inserted)
+            if inserted and num_tool_calls > 0:
                 conn.execute(
                     """UPDATE sessions SET message_count = message_count + 1,
                        tool_call_count = tool_call_count + ? WHERE id = ?""",
                     (num_tool_calls, session_id),
                 )
-            else:
+            elif inserted:
                 conn.execute(
                     "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                     (session_id,),

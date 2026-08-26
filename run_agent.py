@@ -2980,6 +2980,7 @@ class AIAgent:
             )
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
+            idx = flush_from
             for msg in messages[flush_from:]:
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
@@ -3003,7 +3004,14 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                 )
-            self._last_flushed_db_idx = len(messages)
+                # Advance the cursor AFTER each successfully-committed row, so a
+                # mid-loop failure leaves it pointing exactly past the last
+                # durable row — the next flush resumes instead of replaying
+                # already-committed rows (which re-inserted every tool result and
+                # produced the duplicate transcript entries). The v7 UNIQUE index
+                # is the backstop; this removes the replay itself.
+                idx += 1
+                self._last_flushed_db_idx = idx
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
 
