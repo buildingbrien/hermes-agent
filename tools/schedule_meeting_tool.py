@@ -28,7 +28,7 @@ from typing import Any, Dict, Optional
 DEFAULT_STYLE = "clerk"
 DEFAULT_LEAD_MINUTES = 2
 GRANT_EXPIRY_MINUTES_AFTER_START = 30
-VALID_STYLES = ("clerk", "scribe", "hold")
+VALID_STYLES = ("clerk", "scribe", "hold", "driver")
 
 
 def _resolve_start(start: str) -> datetime:
@@ -44,6 +44,7 @@ def schedule_meeting_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     label = str(args.get("label") or "meeting").strip() or "meeting"
     style = str(args.get("style") or DEFAULT_STYLE).strip().lower()
     pin = str(args.get("pin") or "").strip()
+    join_url = str(args.get("join_url") or "").strip()  # driver: browser guest-join
 
     if style not in VALID_STYLES:
         style = DEFAULT_STYLE
@@ -83,13 +84,29 @@ def schedule_meeting_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
         # and a lobby timeout catches the rare non-admit.
         "notify_admit": False,
     }
-    grant = {
+    if style == "driver" and join_url:
+        meeting["join_url"] = join_url
+    grants = [{
         "action": "outbound_call",
         "to": number,
         "reason": f"meeting:{label}",
         "expires_at": expires_dt.isoformat(),
         "uses": 1,
-    }
+    }]
+    if style == "driver":
+        # A user-scheduled driver join is user-initiated (trusted) — mint the
+        # meeting-duration screen-control grant so in-meeting share/drive runs
+        # card-free. Schema matches approval_gate._grant_permits.
+        ui_expires = start_dt + timedelta(
+            minutes=GRANT_EXPIRY_MINUTES_AFTER_START + 150)
+        grants.append({
+            "action": "ui_action",
+            "unattended": True,
+            "reason": f"meeting-driver:{label}",
+            "expires": ui_expires.isoformat(),
+            "expires_at": ui_expires.isoformat(),
+            "max_per_run": 500,
+        })
 
     try:
         from cron.jobs import create_job
@@ -112,7 +129,7 @@ def schedule_meeting_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
         deliver="origin" if origin else "local",
         job_type="meeting_join",
         meeting=meeting,
-        grants=[grant],
+        grants=grants,
     )
 
     pretty_start = start_dt.strftime("%a %b %-d at %-I:%M %p")
@@ -160,7 +177,11 @@ SCHEDULE_MEETING_SCHEMA = {
             "style": {
                 "type": "string",
                 "enum": list(VALID_STYLES),
-                "description": "clerk (hears all, speaks when named — default), scribe (silent notes), or hold (present, silent).",
+                "description": "clerk (hears all, speaks when named — default), scribe (silent notes), hold (present, silent), or driver (browser guest-join with vision + can share/drive the screen — pass join_url).",
+            },
+            "join_url": {
+                "type": "string",
+                "description": "For style 'driver' only: the meeting's join URL (e.g. a Teams/Zoom/Meet link) the agent browser guest-joins.",
             },
             "pin": {
                 "type": "string",

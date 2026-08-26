@@ -21,7 +21,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
-VALID_STYLES = ("clerk", "scribe", "hold")
+VALID_STYLES = ("clerk", "scribe", "hold", "driver")
 DIAL_TIMEOUT_S = 20.0
 
 
@@ -115,8 +115,6 @@ def run_meeting_join(job: dict, agent_key: str = "thoth") -> Tuple[bool, str, st
     label = str(meeting.get("label") or "the meeting").strip()
     number = str(meeting.get("dial_number") or "").strip()
     style = str(meeting.get("style") or "clerk").strip().lower()
-    if style not in VALID_STYLES:
-        style = "clerk"
 
     def _doc(status: str, detail: str) -> str:
         return (
@@ -127,6 +125,16 @@ def run_meeting_join(job: dict, agent_key: str = "thoth") -> Tuple[bool, str, st
             f"**Status:** {status}\n"
             f"**Detail:** {detail}\n"
         )
+
+    if style not in VALID_STYLES:
+        # REFUSE, never silently demote. An old venv receiving a new 'driver'
+        # job used to dial it as a clerk PSTN call with no error; failing loud
+        # is safer than a wrong-mode join.
+        err = f"unknown meeting style '{style}'"
+        return False, _doc("error", err), (
+            f"I couldn't join {label} — I don't recognize the meeting mode "
+            f"'{style}'. This build may be out of date."
+        ), err
 
     if not number:
         err = "no dial-in number on the job"
@@ -150,6 +158,10 @@ def run_meeting_join(job: dict, agent_key: str = "thoth") -> Tuple[bool, str, st
     }
     if meeting.get("pin"):
         body["pin"] = str(meeting["pin"])
+    if meeting.get("join_url"):
+        # driver: the bridge additionally launches the agent-browser guest-join
+        # from this URL (Phase 2). Hybrid v1 still places the PSTN dial for audio.
+        body["join_url"] = str(meeting["join_url"])
     origin = job.get("origin") or {}
     if origin.get("chat_id"):
         body["session_id"] = str(origin["chat_id"])
