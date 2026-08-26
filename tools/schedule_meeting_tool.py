@@ -31,6 +31,27 @@ GRANT_EXPIRY_MINUTES_AFTER_START = 30
 VALID_STYLES = ("clerk", "scribe", "hold", "driver")
 
 
+def _classify_join_surface(url: str) -> str:
+    """Mirror of the bridge's classify_join_url (the venv can't import it): tag
+    the join surface so the driver browser drives the right flow. '' if unknown.
+    The bridge re-derives from join_url if absent — this just keeps the
+    user-scheduled payload self-consistent with the inbox path."""
+    u = (url or "").lower()
+    if "teams.microsoft.com/meet/" in u:
+        return "teams_meet"
+    if "teams.live.com/meet/" in u:
+        return "teams_live"
+    if "teams.microsoft.com/l/meetup-join" in u:
+        return "teams_meetup"
+    if "zoom.us/j/" in u:
+        return "zoom"
+    if "meet.google.com/" in u:
+        return "meet"
+    if "webex.com/" in u:
+        return "webex"
+    return ""
+
+
 def _resolve_start(start: str) -> datetime:
     """Parse an ISO start time; make naive values local-aware. Raises on junk."""
     dt = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
@@ -86,6 +107,7 @@ def schedule_meeting_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     }
     if style == "driver" and join_url:
         meeting["join_url"] = join_url
+        meeting["join_surface"] = _classify_join_surface(join_url)
     grants = [{
         "action": "outbound_call",
         "to": number,

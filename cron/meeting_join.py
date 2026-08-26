@@ -162,6 +162,10 @@ def run_meeting_join(job: dict, agent_key: str = "thoth") -> Tuple[bool, str, st
         # driver: the bridge additionally launches the agent-browser guest-join
         # from this URL (Phase 2). Hybrid v1 still places the PSTN dial for audio.
         body["join_url"] = str(meeting["join_url"])
+    if meeting.get("join_surface"):
+        # Surface hint (teams_meet/teams_meetup/zoom/…) so the browser join drives
+        # the right flow. Bridge re-derives from join_url if this is absent.
+        body["join_surface"] = str(meeting["join_surface"])
     origin = job.get("origin") or {}
     if origin.get("chat_id"):
         body["session_id"] = str(origin["chat_id"])
