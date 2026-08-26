@@ -64,6 +64,39 @@ def _valid(addr: str) -> bool:
     return "@" in email and "." in email.split("@")[-1]
 
 
+def _org_signature() -> tuple:
+    """Return (text_sig, html_sig) for this machine/org — the company signature
+    the send tool appends so every fleet email carries it (there was NO signature
+    mechanism before: himalaya's piped `message send` injects nothing and no
+    signature= was set). Editable per-org. Priority: env override → this agent's
+    HERMES_HOME file → the shared ~/.hermes org file → empty. Never raises."""
+    txt = os.environ.get("LUCARYIN_EMAIL_SIGNATURE", "")
+    html = os.environ.get("LUCARYIN_EMAIL_SIGNATURE_HTML", "")
+    homes = []
+    h = os.path.expanduser(os.environ.get("HERMES_HOME", "~/.hermes"))
+    homes.append(h)
+    canonical = os.path.expanduser("~/.hermes")
+    try:
+        if os.path.realpath(h) != os.path.realpath(canonical):
+            homes.append(canonical)  # per-agent profile → fall back to the org file
+    except Exception:
+        pass
+    for d in homes:
+        if not txt:
+            try:
+                with open(os.path.join(d, "email-signature.txt")) as f:
+                    txt = f.read().strip()
+            except Exception:
+                pass
+        if not html:
+            try:
+                with open(os.path.join(d, "email-signature.html")) as f:
+                    html = f.read().strip()
+            except Exception:
+                pass
+    return txt, html
+
+
 # ── Idempotent-send ledger ───────────────────────────────────────────────────
 # The send is the LAST line of defence against a double-send. Upstream approval
 # dedup reduces which sends get filed, but retries, the approval resume/re-drive,
@@ -182,6 +215,7 @@ def _build_message(
     subject: str,
     body: str,
     attachments: List[str],
+    html: str = "",
 ) -> EmailMessage:
     msg = EmailMessage()
     msg["From"] = sender
@@ -194,6 +228,13 @@ def _build_message(
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
     msg.set_content(body)
+    # An HTML alternative makes this multipart/alternative: the plain-text body
+    # above stays as the fallback (and the deliverability/spam win of a real
+    # text part), while HTML-capable clients render this. Must precede the
+    # attachment loop so the tree nests correctly —
+    # multipart/mixed[ multipart/alternative[text, html], attachments… ].
+    if html:
+        msg.add_alternative(html, subtype="html")
 
     for path in attachments:
         p = os.path.expanduser(path)
@@ -226,6 +267,7 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     bcc = _as_list(args.get("bcc"))
     subject = (args.get("subject") or "").strip()
     body = args.get("body") or ""
+    html = args.get("html") or ""
     attachments = _as_list(args.get("attachments"))
     account = (args.get("account") or "fleet").strip()
     draft = bool(args.get("draft"))
@@ -251,8 +293,24 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     if not sender:
         sender = f"Lucaryin Fleet <fleet-001@lucaryin.com>" if account == "fleet" else ""
 
+    # Org-wide signature: append to BOTH parts unless the caller opted out or the
+    # body already contains it. RFC 3676 "-- \n" delimiter on the text part. The
+    # html footer is injected before </body> (or appended for a fragment); it is
+    # only touched when an html part exists, so a text-only send stays text/plain.
+    if args.get("signature", True):
+        sig_txt, sig_html = _org_signature()
+        if sig_txt and sig_txt not in body:
+            body = body.rstrip() + "\n\n-- \n" + sig_txt
+        if html and sig_html and sig_html not in html:
+            low = html.lower()
+            if "</body>" in low:
+                idx = low.rindex("</body>")
+                html = html[:idx] + sig_html + html[idx:]
+            else:
+                html = html + sig_html
+
     try:
-        msg = _build_message(sender or "", to, cc, bcc, subject, body, attachments)
+        msg = _build_message(sender or "", to, cc, bcc, subject, body, attachments, html=html)
     except (FileNotFoundError, ValueError) as e:
         return {"error": str(e)}
 
@@ -371,6 +429,16 @@ EMAIL_SEND_SCHEMA = {
             },
             "subject": {"type": "string", "description": "Subject line."},
             "body": {"type": "string", "description": "Plain-text body of the message."},
+            "html": {
+                "type": "string",
+                "description": (
+                    "Optional HTML body. When given, the message is sent as "
+                    "multipart/alternative: 'body' is the plain-text fallback and "
+                    "this is what HTML-capable clients render. Use email-safe HTML "
+                    "(inline styles, table layout) — mail clients strip <style> "
+                    "blocks, external CSS, and web-only features."
+                ),
+            },
             "cc": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -412,6 +480,14 @@ EMAIL_SEND_SCHEMA = {
                     "an identical send is de-duplicated (returned as already "
                     "sent) so retries and background jobs never double-mail — set "
                     "force only when the user explicitly asks to resend."
+                ),
+            },
+            "signature": {
+                "type": "boolean",
+                "description": (
+                    "Append the org email signature to the message (default "
+                    "true). Set false only for machine-to-machine mail or when "
+                    "the body already contains the signature."
                 ),
             },
         },

@@ -20,6 +20,11 @@ Himalaya is a CLI email client that lets you manage emails from the terminal usi
 
 - `references/configuration.md` (config file setup + IMAP/SMTP authentication)
 - `references/message-composition.md` (MML syntax for composing emails)
+- `references/branded-html-template.md` — **use this for any scheduled digest,
+  report, or rich HTML email.** It is the on-brand, email-client-safe template
+  (inline styles, table layout, light + Work Sans); fill the placeholders and
+  pass the result as the `email_send` tool's `html` argument. The org signature
+  footer is appended automatically — don't add your own.
 
 ## Prerequisites
 
