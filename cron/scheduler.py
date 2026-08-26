@@ -927,17 +927,22 @@ def _response_failure_reason(final_response: str) -> Optional[str]:
 
 
 def _wrap_job_output(job_name: str, job_id: str, prompt: str, response: str,
-                     schedule_display: str = "N/A") -> str:
-    """The standard cron output document. Shared so the success and
-    response-failure paths render identically."""
-    return (
-        f"# Cron Job: {job_name}\n\n"
+                     schedule_display: str = "N/A", failed: bool = False) -> str:
+    """The standard cron output document. failed=True means the agent swallowed
+    the error and returned it as its final text (spent budget, provider outage);
+    title it '(FAILED)' and put the body under '## Error' so the /runs scanner
+    classifies it red instead of painting a failed run green (never lie about
+    success). The success path renders '## Response' as before."""
+    head = (
+        f"# Cron Job: {job_name}{' (FAILED)' if failed else ''}\n\n"
         f"**Job ID:** {job_id}\n"
         f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"**Schedule:** {schedule_display}\n\n"
         f"## Prompt\n\n{prompt}\n\n"
-        f"## Response\n\n{response if response else '(No response generated)'}\n"
     )
+    if failed:
+        return head + f"## Error\n\n{response if response else '(No error detail)'}\n"
+    return head + f"## Response\n\n{response if response else '(No response generated)'}\n"
 
 
 def _persist_job_grants(job: dict) -> None:
@@ -1326,7 +1331,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     pass
             return False, _wrap_job_output(
                 job_name, job_id, prompt, final_response,
-                job.get("schedule_display", "N/A"),
+                job.get("schedule_display", "N/A"), failed=True,
             ), "", _resp_error
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
