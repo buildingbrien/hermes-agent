@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 VALID_STYLES = ("clerk", "scribe", "hold", "driver")
@@ -149,6 +149,21 @@ def run_meeting_join(job: dict, agent_key: str = "thoth") -> Tuple[bool, str, st
             f"I couldn't dial into {label} — my authorization to place that "
             f"call was missing or expired. Want me to set it up again?"
         ), err
+
+    # Fire-time guard: a job that fires late (the Mini was asleep, a cron
+    # backlog) must not dial a meeting that is already over. Use end_iso if
+    # present, else start + 60 min; a 5-min grace keeps an in-progress meeting
+    # joinable. Defense-in-depth on top of the grant-expiry backstop, which is
+    # duration-agnostic.
+    _start = _parse_iso(str(meeting.get("start_iso") or ""))
+    if _start is not None:
+        _end = _parse_iso(str(meeting.get("end_iso") or "")) or (_start + timedelta(minutes=60))
+        if _now() >= _end + timedelta(minutes=5):
+            err = "meeting already ended"
+            return False, _doc("skipped", err), (
+                f"I didn't dial into {label} — it was already over by the time "
+                f"the job fired."
+            ), err
 
     body = {
         "to": number,
