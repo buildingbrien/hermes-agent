@@ -24,7 +24,12 @@ PLATFORM_MAP = {
     "windows": "win32",
 }
 
-EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub"))
+# ".hub" hides synced org skills from the local index; "drafts" hides the
+# nightly Skill Distiller's staging area (~/.hermes/skills/drafts/) — those are
+# INERT by design (reviewed/promoted before use), and were leaking straight into
+# the mandatory skills index. Attended-first-run drafts live in normal category
+# dirs and stay visible on purpose.
+EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub", "drafts"))
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────
 

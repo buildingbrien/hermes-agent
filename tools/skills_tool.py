@@ -99,7 +99,9 @@ _PLATFORM_MAP = {
     "windows": "win32",
 }
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub"))
+# "drafts" = the Skill Distiller's inert staging dir; keep it out of skills_list
+# and the mandatory index (mirrors agent.skill_utils.EXCLUDED_SKILL_DIRS).
+_EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub", "drafts"))
 _REMOTE_ENV_BACKENDS = frozenset({"docker", "singularity", "modal", "ssh", "daytona"})
 _secret_capture_callback = None
 

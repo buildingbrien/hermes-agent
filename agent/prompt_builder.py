@@ -177,9 +177,14 @@ MEMORY_GUIDANCE = (
 )
 
 SESSION_SEARCH_GUIDANCE = (
-    "When the user references something from a past conversation or you suspect "
-    "relevant cross-session context exists, use session_search to recall it before "
-    "asking them to repeat themselves."
+    "Recall before you dig. Before starting any research, mapping, setup, or "
+    "discovery task — anything you or a teammate may already have worked through — "
+    "first check whether that work already exists: run session_search on the target, "
+    "and gbrain_search too when it is available (your compiled memory of past "
+    "projects). Reuse what you find instead of re-deriving it; re-solving a problem "
+    "that already lives in your history or memory wastes an entire task. Also use "
+    "session_search whenever the user references something from a past conversation, "
+    "before asking them to repeat it."
 )
 
 SKILLS_GUIDANCE = (

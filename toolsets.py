@@ -231,6 +231,21 @@ TOOLSETS = {
         "tools": ["clarify"],
         "includes": []
     },
+
+    "board": {
+        # board_tool.py registers these under toolset="board", but the toolset
+        # was never DEFINED here — so the Lucaryin product path (union of all
+        # toolsets) never included them and agents could not touch the office
+        # board. That is why "the bots have not updated the board since the day
+        # it was created" (founder, 2026-08-28). Scoped to its own toolset so it
+        # reaches the fleet product path without being forced into every
+        # Discord/Slack/Telegram core.
+        "description": "The office shared board — bulletin widgets and counters "
+                       "that track the team's finished work",
+        "tools": ["board_view", "board_propose", "board_update",
+                  "counter_create", "counter_increment"],
+        "includes": []
+    },
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
