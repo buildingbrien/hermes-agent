@@ -61,6 +61,15 @@ WRITE_DENIED_PATHS = {
         "/etc/sudoers",
         "/etc/passwd",
         "/etc/shadow",
+        # ── Gate-state integrity (Sprint-1 CRITICAL) ──────────────────────────
+        # These files ARE the consent gate's own state. If write_file can forge
+        # them the agent self-approves anything (a hand-written `approved`
+        # record), raises its own trust floor, or rewrites cron/config gates.
+        # Deny the whole surface. (Interim — the terminal still bypasses this;
+        # the durable boundary is the separate-user sandbox, FD1/FD3.)
+        os.path.join(_HOME, ".lucaryin", "agent-configs.db"),
+        str(get_hermes_home() / "config.yaml"),
+        os.path.join(_HOME, ".hermes", "config.yaml"),
     ]
 }
 
@@ -75,6 +84,14 @@ WRITE_DENIED_PREFIXES = [
         os.path.join(_HOME, ".docker"),
         os.path.join(_HOME, ".azure"),
         os.path.join(_HOME, ".config", "gh"),
+        # Gate-state dirs (Sprint-1): dialing policy, approval records, grants,
+        # and the cron job store (grant-bearing jobs). Sanctioned edits go
+        # through the bridge APIs, never a raw write_file.
+        os.path.join(_HOME, ".lucaryin", "policies"),
+        os.path.join(_HOME, ".lucaryin", "approvals"),
+        os.path.join(_HOME, ".lucaryin", "interactive-grants"),
+        os.path.join(_HOME, ".lucaryin", "grants"),
+        os.path.join(_HOME, ".hermes", "cron"),
     ]
 ]
 
