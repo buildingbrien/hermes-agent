@@ -25,6 +25,7 @@ piped straight to himalaya's stdin, so there is nothing on disk to expire.
 
 import mimetypes
 import os
+import re
 import subprocess
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
@@ -259,6 +260,43 @@ def _build_message(
     return msg
 
 
+# himalaya keeps each account's own identity (email + display-name) here. We
+# read it so a send from ANY configured account (gmail/zoho/…) carries that
+# account's real From — historically only the hardcoded 'fleet' identity was
+# filled, so a send from any other account left an EMPTY From header and
+# himalaya bounced it with the opaque "cannot send message without a sender".
+HIMALAYA_CONFIG = os.path.expanduser("~/.config/himalaya/config.toml")
+
+
+def _account_from(account: str) -> str:
+    """Resolve an account's From identity ("Display Name <email>") from the
+    himalaya config. Returns "" when the account or its email isn't found —
+    the caller turns that into an actionable error instead of letting himalaya
+    reject an empty From."""
+    try:
+        with open(HIMALAYA_CONFIG, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return ""
+    # Isolate the [accounts.<account>] table (bare or quoted header), stopping
+    # at the next top-level [section].
+    m = re.search(
+        r'(?ms)^\[accounts\.(?:"' + re.escape(account) + r'"|'
+        + re.escape(account) + r')\][ \t]*\n(.*?)(?=^\[|\Z)',
+        text,
+    )
+    if not m:
+        return ""
+    block = m.group(1)
+    em = re.search(r'(?m)^[ \t]*email[ \t]*=[ \t]*"([^"]+)"', block)
+    if not em or not em.group(1).strip():
+        return ""
+    email = em.group(1).strip()
+    dn = re.search(r'(?m)^[ \t]*display-name[ \t]*=[ \t]*"([^"]+)"', block)
+    name = dn.group(1).strip() if dn else ""
+    return f"{name} <{email}>" if name else email
+
+
 def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     args = args if isinstance(args, dict) else {}
 
@@ -288,10 +326,26 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
         }
 
     # Resolve the From address from the account himalaya is configured with, so
-    # the envelope matches the credentials actually used.
+    # the envelope matches the credentials actually used. An explicit `from`
+    # wins; otherwise read the account's own identity out of the himalaya config
+    # (works for gmail/zoho/any account, not just fleet). Fleet keeps a hardcoded
+    # fallback so it still sends if the config couldn't be read.
     sender = (args.get("from") or "").strip()
     if not sender:
-        sender = f"Lucaryin Fleet <fleet-001@lucaryin.com>" if account == "fleet" else ""
+        sender = _account_from(account)
+    if not sender and account == "fleet":
+        sender = "Lucaryin Fleet <fleet-001@lucaryin.com>"
+    if not sender:
+        # No sender identity for this account → himalaya would otherwise reject
+        # the send with the opaque "cannot send message without a sender". Fail
+        # with an actionable message the agent can relay, and point at the
+        # account that is known-good.
+        return {"error": (
+            f"The '{account}' mail account has no sender identity configured on "
+            f"this machine, so mail can't be sent from it yet. Set it up under "
+            f"Settings → Connectors, pass an explicit From address, or send "
+            f"from the 'fleet' account (which is configured)."
+        )}
 
     # Org-wide signature: append to BOTH parts unless the caller opted out or the
     # body already contains it. RFC 3676 "-- \n" delimiter on the text part. The

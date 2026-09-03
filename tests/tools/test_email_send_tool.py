@@ -87,3 +87,72 @@ def test_draft_failure_names_the_draft_verb(monkeypatch):
     assert "error" in result
     assert "IMAP down" in result["error"]
     assert "draft" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Sender identity — the "cannot send message without a sender" bug.
+# A send from a non-'fleet' account (e.g. account:"gmail", from "go into my
+# Gmail") used to leave an EMPTY From header, so himalaya bounced it. The From
+# must now be resolved from the account's own himalaya config, for any account.
+# ---------------------------------------------------------------------------
+
+GMAIL_CFG = '''[accounts.gmail]
+email = "brien@example.com"
+display-name = "Brien Collier"
+
+smtp.server = "smtps://smtp.gmail.com:465"
+'''
+
+
+def _point_config(monkeypatch, tmp_path, contents):
+    p = tmp_path / "config.toml"
+    p.write_text(contents)
+    monkeypatch.setattr(est, "HIMALAYA_CONFIG", str(p))
+    return p
+
+
+def test_gmail_from_resolved_from_config(fake_himalaya, monkeypatch, tmp_path):
+    _point_config(monkeypatch, tmp_path, GMAIL_CFG)
+    result = est.email_send_tool(dict(BASE_ARGS, account="gmail"))
+    assert result.get("sent") is True
+    raw = fake_himalaya[0]["input"].decode(errors="replace")
+    assert "From: Brien Collier <brien@example.com>" in raw
+    assert "-a" in fake_himalaya[0]["cmd"]
+    assert "gmail" in fake_himalaya[0]["cmd"]
+
+
+def test_unconfigured_account_actionable_error_not_empty_send(fake_himalaya, monkeypatch, tmp_path):
+    # gmail requested, but the config has no gmail account → no empty From send.
+    _point_config(monkeypatch, tmp_path, "[accounts.fleet]\nemail = \"fleet-001@lucaryin.com\"\n")
+    result = est.email_send_tool(dict(BASE_ARGS, account="gmail"))
+    assert "error" in result
+    assert "sender identity" in result["error"].lower()
+    assert "fleet" in result["error"].lower()  # points at the known-good account
+    assert not fake_himalaya  # himalaya never invoked with an empty sender
+
+
+def test_explicit_from_wins_over_config(fake_himalaya, monkeypatch, tmp_path):
+    _point_config(monkeypatch, tmp_path, GMAIL_CFG)
+    est.email_send_tool(dict(BASE_ARGS, account="gmail", **{"from": "Ops <ops@x.com>"}))
+    raw = fake_himalaya[0]["input"].decode(errors="replace")
+    assert "From: Ops <ops@x.com>" in raw
+
+
+def test_fleet_still_sends_when_config_missing(fake_himalaya, monkeypatch, tmp_path):
+    # Regression: fleet's hardcoded fallback survives an unreadable config.
+    monkeypatch.setattr(est, "HIMALAYA_CONFIG", str(tmp_path / "does-not-exist.toml"))
+    result = est.email_send_tool(dict(BASE_ARGS))  # no account → 'fleet'
+    assert result.get("sent") is True
+    raw = fake_himalaya[0]["input"].decode(errors="replace")
+    assert "fleet-001@lucaryin.com" in raw
+
+
+def test_account_from_parses_email_and_name(monkeypatch, tmp_path):
+    _point_config(monkeypatch, tmp_path, GMAIL_CFG)
+    assert est._account_from("gmail") == "Brien Collier <brien@example.com>"
+    assert est._account_from("nonexistent") == ""
+
+
+def test_account_from_email_only_no_display_name(monkeypatch, tmp_path):
+    _point_config(monkeypatch, tmp_path, '[accounts.zoho]\nemail = "z@lucaryin.com"\n')
+    assert est._account_from("zoho") == "z@lucaryin.com"
