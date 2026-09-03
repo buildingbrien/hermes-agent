@@ -173,19 +173,74 @@ def _dir_hash(directory: Path) -> str:
     return hasher.hexdigest()
 
 
+def _discover_home_skills() -> Dict[str, List[Path]]:
+    """Map skill frontmatter name -> on-disk dirs under SKILLS_DIR (the seeded
+    home). Mirrors _discover_bundled_skills but over the user's skills dir — used
+    to locate a demoted skill's orphaned copy for pruning."""
+    out: Dict[str, List[Path]] = {}
+    if not SKILLS_DIR.exists():
+        return out
+    for skill_md in SKILLS_DIR.rglob("SKILL.md"):
+        path_str = str(skill_md)
+        if "/.git/" in path_str or "/.github/" in path_str or "/.hub/" in path_str:
+            continue
+        skill_dir = skill_md.parent
+        name = _read_skill_name(skill_md, skill_dir.name)
+        out.setdefault(name, []).append(skill_dir)
+    return out
+
+
+def _prune_orphaned_home_skills(
+    cleaned: List[str], manifest: Dict[str, str], quiet: bool
+) -> List[str]:
+    """Remove the seeded home copy of skills that left the bundled set (e.g.
+    demoted to optional-skills/), but ONLY when it is unmodified — its current
+    hash still equals the origin hash recorded when we seeded it.
+
+    Anything else is left untouched (the caller still drops the manifest entry):
+    a user-modified copy, a hub-installed copy whose content no longer matches,
+    a v1 entry with no recorded hash, or an ambiguous name mapping to >1 on-disk
+    dir. This is what lets a shipped-set slim actually shrink the index on
+    ALREADY-provisioned agents — the plain seed is additive-only and never
+    deletes, so without this a demoted skill lingers in every existing home
+    forever."""
+    pruned: List[str] = []
+    if not cleaned:
+        return pruned
+    home_by_name = _discover_home_skills()
+    for name in cleaned:
+        origin_hash = manifest.get(name, "")
+        dirs = home_by_name.get(name, [])
+        if not origin_hash or len(dirs) != 1:
+            continue  # untracked/ambiguous → keep it, just clean the manifest
+        target = dirs[0]
+        try:
+            if _dir_hash(target) != origin_hash:
+                continue  # user- or hub-modified since seed → don't touch
+            shutil.rmtree(target)
+            pruned.append(name)
+            if not quiet:
+                print(f"  - {name} (removed — no longer in the default set)")
+        except (OSError, IOError) as e:
+            if not quiet:
+                print(f"  ! Failed to prune {name}: {e}")
+    return pruned
+
+
 def sync_skills(quiet: bool = False) -> dict:
     """
     Sync bundled skills into ~/.hermes/skills/ using the manifest.
 
     Returns:
         dict with keys: copied (list), updated (list), skipped (int),
-                        user_modified (list), cleaned (list), total_bundled (int)
+                        user_modified (list), cleaned (list), pruned (list),
+                        total_bundled (int)
     """
     bundled_dir = _get_bundled_dir()
     if not bundled_dir.exists():
         return {
             "copied": [], "updated": [], "skipped": 0,
-            "user_modified": [], "cleaned": [], "total_bundled": 0,
+            "user_modified": [], "cleaned": [], "pruned": [], "total_bundled": 0,
         }
 
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
@@ -273,8 +328,13 @@ def sync_skills(quiet: bool = False) -> dict:
             # ── In manifest but not on disk — user deleted it ──
             skipped += 1
 
-    # Clean stale manifest entries (skills removed from bundled dir)
+    # Clean stale manifest entries (skills removed from the bundled set — e.g.
+    # demoted to optional-skills/). Also remove the orphaned on-disk copy when it
+    # is safe to (unmodified since seed), so a demotion actually slims
+    # already-provisioned agents — the seed above is additive-only and would
+    # otherwise leave the copy behind forever.
     cleaned = sorted(set(manifest.keys()) - bundled_names)
+    pruned = _prune_orphaned_home_skills(cleaned, manifest, quiet)
     for name in cleaned:
         del manifest[name]
 
@@ -297,6 +357,7 @@ def sync_skills(quiet: bool = False) -> dict:
         "skipped": skipped,
         "user_modified": user_modified,
         "cleaned": cleaned,
+        "pruned": pruned,
         "total_bundled": len(bundled_skills),
     }
 
@@ -409,6 +470,8 @@ if __name__ == "__main__":
     ]
     if result["user_modified"]:
         parts.append(f"{len(result['user_modified'])} user-modified (kept)")
+    if result.get("pruned"):
+        parts.append(f"{len(result['pruned'])} removed (demoted)")
     if result["cleaned"]:
         parts.append(f"{len(result['cleaned'])} cleaned from manifest")
     print(f"\nDone: {', '.join(parts)}. {result['total_bundled']} total bundled.")

@@ -1,5 +1,6 @@
 """Tests for tools/skills_sync.py — manifest-based skill seeding and updating."""
 
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -407,7 +408,7 @@ class TestSyncSkills:
             result = sync_skills(quiet=True)
         assert result == {
             "copied": [], "updated": [], "skipped": 0,
-            "user_modified": [], "cleaned": [], "total_bundled": 0,
+            "user_modified": [], "cleaned": [], "pruned": [], "total_bundled": 0,
         }
 
     def test_failed_copy_does_not_poison_manifest(self, tmp_path):
@@ -501,6 +502,111 @@ class TestSyncSkills:
         new_bundled_hash = _dir_hash(bundled / "old-skill")
         assert manifest["old-skill"] == new_bundled_hash
         assert manifest["old-skill"] != old_hash
+
+
+class TestPruneDemotedSkills:
+    """The heal-gap fix: when a skill leaves the bundled set (demoted to
+    optional-skills/), its unmodified seeded copy is removed from the home so the
+    slim reaches already-provisioned agents — but a modified/ambiguous/untracked
+    copy is preserved."""
+
+    def _patches(self, bundled, skills_dir, manifest_file):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        return stack
+
+    def _bundle(self, tmp_path):
+        bundled = tmp_path / "bundled_skills"
+        (bundled / "mlops" / "axolotl").mkdir(parents=True)
+        (bundled / "mlops" / "axolotl" / "SKILL.md").write_text("---\nname: axolotl\n---\n# Axolotl\n")
+        (bundled / "email" / "himalaya").mkdir(parents=True)
+        (bundled / "email" / "himalaya" / "SKILL.md").write_text("---\nname: himalaya\n---\n# Himalaya\n")
+        return bundled
+
+    def test_unmodified_demoted_skill_is_pruned(self, tmp_path):
+        bundled = self._bundle(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)  # seed both
+            assert (skills_dir / "mlops" / "axolotl" / "SKILL.md").exists()
+            shutil.rmtree(bundled / "mlops" / "axolotl")  # demote axolotl
+            result = sync_skills(quiet=True)
+        assert "axolotl" in result["pruned"]
+        assert "axolotl" in result["cleaned"]
+        assert not (skills_dir / "mlops" / "axolotl").exists()          # removed from home
+        assert (skills_dir / "email" / "himalaya" / "SKILL.md").exists()  # untouched
+
+    def test_user_modified_demoted_skill_is_kept(self, tmp_path):
+        bundled = self._bundle(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            (skills_dir / "mlops" / "axolotl" / "SKILL.md").write_text("# my edits\n")
+            shutil.rmtree(bundled / "mlops" / "axolotl")  # demote
+            result = sync_skills(quiet=True)
+        assert "axolotl" not in result["pruned"]     # NOT deleted (user-modified)
+        assert "axolotl" in result["cleaned"]         # manifest still cleaned
+        assert (skills_dir / "mlops" / "axolotl" / "SKILL.md").read_text() == "# my edits\n"
+
+    def test_demoted_skill_already_deleted_no_error(self, tmp_path):
+        bundled = self._bundle(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            shutil.rmtree(skills_dir / "mlops" / "axolotl")  # user already removed it
+            shutil.rmtree(bundled / "mlops" / "axolotl")     # demote
+            result = sync_skills(quiet=True)
+        assert "axolotl" not in result["pruned"]
+        assert "axolotl" in result["cleaned"]
+
+    def test_bundled_skill_never_pruned(self, tmp_path):
+        bundled = self._bundle(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            result = sync_skills(quiet=True)  # nothing demoted
+        assert result["pruned"] == []
+        assert (skills_dir / "mlops" / "axolotl" / "SKILL.md").exists()
+        assert (skills_dir / "email" / "himalaya" / "SKILL.md").exists()
+
+    def test_v1_manifest_entry_not_pruned(self, tmp_path):
+        # A demoted skill whose manifest entry has no hash (v1) can't be verified
+        # unmodified → keep the on-disk copy, only clean the manifest.
+        bundled = self._bundle(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        dest = skills_dir / "mlops" / "axolotl"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("---\nname: axolotl\n---\n# Axolotl\n")
+        shutil.rmtree(bundled / "mlops" / "axolotl")  # not in bundle
+        manifest_file.write_text("axolotl\n")          # v1, no hash
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+        assert "axolotl" not in result["pruned"]
+        assert "axolotl" in result["cleaned"]
+        assert dest.exists()
+
+    def test_ambiguous_name_not_pruned(self, tmp_path):
+        # Same frontmatter name in two on-disk dirs → don't prune (safety).
+        bundled = self._bundle(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        with self._patches(bundled, skills_dir, manifest_file):
+            sync_skills(quiet=True)
+            dup = skills_dir / "dup" / "axolotl2"
+            dup.mkdir(parents=True)
+            (dup / "SKILL.md").write_text("---\nname: axolotl\n---\n# dup\n")
+            shutil.rmtree(bundled / "mlops" / "axolotl")  # demote axolotl
+            result = sync_skills(quiet=True)
+        assert "axolotl" not in result["pruned"]        # ambiguous → skip
+        assert (skills_dir / "mlops" / "axolotl").exists()
 
 
 class TestGetBundledDir:
