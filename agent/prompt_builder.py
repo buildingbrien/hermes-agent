@@ -703,8 +703,24 @@ def _skill_should_show(
     conditions: dict,
     available_tools: "set[str] | None",
     available_toolsets: "set[str] | None",
+    session_platform: "str | None" = None,
 ) -> bool:
     """Return False if the skill's conditional activation rules exclude it."""
+    # Gateway-channel gate: hide a channel-specific skill (its frontmatter lists
+    # session_platforms) on every OTHER channel — independent of tool filtering,
+    # and evaluated BEFORE the None/None short-circuit so it fires even when tool
+    # info is absent. Fail-open when the session platform is unknown (desktop/CLI/
+    # tests bind no platform): hiding a skill someone needs is worse than one
+    # spare index line. Backported from upstream (NousResearch/hermes-agent).
+    wanted_platforms = [
+        str(p).strip().lower()
+        for p in (conditions.get("session_platforms") or [])
+        if str(p).strip()
+    ]
+    if wanted_platforms and session_platform:
+        if session_platform.strip().lower() not in wanted_platforms:
+            return False
+
     if available_tools is None and available_toolsets is None:
         return True  # No filtering info — show everything (backward compat)
 
@@ -801,6 +817,7 @@ def build_skills_system_prompt(
                 entry.get("conditions") or {},
                 available_tools,
                 available_toolsets,
+                _platform_hint or None,
             ):
                 continue
             skills_by_category.setdefault(category, []).append(
@@ -826,6 +843,7 @@ def build_skills_system_prompt(
                 extract_skill_conditions(frontmatter),
                 available_tools,
                 available_toolsets,
+                _platform_hint or None,
             ):
                 continue
             skills_by_category.setdefault(entry["category"], []).append(
@@ -881,6 +899,7 @@ def build_skills_system_prompt(
                     extract_skill_conditions(frontmatter),
                     available_tools,
                     available_toolsets,
+                    _platform_hint or None,
                 ):
                     continue
                 seen_skill_names.add(frontmatter_name)

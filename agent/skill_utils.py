@@ -257,6 +257,11 @@ def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
         "requires_toolsets": hermes.get("requires_toolsets", []),
         "fallback_for_tools": hermes.get("fallback_for_tools", []),
         "requires_tools": hermes.get("requires_tools", []),
+        # Gateway-channel relevance (offer-time gate): show only on these
+        # session platforms; empty/absent = every channel. Backported from
+        # upstream (NousResearch/hermes-agent) to curate the skill index per
+        # channel without touching the mutable config disabled-list.
+        "session_platforms": hermes.get("session_platforms", []),
     }
 
 

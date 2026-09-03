@@ -1148,4 +1148,51 @@ class TestBuildUnavailableToolsPrompt:
 # =========================================================================
 
 
+# =========================================================================
+# session_platforms channel gate (S1 backport from upstream)
+# =========================================================================
+class TestSessionPlatformsGate:
+    """Offer-time channel gate in _skill_should_show + its frontmatter key."""
+
+    def test_hidden_on_other_channel(self):
+        cond = {"session_platforms": ["teams", "cron"]}
+        assert _skill_should_show(cond, set(), set(), session_platform="telegram") is False
+
+    def test_shown_on_matching_channel(self):
+        cond = {"session_platforms": ["teams", "cron"]}
+        assert _skill_should_show(cond, set(), set(), session_platform="teams") is True
+
+    def test_shown_when_platform_unknown_failopen(self):
+        # desktop/CLI bind no session platform -> gate fails OPEN (show).
+        cond = {"session_platforms": ["teams"]}
+        assert _skill_should_show(cond, set(), set(), session_platform=None) is True
+
+    def test_shown_when_no_session_platforms(self):
+        # absent field -> every channel.
+        assert _skill_should_show({}, set(), set(), session_platform="telegram") is True
+
+    def test_gate_fires_before_tool_shortcircuit(self):
+        # Even with no tool info (None/None), the channel gate still applies —
+        # ordering matters: it runs before the backward-compat short-circuit.
+        cond = {"session_platforms": ["teams"]}
+        assert _skill_should_show(cond, None, None, session_platform="telegram") is False
+
+    def test_case_insensitive_match(self):
+        cond = {"session_platforms": ["Teams"]}
+        assert _skill_should_show(cond, set(), set(), session_platform="teams") is True
+
+    def test_fallback_for_tools_still_hides_with_new_signature(self):
+        # Regression: the existing tool filter keeps working with the 4th arg.
+        cond = {"fallback_for_tools": ["email_send"]}
+        assert _skill_should_show(cond, {"email_send"}, set(), session_platform="desktop") is False
+        assert _skill_should_show(cond, {"web_search"}, set(), session_platform="desktop") is True
+
+    def test_extract_conditions_includes_session_platforms(self):
+        from agent.skill_utils import extract_skill_conditions
+
+        fm = {"metadata": {"hermes": {"session_platforms": ["teams"]}}}
+        assert extract_skill_conditions(fm)["session_platforms"] == ["teams"]
+        assert extract_skill_conditions({})["session_platforms"] == []
+
+
 
