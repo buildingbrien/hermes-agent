@@ -24,6 +24,27 @@ from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
+
+# Phone-voice worker turns run under a bridge session id with one of these
+# prefixes (mobile_voice_server: inbound_/dialer_/driver_). On a LIVE call a
+# session_search that loads each matching session and Gemini-summarizes it took
+# 100-180s (2026-09-04, a 194s turn) — the caller sits in dead air. For voice
+# we return the FTS5 match snippets directly (already computed by SQLite, no
+# model call): a fact lookup like "where do I live" is answered from the
+# highlighted excerpt in well under a second.
+_VOICE_SESSION_PREFIXES = ("inbound_", "dialer_", "driver_")
+
+
+def _is_voice_turn(current_session_id) -> bool:
+    return bool(current_session_id) and str(current_session_id).startswith(
+        _VOICE_SESSION_PREFIXES)
+
+
+def _clean_snippet(text: str, max_chars: int = 400) -> str:
+    """FTS5 highlight markers → plain text, collapsed and bounded."""
+    t = (text or "").replace(">>>", "").replace("<<<", "")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:max_chars]
 MAX_SUMMARY_TOKENS = 10000
 
 
@@ -422,6 +443,38 @@ def session_search(
                 seen_sessions[resolved_sid] = result
             if len(seen_sessions) >= limit:
                 break
+
+        # Voice fast path: on a live call, skip per-session load + Gemini
+        # summarization and hand back the FTS snippets directly. The agent
+        # turns the excerpt into one spoken sentence; the whole tool returns
+        # in well under a second instead of minutes.
+        if _is_voice_turn(current_session_id):
+            vresults = []
+            for sid, match in seen_sessions.items():
+                meta = {}
+                try:
+                    meta = db.get_session(sid) or {}
+                except Exception:
+                    meta = {}
+                snip = _clean_snippet(match.get("snippet") or match.get("content") or "")
+                vresults.append({
+                    "session_id": sid,
+                    "title": (meta.get("title") or match.get("session_title") or "").strip(),
+                    "when": _format_timestamp(
+                        match.get("timestamp") or meta.get("started_at")),
+                    "role": match.get("role", ""),
+                    "excerpt": snip,
+                })
+            return json.dumps({
+                "success": True,
+                "query": query,
+                "mode": "voice_snippet",
+                "results": vresults,
+                "count": len(vresults),
+                "note": ("Live-call fast recall: matched excerpts from past "
+                         "sessions, not full summaries. Answer from these in one "
+                         "short spoken sentence."),
+            }, ensure_ascii=False)
 
         # Prepare all sessions for parallel summarization
         tasks = []
