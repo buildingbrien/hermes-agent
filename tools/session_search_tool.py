@@ -53,6 +53,15 @@ def _clean_snippet(text: str, max_chars: int = 400) -> str:
 # also raising that timeout, or the retry storm returns.
 MAX_SUMMARY_TOKENS = 1200
 
+# Summarization model. Routed to DeepSeek (the fleet's main provider): measured
+# ~2x Gemini-Flash's generation rate on this task (2026-09-04), no extra vendor
+# seeing private transcripts, and no extra credential — the DEEPSEEK_API_KEY is
+# already present on every Mini. Falls back to the configured aux provider when
+# that key is absent, and yields to an explicit auxiliary.session_search.provider.
+_SUMMARY_PROVIDER = "deepseek"
+_SUMMARY_MODEL = "deepseek-v4-flash"
+_SUMMARY_BASE_URL = "https://api.deepseek.com"
+
 
 def _get_session_search_max_concurrency(default: int = 3) -> int:
     """Read auxiliary.session_search.max_concurrency with sane bounds."""
@@ -73,6 +82,34 @@ def _get_session_search_max_concurrency(default: int = 3) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, min(value, 5))
+
+
+def _summary_llm_overrides() -> dict:
+    """Explicit async_call_llm kwargs to route summarization to DeepSeek.
+
+    Returns {} (→ the configured/auto aux provider, e.g. Gemini) when the
+    DeepSeek key is absent, or when the operator has EXPLICITLY set
+    auxiliary.session_search.provider to a real value (config still wins).
+    """
+    import os
+    try:
+        from hermes_cli.config import load_config
+        aux = (load_config().get("auxiliary", {}) or {})
+        tc = aux.get("session_search", {}) or {}
+        prov = str(tc.get("provider", "") or "").strip().lower()
+        if prov and prov not in ("auto", "main", "default"):
+            return {}
+    except Exception:  # noqa: BLE001 - config unreadable → fall through
+        pass
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not key:
+        return {}
+    return {
+        "provider": _SUMMARY_PROVIDER,
+        "model": _SUMMARY_MODEL,
+        "base_url": _SUMMARY_BASE_URL,
+        "api_key": key,
+    }
 
 
 def _format_timestamp(ts: Union[int, float, str, None]) -> str:
@@ -261,6 +298,7 @@ async def _summarize_session(
                 ],
                 temperature=0.1,
                 max_tokens=MAX_SUMMARY_TOKENS,
+                **_summary_llm_overrides(),
             )
             content = extract_content_or_reasoning(response)
             if content:

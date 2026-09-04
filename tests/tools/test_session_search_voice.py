@@ -84,3 +84,32 @@ def test_timeout_does_not_retry(monkeypatch):
         ss._summarize_session("transcript", "query", {"source": "web"}))
     assert out is None
     assert calls["n"] == 1, "a timed-out summary must NOT retry (that is the 104s storm)"
+
+
+# ── Summarization routed to DeepSeek (2026-09-04) ────────────────────────────
+def test_summary_routes_to_deepseek_when_key_present(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    # no explicit config override in the test env → DeepSeek preferred
+    ov = ss._summary_llm_overrides()
+    assert ov.get("provider") == "deepseek"
+    assert ov.get("model") == "deepseek-v4-flash"
+    assert ov.get("base_url") == "https://api.deepseek.com"
+    assert ov.get("api_key") == "sk-test-key"
+
+
+def test_summary_falls_back_without_deepseek_key(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    assert ss._summary_llm_overrides() == {}  # → configured aux provider
+
+
+def test_summarize_passes_overrides_to_llm(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-key")
+    seen = {}
+    async def fake_llm(**kw):
+        seen.update(kw); return {"choices": [{"message": {"content": "ok"}}]}
+    monkeypatch.setattr(ss, "async_call_llm", fake_llm)
+    monkeypatch.setattr(ss, "extract_content_or_reasoning", lambda r: "ok")
+    asyncio.get_event_loop().run_until_complete(
+        ss._summarize_session("t", "q", {"source": "web"}))
+    assert seen.get("provider") == "deepseek" and seen.get("model") == "deepseek-v4-flash"
