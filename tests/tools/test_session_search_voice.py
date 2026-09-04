@@ -57,3 +57,30 @@ def test_desktop_turn_still_summarizes(monkeypatch):
     db = _FakeDB()
     json.loads(ss.session_search("where do I live", db=db, current_session_id="web_1234"))
     assert calls["n"] > 0
+
+
+# ── Budget / robustness (2026-09-04): desktop path was 104s ──────────────────
+def test_budget_constants_stay_under_the_timeout_wall():
+    # 1200 tok ≈ 24s finishes in ONE attempt under auxiliary.session_search
+    # timeout=30; raising past ~1300 without raising that timeout re-triggers
+    # the 3x-retry storm that caused the 104s call.
+    assert ss.MAX_SUMMARY_TOKENS <= 1300
+    assert ss.MAX_SESSION_CHARS <= 40000
+    # floor: _truncate_around_matches needs room around a match
+    assert ss.MAX_SESSION_CHARS >= 12000
+
+
+def test_timeout_does_not_retry(monkeypatch):
+    import asyncio
+    from openai import APITimeoutError
+    calls = {"n": 0}
+
+    async def fake_llm(*a, **k):
+        calls["n"] += 1
+        raise APITimeoutError(request=None)
+
+    monkeypatch.setattr(ss, "async_call_llm", fake_llm)
+    out = asyncio.get_event_loop().run_until_complete(
+        ss._summarize_session("transcript", "query", {"source": "web"}))
+    assert out is None
+    assert calls["n"] == 1, "a timed-out summary must NOT retry (that is the 104s storm)"

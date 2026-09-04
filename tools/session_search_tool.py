@@ -23,7 +23,7 @@ import re
 from typing import Dict, Any, List, Optional, Union
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
-MAX_SESSION_CHARS = 100_000
+MAX_SESSION_CHARS = 30_000
 
 # Phone-voice worker turns run under a bridge session id with one of these
 # prefixes (mobile_voice_server: inbound_/dialer_/driver_). On a LIVE call a
@@ -45,7 +45,13 @@ def _clean_snippet(text: str, max_chars: int = 400) -> str:
     t = (text or "").replace(">>>", "").replace("<<<", "")
     t = re.sub(r"\s+", " ", t).strip()
     return t[:max_chars]
-MAX_SUMMARY_TOKENS = 10000
+# Output cap. gemini-3-flash-preview generates ~50 tok/s, so this is the
+# dominant latency lever. 1200 tokens ≈ ~24s finishes in ONE attempt UNDER the
+# 30s auxiliary.session_search.timeout; the old 10000 ceiling let a rich
+# transcript run long, trip the 30s wall, and retry 3x (30+1+30+2+30 ≈ 93s) —
+# the founder's 104s desktop call 2026-09-04. Do NOT raise past ~1300 without
+# also raising that timeout, or the retry storm returns.
+MAX_SUMMARY_TOKENS = 1200
 
 
 def _get_session_search_max_concurrency(default: int = 3) -> int:
@@ -226,8 +232,11 @@ async def _summarize_session(
         "3. Key decisions, solutions found, or conclusions reached\n"
         "4. Any specific commands, files, URLs, or technical details that were important\n"
         "5. Anything left unresolved or notable\n\n"
-        "Be thorough but concise. Preserve specific details (commands, paths, error messages) "
-        "that would be useful to recall. Write in past tense as a factual recap."
+        "Keep the recap SHORT — aim for under ~200 words. Lead with whatever "
+        "answers the search topic, then the essentials; short bullets are fine "
+        "and you may omit routine back-and-forth. Preserve specific details "
+        "(commands, paths, URLs, error messages, names, places) that would be "
+        "useful to recall. Write in past tense as a factual recap."
     )
 
     source = session_meta.get("source", "unknown")
@@ -265,7 +274,20 @@ async def _summarize_session(
         except RuntimeError:
             logging.warning("No auxiliary model available for session summarization")
             return None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
+            # A timeout or connection error means the model was already given
+            # its full (30s) budget — retrying just stacks another 30s wait.
+            # 2026-09-04: retrying a timed-out 10k-token summary 3x is exactly
+            # what made the desktop path take 104s. Fall back immediately on
+            # those; only retry genuinely transient/empty failures.
+            try:
+                from openai import APITimeoutError, APIConnectionError
+                _no_retry = isinstance(e, (APITimeoutError, APIConnectionError))
+            except Exception:  # noqa: BLE001 - openai always present here
+                _no_retry = "timeout" in str(e).lower()
+            if _no_retry:
+                logging.warning("Session summarization timed out — not retrying: %s", e)
+                return None
             if attempt < max_retries - 1:
                 await asyncio.sleep(1 * (attempt + 1))
             else:
