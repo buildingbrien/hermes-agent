@@ -2300,6 +2300,31 @@ def _get_cached_client(
     return client, model or default_model
 
 
+# DeepSeek is the fleet's main provider; route TEXT auxiliary tasks to its fast
+# model rather than offloading to a second vendor (Google/Gemini). Vision and
+# any multimodal task keeps its own path.
+_DEEPSEEK_TEXT_MODEL = "deepseek-v4-flash"
+_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+_DEEPSEEK_TEXT_EXCLUDE = ("vision",)
+
+
+def _deepseek_text_default(task):
+    """(provider, model, base_url, api_key, api_mode) routing a text aux task to
+    DeepSeek, or None to fall through. Fires only when the MAIN provider is
+    DeepSeek (so aux runs on the same vendor as the main agent, not a second
+    one) AND its key is present, and never for a vision/multimodal task."""
+    import os
+    t = (task or "").lower()
+    if any(x in t for x in _DEEPSEEK_TEXT_EXCLUDE):
+        return None
+    if _read_main_provider() != "deepseek":
+        return None
+    key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if not key:
+        return None
+    return ("custom", _DEEPSEEK_TEXT_MODEL, _DEEPSEEK_BASE_URL, key, "chat_completions")
+
+
 def _resolve_task_provider_model(
     task: str = None,
     provider: str = None,
@@ -2347,6 +2372,20 @@ def _resolve_task_provider_model(
             return "custom", resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
         if cfg_provider and cfg_provider != "auto":
             return cfg_provider, resolved_model, None, None, resolved_api_mode
+
+        # Text auxiliary tasks default to DeepSeek (the fleet's main provider):
+        # ~2x Gemini-Flash's generation rate on these jobs (measured 2026-09-04),
+        # it keeps private content (whole conversations for compression, the
+        # user's memories for flush_memories, etc.) with the ONE vendor already
+        # running the main agent instead of also sending it to Google, and needs
+        # no extra credential — DEEPSEEK_API_KEY is already on every Mini.
+        # Vision/multimodal tasks are excluded (DeepSeek's text model rejects
+        # images — they keep their own resolution). Explicit provider/model/
+        # base_url args and an explicit auxiliary.<task>.provider above still win,
+        # and without a DeepSeek key this falls through to the normal auto chain.
+        ds = _deepseek_text_default(task)
+        if ds is not None:
+            return ds
 
         return "auto", resolved_model, None, None, resolved_api_mode
 
