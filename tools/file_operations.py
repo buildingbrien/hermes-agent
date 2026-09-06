@@ -461,6 +461,17 @@ class ShellFileOperations(FileOperations):
         """
         if not path:
             return path
+
+        # Expand $VAR / ${VAR} (e.g. $HOME) before ~ handling. Agent/cron
+        # prompts routinely embed literal "$HOME/..." paths; the file tools
+        # pass the arg straight through (no shell), so without this it resolves
+        # to a literal "$HOME/..." → "File not found" and the agent flails
+        # (a recurring source of spurious file_delete/cleanup approvals).
+        # expandvars only substitutes defined env vars (no command
+        # substitution) and leaves unknown $names literal; the result is still
+        # shell-escaped downstream and re-checked by the write-deny guard.
+        if "$" in path:
+            path = os.path.expandvars(path)
         
         # Handle ~ and ~user
         if path.startswith('~'):
