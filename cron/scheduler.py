@@ -1088,6 +1088,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             agent_key=str(_agent_key).lower(),
             trust_level=(job.get("trust_level") or "cautious"),
             grants=(job.get("grants") or []),
+            # A read-only job (e.g. the heartbeat: "look and report, not act")
+            # blocks write-class actions WITHOUT filing an approval card — an
+            # unattended run never waits, so such a card is only noise to reject.
+            read_only=bool(job.get("read_only", False)),
         )
     except Exception:
         # Never let gate wiring break job execution — but cron_gate itself
