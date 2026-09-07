@@ -1092,6 +1092,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # blocks write-class actions WITHOUT filing an approval card — an
             # unattended run never waits, so such a card is only noise to reject.
             read_only=bool(job.get("read_only", False)),
+            # Per-job gate policy overrides read_only when set: "escalate" lets
+            # a curated outward action (email/message/crm/post/calendar-create)
+            # file a capped card while off-mission improvisation still blocks
+            # silent; "block"/"card-all" are the legacy read_only behaviors.
+            # Absent → cron_gate derives from read_only, so nothing else changes.
+            policy=job.get("cron_action_policy"),
         )
     except Exception:
         # Never let gate wiring break job execution — but cron_gate itself
