@@ -1,0 +1,13 @@
+# Fork-owned overlay on top of vendor/hermes-upstream (see PHASE_B_OVERLAY.md).
+# ADDONS (fork-only files, carried whole under runtime-addons/):
+tools/fleet_send.py
+tools/dial_meeting.py
+tools/meeting_notes.py
+tools/schedule_meeting_tool.py
+tools/action_items_tool.py
+tools/desktop_use.py
+cron/meeting_join.py
+# DROPPED per assumptions test (RL-training-only; upstream serves DeepSeek tool-calls natively):
+#   environments/tool_call_parsers/deepseek_v3_parser.py
+#   environments/tool_call_parsers/deepseek_v3_1_parser.py
+# PATCHES (fold re-fits onto upstream files) are listed in runtime-patches/series.
