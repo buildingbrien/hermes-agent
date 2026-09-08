@@ -350,6 +350,7 @@ class TestBuiltinDiscovery:
             "tools.cronjob_tools",
             "tools.delegate_neith",
             "tools.delegate_tool",
+            "tools.desktop_use",
             "tools.dial_meeting",
             "tools.discord_tool",
             "tools.email_send_tool",
