@@ -1,0 +1,37 @@
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -491,6 +491,24 @@
+     return _prepend_missing_path_entries(existing_path, [bin_dir] if bin_dir else [])
+ 
+ 
++def _prepend_local_bin_dir(existing_path: str) -> str:
++    """Prepend the real user's ``~/.local/bin`` if missing (no-op on Windows).
++
++    ``~/.local/bin`` is where the desktop app installs the binaries it ships for
++    the agent — himalaya (fleet email), cloudflared (voice tunnel) — because
++    customer machines have no Homebrew. It must be on PATH even when the inherited
++    PATH already looks sane (``_append_missing_sane_path_entries`` only fills gaps
++    in the standard dirs), or the agent runs ``himalaya`` and gets exit 127.
++    Uses the real home (the Python process's HOME) via ``expanduser``, not any
++    per-profile HOME override applied later — the binaries live in the actual
++    user's directory.
++    """
++    if _IS_WINDOWS:
++        return existing_path
++    local_bin = os.path.join(os.path.expanduser("~"), ".local", "bin")
++    return _prepend_missing_path_entries(existing_path, [local_bin])
++
++
+ def _managed_runtime_path_entries() -> list[str]:
+     """Existing Hermes-managed runtime dirs: ``$HERMES_HOME/node`` (+``/bin``) and
+     ``$HERMES_HOME/bin`` (managed ``uv``). Per call, not cached: home is
+@@ -542,7 +560,8 @@
+ def _make_run_env(env: dict) -> dict:
+     """Build a run environment with a sane PATH and provider-var stripping."""
+     return _scrubbed_env([(dict(os.environ | env), True)], frozenset(),
+-                         lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
++                         lambda p: _prepend_local_bin_dir(
++                             _prepend_git_bash_dirs(_append_missing_sane_path_entries(p))))
+ 
+ 
+ # --- Hermes venv / repo-root detection (module-level, computed once) ---

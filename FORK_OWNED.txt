@@ -1,0 +1,27 @@
+# Fork-owned overlay on vendor/hermes-upstream (v2026.9.7). See PHASE_B_OVERLAY.md.
+# PATCHES (fold re-fits, in runtime-patches/series):
+#   0001 deepseek prefix-cache · 0002 aux flash-guard · 0003 prompt_builder ·
+#   0004 local PATH · 0005 default_soul identity · 0006 deepseek-vision ·
+#   0007 cron meeting · 0008 file_safety #53 denies · 0009 browser_cdp session-material ·
+#   0010 browser_tool UI-access · 0011 toolsets (#54 desktop/board/fleet) ·
+#   0012 cronjob grants · 0014 registry unavailable_out · 0015 process_registry reconcile ·
+#   0016 sandbox call-sites   (0013 session-search DROPPED — obsolete upstream)
+# ADDONS (fork-only files, carried whole under runtime-addons/):
+tools/fleet_send.py
+tools/dial_meeting.py
+tools/meeting_notes.py
+tools/schedule_meeting_tool.py
+tools/action_items_tool.py
+tools/desktop_use.py
+cron/meeting_join.py
+tools/browser_cursor.py
+tools/ask_agent_tool.py
+tools/delegate_neith.py
+tools/board_tool.py
+tools/gbrain_tool.py
+tools/email_send_tool.py
+cron/p7_task_hook.py
+sandbox_executor.py
+sandbox_routing.py
+# DROPPED: environments/tool_call_parsers/* (RL-training-only), gemini_cloudcode_adapter
+#   (multi-model, violates DeepSeek-lock), matrix.py, browser_providers/base.py (superseded).

@@ -1,0 +1,15 @@
+0001-deepseek-prefix-cache.patch
+0002-auxiliary-client-flash-guard.patch
+0003-prompt-builder-folds.patch
+0004-local-path-prepend.patch
+0005-default-soul-identity.patch
+0006-deepseek-vision.patch
+0007-cron-meeting-folds.patch
+0008-file-safety-lucaryin-denies.patch
+0009-browser-cdp-session-material.patch
+0010-browser-tool-uiaccess.patch
+0011-toolsets-lucaryin.patch
+0012-cronjob-grants.patch
+0014-registry-unavailable-out.patch
+0015-process-registry-reconcile.patch
+0016-sandbox-callsites.patch

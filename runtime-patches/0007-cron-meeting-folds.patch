@@ -1,0 +1,90 @@
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -1705,6 +1705,10 @@
+     failure_deliver: Optional[str] = None,
+     paused: bool = False,
+     paused_reason: Optional[str] = None,
++    job_type: str = "prompt",
++    meeting: Optional[Dict[str, Any]] = None,
++    grants: Optional[List[Dict[str, Any]]] = None,
++    agent: Optional[str] = None,
+ ) -> Dict[str, Any]:
+     """Create a new cron job and return the stored record.
+ 
+@@ -1759,6 +1763,19 @@
+ 
+     job = {
+         "id": job_id,
++        # A plain "prompt" job runs the agent; a "meeting_join" job is executed
++        # deterministically by the scheduler (no model) — see run_meeting_join.
++        "type": (job_type or "prompt"),
++        # Structured payload for non-prompt job types (e.g. meeting_join dial
++        # info). None for ordinary prompt jobs.
++        "meeting": meeting,
++        # Standing authorizations captured when the job was scheduled in an
++        # attended turn; the approval gate / meeting executor honor these so a
++        # future unattended action the user already approved isn't re-asked.
++        "grants": grants or [],
++        # Which agent runs this job (run_job honors job["agent"], falling back to
++        # the ticker's profile). None/"" -> ticker default.
++        "agent": (str(agent).strip().lower() or None) if agent else None,
+         "name": name,
+         "prompt": prompt_text,
+         "skills": normalized_skills,
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2297,7 +2297,19 @@
+             "error": error})
+ 
+ 
++def _persist_job_grants(job: dict) -> None:
++    """Write the job's (possibly grant-mutated) state back to the store. Used
++    after a meeting_join consumes its single-use dial grant, so the grant can't
++    be reused across a restart."""
++    from cron.jobs import load_jobs, save_jobs
++    jobs = load_jobs()
++    for i, j in enumerate(jobs):
++        if j.get("id") == job.get("id"):
++            jobs[i]["grants"] = job.get("grants", [])
++            save_jobs(jobs)
++            return
+ 
++
+ def run_job(
+     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
+     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
+@@ -2959,13 +2971,27 @@
+             "execution_id": execution_id}
+         if fire_claim_lost is not None:
+             _run_kwargs["cancel_event"] = fire_claim_lost
+-        try:
+-            success, output, final_response, error = run_job(job, **_run_kwargs)
+-        except BaseException:
+-            # run_job hands back the agent even when raising; tear down so a failed run never leaks.
+-            # BaseException so KeyboardInterrupt/SystemExit mid-run still trigger teardown.
+-            _teardown_deferred()
+-            raise
++        if job.get("type") == "meeting_join":
++            # Deterministic dial — no model, no cron agent to defer/tear down.
++            # See cron/meeting_join.py.
++            from cron.meeting_join import run_meeting_join
++            _mj_agent = str(job.get("agent") or "thoth").lower() or "thoth"
++            success, output, final_response, error = run_meeting_join(job, _mj_agent)
++            # The executor consumes a single-use grant in-place; persist the
++            # mutated job so a restart can't re-dial on the same grant.
++            try:
++                _persist_job_grants(job)
++            except Exception:
++                logger.warning("could not persist consumed meeting grant for %s",
++                               job.get("id"), exc_info=True)
++        else:
++            try:
++                success, output, final_response, error = run_job(job, **_run_kwargs)
++            except BaseException:
++                # run_job hands back the agent even when raising; tear down so a failed run never leaks.
++                # BaseException so KeyboardInterrupt/SystemExit mid-run still trigger teardown.
++                _teardown_deferred()
++                raise
+ 
+         if _fire_claim_ownership_lost():
+             _teardown_deferred()
