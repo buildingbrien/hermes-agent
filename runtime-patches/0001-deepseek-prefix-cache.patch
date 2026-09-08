@@ -1,0 +1,70 @@
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -240,6 +240,7 @@
+         enabled_toolsets: List[str] = None, disabled_toolsets: List[str] = None,
+         save_trajectories: bool = False, verbose_logging: bool = False, quiet_mode: bool = False,
+         tool_progress_mode: str = "all", ephemeral_system_prompt: str = None,
++        ephemeral_user_context: str = None,  # lucaryin: bridge per-turn volatile block routed to the user-message tail (DeepSeek prefix-cache stability)
+         log_prefix_chars: int = 100, log_prefix: str = "",
+         providers_allowed: List[str] = None, providers_ignored: List[str] = None, providers_order: List[str] = None,
+         provider_sort: str = None, provider_require_parameters: bool = False, provider_data_collection: str = None,
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -2147,7 +2147,7 @@
+ # Constructor params stored verbatim under the same name.
+ _PASSTHROUGH_PARAMS = (
+     "model", "max_iterations", "save_trajectories", "verbose_logging", "quiet_mode",
+-    "tool_progress_mode", "ephemeral_system_prompt", "platform", "skip_context_files",
++    "tool_progress_mode", "ephemeral_system_prompt", "ephemeral_user_context", "platform", "skip_context_files",
+     "load_soul_identity", "pass_session_id", "log_prefix_chars",
+     # OpenRouter provider preferences
+     "providers_allowed", "providers_ignored", "providers_order", "provider_sort",
+@@ -2181,6 +2181,7 @@
+     enabled_toolsets: List[str] = None, disabled_toolsets: List[str] = None,
+     save_trajectories: bool = False, verbose_logging: bool = False, quiet_mode: bool = False,
+     tool_progress_mode: str = "all", ephemeral_system_prompt: str = None,
++    ephemeral_user_context: str = None,
+     log_prefix_chars: int = 100, log_prefix: str = "", providers_allowed: List[str] = None,
+     providers_ignored: List[str] = None, providers_order: List[str] = None,
+     provider_sort: str = None, provider_require_parameters: bool = False,
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -78,7 +78,8 @@
+ 
+ 
+ def compose_user_api_content(
+-    content: Any, ext_prefetch_cache: str, plugin_user_context: str
++    content: Any, ext_prefetch_cache: str, plugin_user_context: str,
++    ephemeral_user_context: str = "",
+ ) -> Optional[str]:
+     """Compose the API-bound content of the current turn's user message.
+ 
+@@ -87,7 +88,7 @@
+     if not isinstance(content, str):
+         return None
+     fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
+-    injections = [part for part in (fenced, plugin_user_context) if part]
++    injections = [part for part in (fenced, plugin_user_context, ephemeral_user_context) if part]
+     if not injections:
+         return None
+     return content + "\n\n" + "\n\n".join(injections)
+@@ -729,7 +730,8 @@
+     API copy, so stamp the exact sent bytes on the live dict for replay."""
+     _turn_user_msg = messages[current_turn_user_idx]
+     _api_content = compose_user_api_content(
+-        _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
++        _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context,
++        getattr(agent, "ephemeral_user_context", "") or "",
+     )
+     if _api_content is None or _api_content == _turn_user_msg.get("content"):
+         return
+@@ -986,7 +988,8 @@
+             else:
+                 # Callers that bypass the prologue stamping: compose live.
+                 _composed = compose_user_api_content(
+-                    api_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
++                    api_msg.get("content", ""), ext_prefetch_cache, plugin_user_context,
++                    getattr(agent, "ephemeral_user_context", "") or "",
+                 )
+                 if _composed is not None:
+                     api_msg["content"] = _composed
