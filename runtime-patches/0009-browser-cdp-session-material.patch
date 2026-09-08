@@ -1,0 +1,45 @@
+--- a/tools/browser_cdp_tool.py
++++ b/tools/browser_cdp_tool.py
+@@ -263,6 +263,34 @@
+     ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
+     effective_task_id = task_id or "default"
+ 
++    # ── Session-material denylist (Lucaryin UI-access doctrine, 2026-08-15) ──
++    # The agent may USE a signed-in browser session; it may never EXTRACT it.
++    # Reading/writing cookies or storage would turn a non-portable local
++    # capability into a portable secret — denied structurally, before any CDP
++    # connection (both the frame_id supervisor path and the direct path), with
++    # no approval path. See lucaryin-ai/docs/ui-access-scope-2026-08-14.md
++    # (hard condition 1). Applied ahead of upstream's private-page/SSRF guard,
++    # which stays intact for everything else.
++    _m = method.strip().lower() if isinstance(method, str) else ""
++    _SESSION_MATERIAL = (
++        "network.getcookies", "network.getallcookies", "network.setcookie",
++        "network.setcookies", "network.clearbrowsercookies",
++        "page.getcookies", "page.deletecookie",
++        "storage.getcookies", "storage.setcookies", "storage.clearcookies",
++        "storage.getstorageitems", "domstorage.getdomstorageitems",
++        "domstorage.enable",
++    )
++    if _m in _SESSION_MATERIAL:
++        return json.dumps({
++            "error": (
++                f"CDP method '{method}' is blocked: browser session material "
++                "(cookies/storage) is structurally unreachable to agents. "
++                "You can USE the signed-in session by driving pages; you can "
++                "never read or export its credentials."
++            ),
++            "blocked": "session_material",
++        })
++
+     if frame_id:
+         blocked = _browser_cdp_private_guard(task_id=effective_task_id, method=method, params=params or {})
+         if blocked:
+@@ -334,7 +362,6 @@
+         "- List tabs: method='Target.getTargets', params={}\n"
+         "- Handle a native JS dialog: method='Page.handleJavaScriptDialog', "
+         "params={'accept': true, 'promptText': ''}, target_id=<tabId>\n"
+-        "- Get all cookies: method='Network.getAllCookies', params={}\n"
+         "- Eval in a specific tab: method='Runtime.evaluate', params={'expression': '...', 'returnByValue': true}, "
+         "target_id=<tabId>\n"
+         "- Set viewport for a tab: method='Emulation.setDeviceMetricsOverride', "

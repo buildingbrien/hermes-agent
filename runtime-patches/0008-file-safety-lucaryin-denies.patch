@@ -1,0 +1,49 @@
+--- a/agent/file_safety.py
++++ b/agent/file_safety.py
+@@ -92,6 +92,13 @@
+         *(os.path.join(home, *f) for f in home_files),
+         *(str(base / f) for f in hermes_files for base in (_hermes_home_path(), _hermes_root_path())),
+         "/etc/sudoers", "/etc/passwd", "/etc/shadow",
++        # ── Lucaryin gate-state integrity (Sprint-1 CRITICAL) ──────────────
++        # This file IS the consent gate's own state. If write_file can forge it
++        # the agent self-approves anything (a hand-written `approved` record) or
++        # raises its own trust floor. Sanctioned edits go through the bridge
++        # APIs, never a raw write. (Interim — the terminal still bypasses this;
++        # the durable boundary is the separate-user sandbox, FD1/FD3.)
++        os.path.join(home, ".lucaryin", "agent-configs.db"),
+     ]
+     return {os.path.realpath(p) for p in paths}
+ 
+@@ -102,6 +109,11 @@
+         *(os.path.join(home, d) for d in (".ssh", ".aws", ".gnupg", ".kube")),
+         "/etc/sudoers.d", "/etc/systemd",
+         *(os.path.join(home, *d) for d in ((".docker",), (".azure",), (".config", "gh"), (".config", "gcloud"))),
++        # ── Lucaryin gate-state dirs (Sprint-1) ────────────────────────────
++        # Dialing policy, approval records, and grants: an agent that rewrites
++        # these self-authorizes its own gates. Deny the whole surface; sanctioned
++        # edits go through the bridge APIs, never a raw write.
++        *(os.path.join(home, ".lucaryin", d) for d in ("policies", "approvals", "interactive-grants", "grants")),
+     ]
+     return [os.path.realpath(p) + os.sep for p in paths]
+ 
+@@ -229,7 +241,19 @@
+     resolved = Path(path).expanduser().resolve()
+     hermes_dirs = _hermes_dirs()
+     reason = None
+-    if any(_is_under(resolved, hd / "skills" / ".hub") for hd in hermes_dirs):
++    # ── Lucaryin UI-access doctrine (2026-08-15) ───────────────────────────
++    # The agent-browser profile holds the customer's signed-in session material
++    # (cookie store, tokens). Agents may USE those sessions via the browser tools
++    # — never read the material itself. It lives under $HOME (NOT HERMES_HOME),
++    # so it needs its own check. Structural deny, no approval path.
++    _lucaryin_browser = _resolve_each([Path.home() / ".lucaryin" / "agent-browser"])
++    if _lucaryin_browser and _is_under(resolved, _lucaryin_browser[0]):
++        reason = (
++            "is inside the agent-browser profile, which holds the user's signed-in "
++            "session material. Session material is structurally unreachable — use "
++            "the browser tools to operate signed-in sites instead."
++        )
++    elif any(_is_under(resolved, hd / "skills" / ".hub") for hd in hermes_dirs):
+         reason = (
+             "is an internal Hermes cache file and cannot be read directly to prevent "
+             "prompt injection. Use the skills_list or skill_view tools instead."

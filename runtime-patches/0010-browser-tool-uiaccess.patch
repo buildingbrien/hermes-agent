@@ -1,0 +1,304 @@
+--- a/tools/browser_tool.py
++++ b/tools/browser_tool.py
+@@ -228,6 +228,103 @@
+ from tools import browser_tool_lightpanda_fallback as _lp
+ 
+ 
++# ===========================================================================
++# Lucaryin UI-access: the signed-in "team browser" as a third CDP-override tier
++# ===========================================================================
++# Upstream ``_cdp._get_cdp_override()`` resolves BROWSER_CDP_URL / browser.cdp_url
++# / real-profile only. Lucaryin adds a third tier: the user's own signed-in agent
++# browser, discovered on its private CDP port and — when it exists but is closed —
++# relaunched via a local bridge's ``/api/ui-access/open-browser``. This is what
++# makes "sign in to a tool" a real feature: the tools drive the SAME Chrome the
++# user signed into, instead of a cookie-less cloud/stealth browser. Explicit
++# env/config overrides still win (upstream returns them first); the team browser
++# is only discovered when they yield nothing.
++_AGENT_BROWSER_PROFILE = os.path.expanduser(
++    os.path.join(os.environ.get("LUCARYIN_HOME") or "~/.lucaryin", "agent-browser"))
++_AGENT_BROWSER_CDP_PORT = int(os.environ.get("LUCARYIN_CDP_PORT", "9222"))
++# Bridges that can launch the shared agent-browser profile (any one opens it —
++# /api/ui-access/open-browser). Same port map ask_agent uses.
++_BRIDGE_PORTS = (9001, 9005, 9006, 9007)
++
++# Set when the signed-in browser existed but could not be reached/launched, so
++# browser_navigate can surface it instead of silently proceeding cookie-less
++# (#72). NOT sticky: cleared the moment an attach succeeds, so one failed launch
++# can't poison every later navigation with a false "unreachable" warning.
++_SIGNED_IN_BROWSER_UNREACHABLE = False
++
++
++def _mark_signed_in_reachable() -> None:
++    global _SIGNED_IN_BROWSER_UNREACHABLE
++    if _SIGNED_IN_BROWSER_UNREACHABLE:
++        logger.info("signed-in browser reachable again — clearing unreachable flag")
++    _SIGNED_IN_BROWSER_UNREACHABLE = False
++
++
++def _agent_browser_cdp() -> str:
++    """CDP endpoint of the signed-in agent browser, or "" on a machine that has
++    never used one. If the profile exists but the browser is closed, ask a local
++    bridge to launch it. Falling back silently to a DIFFERENT browser would be
++    worse than failing: the agent would report an authwall on a site the user is
++    signed into, which reads as "the feature is broken"."""
++    if not os.path.isdir(_AGENT_BROWSER_PROFILE):
++        return ""
++    import requests  # lazy: keep it off browser_tool's hot import path
++    version_url = f"http://127.0.0.1:{_AGENT_BROWSER_CDP_PORT}/json/version"
++
++    def _ping() -> str:
++        try:
++            payload = requests.get(version_url, timeout=3).json()
++            return str(payload.get("webSocketDebuggerUrl") or "").strip()
++        except Exception:
++            return ""
++
++    ws = _ping()
++    if ws:
++        _mark_signed_in_reachable()
++        return ws  # a /json/version webSocketDebuggerUrl is already a concrete ws:// endpoint
++    # Closed — ask a bridge to bring it up (single launcher lives bridge-side).
++    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
++    headers = {"Authorization": f"Bearer {token}"} if token else {}
++    for port in _BRIDGE_PORTS:
++        try:
++            requests.post(f"http://127.0.0.1:{port}/api/ui-access/open-browser",
++                          headers=headers, timeout=35)
++        except Exception:
++            continue
++        ws = _ping()
++        if ws:
++            logger.info("agent browser relaunched via bridge :%s", port)
++            _mark_signed_in_reachable()
++            return ws
++    logger.warning(
++        "agent-browser profile exists but the browser could not be reached "
++        "or launched — signed-in sites will be unavailable this turn")
++    global _SIGNED_IN_BROWSER_UNREACHABLE
++    _SIGNED_IN_BROWSER_UNREACHABLE = True
++    return ""
++
++
++# Extend upstream override resolution with the signed-in-browser tier, and install
++# it onto the _cdp module so EVERY consumer that resolves via _cdp._get_cdp_override()
++# at call time (session establishment in browser_tool_session, CDP-supervisor attach
++# in browser_tool_cdp) inherits the fallback without editing browser_tool_cdp.py.
++# _get_cdp_override_raw (pure "is-it-configured" gates) is deliberately NOT wrapped:
++# the team browser is a connect-time discovery, not a configured override.
++# The _lucaryin_upstream stash makes re-import / hot-reload idempotent (no self-wrap).
++_cdp_get_cdp_override_upstream = getattr(
++    _cdp._get_cdp_override, "_lucaryin_upstream", _cdp._get_cdp_override)
++
++
++def _get_cdp_override() -> str:
++    """Resolved CDP override: upstream tiers (env / browser.cdp_url / real-profile),
++    then — only when those yield nothing — the signed-in Lucaryin team browser."""
++    return _cdp_get_cdp_override_upstream() or _agent_browser_cdp()
++
++
++_get_cdp_override._lucaryin_upstream = _cdp_get_cdp_override_upstream  # type: ignore[attr-defined]
++_cdp._get_cdp_override = _get_cdp_override  # type: ignore[assignment]
++
++
+ # Single shared real-profile copy-browser session: concurrent tasks reuse it
+ # instead of each launching a rival Chromium on the same copied user-data-dir.
+ _REAL_PROFILE_SESSION = "hermes-real-profile"
+@@ -431,6 +528,24 @@
+ # ----------------------------------------------------------------------------
+ BROWSER_TOOL_SCHEMAS = [
+     {
++        "name": "request_signin",
++        "description": "Ask the USER to sign in to a website the task needs. Use when a page lands on a login/sign-in wall, or when the team browser is unreachable and the task needs a signed-in site. Files a one-tap card in chat; approving opens the site's login page in the team browser in front of the user, they sign in themselves, and your turn resumes automatically once the session is live. NEVER ask for or type credentials. After calling this, end your turn.",
++        "parameters": {
++            "type": "object",
++            "properties": {
++                "host": {
++                    "type": "string",
++                    "description": "The site's domain, e.g. 'linkedin.com'"
++                },
++                "reason": {
++                    "type": "string",
++                    "description": "One short line on why the sign-in is needed (shown on the card)"
++                }
++            },
++            "required": ["host"]
++        }
++    },
++    {
+         "name": "browser_navigate",
+         "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
+         "parameters": {
+@@ -750,14 +865,46 @@
+     # and blocked redirects must not retarget follow-up clicks to an irrelevant session.
+     _last_active_session_key[effective_task_id] = nav_session_key
+     _lp._copy_fallback_warning(response, result)
+-    _add_navigate_warnings(response, title, session_info if is_first_nav else None)
++    _add_navigate_warnings(response, title, session_info if is_first_nav else None, final_url)
+     _attach_auto_snapshot(response, nav_session_key)
+     return _dumps(response)
+ 
+ 
+-def _add_navigate_warnings(response: Dict[str, Any], title: str, first_nav_session: Optional[Dict[str, Any]]) -> None:
+-    """Bot-detection hint from the page title; on first navigation, the session's stealth features."""
++def _add_navigate_warnings(response: Dict[str, Any], title: str, first_nav_session: Optional[Dict[str, Any]],
++                           final_url: str = "") -> None:
++    """Bot-detection hint from the page title; on first navigation, the session's stealth features.
++    Lucaryin (#72) also surfaces two UI-access signals: an unreachable signed-in browser, and a
++    login/sign-in wall — both steer the model to ``request_signin`` instead of narrating an authwall
++    or typing credentials itself."""
+     title_lower = title.lower()
++    # Lucaryin: the signed-in team browser existed but couldn't be reached this turn, so this page
++    # loaded WITHOUT the user's sessions. Say so — "logged out" here may not be logged out.
++    if _SIGNED_IN_BROWSER_UNREACHABLE:
++        response["signed_in_browser_unreachable"] = True
++        response["signin_hint"] = (
++            "WARNING: this page loaded in a browser WITHOUT the user's signed-in sessions "
++            "(the team browser could not be reached). Anything that looks logged-out here may "
++            "not be. If this task needs a signed-in site, call request_signin(host=...) to pop "
++            "a sign-in card, then end your turn.")
++    # Lucaryin: a login front door is a STRUCTURED condition, not just page text — surface it so
++    # the model files a sign-in card rather than trying to log in itself.
++    _fu = (final_url or "").lower()
++    _signin_url_pat = ("/login", "/signin", "/sign-in", "/authwall", "/uas/login",
++                       "/checkpoint/", "accounts.google.com", "/auth/", "login.microsoftonline")
++    _signin_title_pat = ("sign in", "log in", "login", "sign up or log in", "authwall")
++    if _fu and (any(p in _fu for p in _signin_url_pat)
++                or any(p == title_lower or p in title_lower[:40] for p in _signin_title_pat)):
++        try:
++            from urllib.parse import urlparse as _up
++            _host = _up(final_url).netloc.split(":")[0].lstrip("www.")
++        except Exception:
++            _host = ""
++        response["signin_wall"] = {"host": _host or "unknown", "url": final_url}
++        response["signin_hint"] = (
++            f"This landed on a login page — the user has no live session for {_host or 'this site'} "
++            "in the team browser. Do NOT try to log in yourself and do NOT ask for credentials. Call "
++            f"request_signin(host=\"{_host}\") to pop a sign-in card for the user, then END your turn "
++            "telling them you'll continue once they're in.")
+     if any(pattern in title_lower for pattern in _BOT_DETECTION_TITLE_PATTERNS):
+         response["bot_detection_warning"] = (
+             f"Page title '{title}' suggests bot detection. The site may have blocked this request. "
+@@ -844,11 +991,35 @@
+     return ref if ref.startswith("@") else f"@{ref}"
+ 
+ 
++def _cursor_enabled(task_id: str) -> bool:
++    """Lucaryin: show the gliding cursor only where a human can SEE it — an attached CDP browser
++    (the signed-in headed Chrome, or /browser connect). Cloud + local headless have no override and
++    skip it (no wasted evals). Toggle off with LUCARYIN_BROWSER_CURSOR=0."""
++    if os.environ.get("LUCARYIN_BROWSER_CURSOR", "1") == "0":
++        return False
++    try:
++        return bool(_get_cdp_override())
++    except Exception:
++        return False
++
++
++def _show_cursor(effective_task_id: str, ref: str, pulse: bool) -> None:
++    """Best-effort cursor glide toward ``ref`` before an input action (carried addon; never fatal)."""
++    if not _cursor_enabled(effective_task_id):
++        return
++    try:
++        from tools.browser_cursor import show_cursor_at
++        show_cursor_at(_session._run_browser_command, effective_task_id, ref, pulse=pulse)
++    except Exception as exc:
++        logger.debug("browser cursor overlay skipped for %s: %s", ref, exc)
++
++
+ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
+     """Click the element ``ref`` (e.g. "@e5")."""
+     if _is_camofox_mode():
+         return _camofox("camofox_click", ref, task_id)
+     ref = _at_ref(ref)
++    _show_cursor(_last_session_key(task_id or "default"), ref, pulse=True)
+     return _guarded_action(task_id, "click", "click", [ref], {"clicked": ref}, f"Failed to click {ref}")
+ 
+ 
+@@ -861,6 +1032,7 @@
+     if blocked is not None:
+         return blocked
+     ref = _at_ref(ref)
++    _show_cursor(effective_task_id, ref, pulse=False)
+     result = _session._run_browser_command(effective_task_id, "fill", [ref, text])
+     from agent.display import redact_browser_typed_text_for_display, redact_tool_args_for_display
+     # Typed text goes through the secret-pattern redactor so API keys / tokens don't
+@@ -1248,6 +1420,59 @@
+         return _dumps(error_info)
+ 
+ 
++def request_signin(host: str, reason: str = "") -> str:
++    """Lucaryin (#72): file a sign-in CARD so the USER can log in to a site the task needs.
++
++    The card pops in chat; on approve the bridge opens + fronts the team browser at the site's
++    login page, the user signs in themselves, and the turn auto-resumes when a fresh session
++    appears. The agent never sees, asks for, or types credentials. After calling this, END the
++    turn. Files against ``/api/ui-access/request-signin`` on a local bridge (403 = the host is
++    policy-excluded from signed-in tools, e.g. a financial site)."""
++    import requests  # lazy: keep it off browser_tool's hot import path
++    h = (host or "").strip().lower()
++    if "//" in h:
++        h = h.split("//", 1)[1]
++    h = h.split("/", 1)[0].split(":", 1)[0].lstrip(".")
++    if not h or "." not in h:
++        return json.dumps({"success": False,
++                           "error": "host must be a domain like linkedin.com"})
++    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
++    headers = {"Authorization": f"Bearer {token}"} if token else {}
++    payload = {
++        "host": h,
++        "reason": (reason or "").strip()[:300],
++        "agent": os.environ.get("BRIDGE_PROFILE", "thoth"),
++        "session_id": os.environ.get("HERMES_CRON_ORIGIN_CHAT_ID", ""),
++    }
++    for port in _BRIDGE_PORTS:
++        try:
++            r = requests.post(
++                f"http://127.0.0.1:{port}/api/ui-access/request-signin",
++                json=payload, headers=headers, timeout=10)
++        except Exception:
++            continue
++        if r.status_code == 403:
++            return json.dumps({"success": False,
++                               "error": f"{h} is excluded from signed-in tools "
++                                        "by policy (financial site)"})
++        try:
++            data = r.json()
++        except Exception:
++            continue
++        if data.get("ok"):
++            return json.dumps({
++                "success": True,
++                "approval_id": data.get("approval_id"),
++                "next_step": (
++                    "A sign-in card is now in front of the user. END YOUR TURN "
++                    f"with a short line telling them you'll continue with {h} "
++                    "as soon as they've signed in. Do not poll, do not retry "
++                    "the site, do not ask for credentials.")})
++        return json.dumps({"success": False, "error": data.get("error", "bridge refused")})
++    return json.dumps({"success": False,
++                       "error": "no bridge reachable to file the sign-in card"})
++
++
+ # ---------------------------------------------------------------------------
+ # Registry
+ # ---------------------------------------------------------------------------
+@@ -1312,6 +1537,18 @@
+     registry.register(name=_name, toolset="browser", schema=_BROWSER_SCHEMA_MAP[_name],
+                       handler=_routed_handler(_name, _fallback_call(_name, _defaults, *_extra)),
+                       check_fn=_check_fn, emoji=_emoji)
++
++# Lucaryin (#72): request_signin is a chat-card filer, NOT a browser action, so it registers
++# directly (no extension routing, no browser-availability gate — it must work even when the
++# team browser is unreachable, which is exactly when the model needs it).
++registry.register(
++    name="request_signin",
++    toolset="browser",
++    schema=_BROWSER_SCHEMA_MAP["request_signin"],
++    handler=lambda args, **kw: request_signin(
++        host=args.get("host", ""), reason=args.get("reason", "")),
++    emoji="🔐",
++)
+ 
+ 
+ # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

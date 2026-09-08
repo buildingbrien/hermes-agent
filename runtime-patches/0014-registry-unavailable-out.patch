@@ -1,0 +1,35 @@
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -757,9 +757,21 @@
+ 
+     # ---- Schema retrieval --------------------------------------------
+ 
+-    def get_definitions(self, tool_names: Set[str], quiet: bool = False) -> List[dict]:
++    def get_definitions(
++        self,
++        tool_names: Set[str],
++        quiet: bool = False,
++        unavailable_out: Optional[List[str]] = None,
++    ) -> List[dict]:
+         """OpenAI-format schemas for the requested tools whose ``check_fn`` passes (or is
+-        absent). Probes use the ~30 s TTL cache so ``hermes tools enable`` lands quickly."""
++        absent). Probes use the ~30 s TTL cache so ``hermes tools enable`` lands quickly.
++
++        When *unavailable_out* is provided, the names of registered tools that were
++        requested but dropped because their ``check_fn()`` failed (missing API keys,
++        unreachable backends, etc.) are appended to it. Callers use this to tell the
++        model which tools are NOT available in the deployment, instead of silently
++        hiding them and letting the model hallucinate their results (e.g. gbrain recall
++        on a machine whose brain/bridge is down)."""
+         result = []
+         check_results: Dict[Callable, bool] = {}
+         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
+@@ -770,6 +782,8 @@
+             if entry.check_fn and not _memo_check(entry.check_fn, check_results):
+                 if not quiet:
+                     logger.debug("Tool %s unavailable (check failed)", name)
++                if unavailable_out is not None:
++                    unavailable_out.append(name)
+                 continue
+             schema_with_name = {**entry.schema, "name": entry.name}
+             # Runtime-dynamic overrides (e.g. delegate_task limits); the caller's memo is

@@ -1,0 +1,309 @@
+--- a/tools/process_registry.py
++++ b/tools/process_registry.py
+@@ -1956,6 +1956,265 @@
+ process_registry = ProcessRegistry()
+ 
+ 
++# ---------------------------------------------------------------------------
++# Reconcile-on-read — the durable answer to "what did I start, and did it finish?"
++# ---------------------------------------------------------------------------
++#
++# 2026-08-16: Ptah's ~/.hermes/profiles/ptah/processes.json held one entry,
++# written at launch, for `cd ~/.lucaryin/rebrand-v2 && python3 focus_group.py`
++# — pid 48695, no exit code, no end time. That PID had been dead for over an
++# hour. Asked "how is the project going", the agent could not see its own work,
++# fell back to session recall, and told the founder a finished focus group was
++# "about to run".
++#
++# The fix is reconcile-on-READ rather than a reaper daemon precisely because the
++# failure mode IS the writer dying: whoever would have recorded the exit is the
++# thing that is gone. Any reader, in any later process, can still check the PID.
++#
++# Lifecycle vocabulary local to this read path. The checkpoint (see
++# process_registry_checkpoint.py) only persists RUNNING sessions, so every
++# on-disk record starts life as "running"; reconcile is what discovers a record
++# whose PID is gone but whose exit nobody recorded.
++LIFECYCLE_RUNNING = "running"
++LIFECYCLE_EXITED = "exited"                      # we observed the exit, exit_code is real
++LIFECYCLE_KILLED = "killed"                      # we sent the signal ourselves
++LIFECYCLE_FINISHED_UNKNOWN = "finished_unknown"  # PID is gone but nobody saw it go
++
++
++def _iso(ts: Optional[float]) -> Optional[str]:
++    """Local-time ISO string for a timestamp, or None. Never raises on junk."""
++    if not ts:
++        return None
++    try:
++        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(float(ts)))
++    except (TypeError, ValueError, OSError):
++        return None
++
++
++def _record_liveness(record: Dict[str, Any]) -> str:
++    """Classify a checkpoint record's process as "alive", "gone", or "unverified"."""
++    if (record.get("status") or LIFECYCLE_RUNNING) != LIFECYCLE_RUNNING:
++        return "gone"
++    if (record.get("pid_scope") or "host") != "host":
++        # The PID is sandbox-local; a host probe would be reading some unrelated
++        # host process. We cannot prove it either way from here, and guessing in
++        # either direction is worse than saying so.
++        return "unverified"
++    # Upstream tracks the kernel start time (PID-reuse guard); a recycled PID
++    # that is alive-but-not-ours counts as gone, same as the kill path.
++    return "alive" if ProcessRegistry._host_pid_is_ours(
++        record.get("pid"), record.get("host_start_time")) else "gone"
++
++
++def reconcile_process_records(
++    checkpoint_path: Optional[Any] = None,
++    persist: bool = True,
++) -> List[Dict[str, Any]]:
++    """Read the on-disk process registry and correct entries whose PID is gone.
++
++    Returns the reconciled records (callers sort). Safe on a host that has never
++    run a background process: a missing or unparseable file yields [] rather than
++    an exception, because this is called from inside agent turns and a plain
++    hermes-agent host may have no checkpoint at all.
++
++    ``persist`` writes the corrections back so the next reader (and the founder
++    looking at the file) sees the same truth; failure to write is not fatal.
++    """
++    path = Path(checkpoint_path) if checkpoint_path is not None else CHECKPOINT_PATH
++    try:
++        if not path.exists():
++            return []
++        entries = json.loads(path.read_text(encoding="utf-8"))
++    except Exception as exc:
++        logger.debug("Could not read process registry %s: %s", path, exc)
++        return []
++
++    if not isinstance(entries, list):
++        return []
++
++    now = time.time()
++    reconciled: List[Dict[str, Any]] = []
++    changed = False
++
++    for entry in entries:
++        if not isinstance(entry, dict):
++            continue
++        record = dict(entry)
++        record.setdefault("status", LIFECYCLE_RUNNING)
++        liveness = _record_liveness(record)
++
++        if record["status"] == LIFECYCLE_RUNNING and liveness == "gone":
++            record.update({
++                "status": LIFECYCLE_FINISHED_UNKNOWN,
++                "exit_code": None,
++                "ended_at": None,          # never observed
++                "reconciled_at": now,
++            })
++            changed = True
++
++        record["liveness"] = liveness
++        reconciled.append(record)
++
++    if changed and persist:
++        try:
++            from utils import atomic_json_write
++            # `liveness` is a read-time judgement, not durable state.
++            atomic_json_write(
++                path, [{k: v for k, v in r.items() if k != "liveness"} for r in reconciled]
++            )
++        except Exception as exc:
++            logger.debug("Could not persist reconciled process registry: %s", exc)
++
++    return reconciled
++
++
++def _summarize_record(record: Dict[str, Any]) -> str:
++    """One line about a process that a later session can repeat without inventing."""
++    status = record.get("status") or LIFECYCLE_RUNNING
++    started = _iso(record.get("started_at"))
++    pid = record.get("pid")
++
++    if status == LIFECYCLE_RUNNING:
++        age = format_uptime_short(int(time.time() - (record.get("started_at") or time.time())))
++        if record.get("liveness") == "unverified":
++            return (
++                f"recorded as running since {started} ({age} ago, pid {pid}), but its "
++                f"liveness cannot be verified from here — confirm before reporting progress"
++            )
++        return f"still running since {started} ({age} ago, pid {pid})"
++
++    if status == LIFECYCLE_KILLED:
++        return f"killed at {_iso(record.get('ended_at')) or 'an unrecorded time'} (SIGTERM)"
++
++    if status == LIFECYCLE_EXITED:
++        return (
++            f"finished at {_iso(record.get('ended_at')) or 'an unrecorded time'} "
++            f"with exit code {record.get('exit_code')}"
++        )
++
++    noticed = _iso(record.get("reconciled_at"))
++    return (
++        f"no longer running (started {started}); its exit was never recorded, so the "
++        f"exit code is UNKNOWN — noticed gone at {noticed or 'an unrecorded time'}. "
++        f"Check the output or the work product before claiming it succeeded or failed."
++    )
++
++
++def _present_record(record: Dict[str, Any]) -> Dict[str, Any]:
++    """Flatten a raw registry record into the agent-facing shape."""
++    started_at = record.get("started_at") or 0
++    command = str(record.get("command", ""))
++    try:
++        # This base redacts every other background-process surface before it
++        # reaches the model (see _redact_process_result); the in-memory overlay
++        # commands have not been through checkpoint redaction, so redact here too.
++        from agent.redact import redact_sensitive_text
++        command = redact_sensitive_text(command, code_file=True)
++    except Exception:
++        pass
++    return {
++        "session_id": record.get("session_id"),
++        "command": command[:400],
++        "cwd": record.get("cwd"),
++        "pid": record.get("pid"),
++        "task_id": record.get("task_id", ""),
++        "status": record.get("status") or LIFECYCLE_RUNNING,
++        "exit_code": record.get("exit_code"),
++        "started_at": _iso(started_at),
++        "age_seconds": int(time.time() - started_at) if started_at else None,
++        "ended_at": _iso(record.get("ended_at")),
++        "noticed_gone_at": _iso(record.get("reconciled_at")),
++        "liveness": record.get("liveness", "unverified"),
++        "output_path": record.get("output_path"),
++        "summary": _summarize_record(record),
++    }
++
++
++def _session_record(session: "ProcessSession") -> Dict[str, Any]:
++    """Build a reconcile-shaped record from a live in-memory session.
++
++    Kept independent of the checkpoint field names so it survives the base's
++    lifecycle refactors: it reads only stable ProcessSession attributes.
++    """
++    if not session.exited:
++        status = LIFECYCLE_RUNNING
++    elif (session.completion_reason or "") == "killed":
++        status = LIFECYCLE_KILLED
++    else:
++        status = LIFECYCLE_EXITED
++    return {
++        "session_id": session.id,
++        "command": session.command,
++        "cwd": session.cwd,
++        "pid": session.pid,
++        "task_id": session.task_id,
++        "pid_scope": session.pid_scope,
++        "host_start_time": session.host_start_time,
++        "started_at": session.started_at,
++        "status": status,
++        "exit_code": None if not session.exited else session.exit_code,
++        "ended_at": None,          # in-memory sessions don't stamp an exit time
++        "reconciled_at": None,
++        "liveness": "alive" if not session.exited else "gone",
++    }
++
++
++def describe_background_work(task_id: Optional[str] = None, limit: int = 25) -> Dict[str, Any]:
++    """Answer "what did I start, and did it finish?" without needing prior memory.
++
++    Reads the on-disk registry (reconciling dead PIDs), then overlays whatever
++    the in-process registry knows, since that is fresher for anything started in
++    this same process. Never raises — an agent turn asking about its own work
++    must not die because the registry is missing or unreadable.
++    """
++    try:
++        records = {
++            r.get("session_id"): r
++            for r in reconcile_process_records()
++            if r.get("session_id")
++        }
++    except Exception as exc:
++        logger.debug("Background-work disk read failed: %s", exc)
++        records = {}
++
++    try:
++        with process_registry._lock:
++            live = list(process_registry._running.values()) + list(process_registry._finished.values())
++        for session in live:
++            process_registry._refresh_detached_session(session)
++        with process_registry._lock:
++            live = list(process_registry._running.values()) + list(process_registry._finished.values())
++        for session in live:
++            records[session.id] = _session_record(session)
++    except Exception as exc:
++        logger.debug("Background-work memory overlay failed: %s", exc)
++
++    presented = [_present_record(r) for r in records.values()]
++    if task_id:
++        presented = [p for p in presented if p.get("task_id") == task_id]
++    presented.sort(key=lambda p: p.get("age_seconds") or 0)
++
++    running = [p for p in presented if p["status"] == LIFECYCLE_RUNNING][:limit]
++    finished = [p for p in presented if p["status"] != LIFECYCLE_RUNNING][:limit]
++
++    result: Dict[str, Any] = {
++        "checked_at": _iso(time.time()),
++        "registry_path": str(CHECKPOINT_PATH),
++        "registry_available": CHECKPOINT_PATH.exists(),
++        "running": running,
++        "finished": finished,
++    }
++
++    unknown = [p for p in finished if p["status"] == LIFECYCLE_FINISHED_UNKNOWN]
++    if unknown:
++        result["warning"] = (
++            f"{len(unknown)} background process(es) ended without a recorded exit code. "
++            "Read output or inspect the work product before describing the result — "
++            "do NOT report unknown-exit work as completed, as successful, or as still to come."
++        )
++    return result
++
++
+ # --- the "process_manage" tool schema + handler -----------------------------------
+ from tools.registry import registry, tool_error
+ 
+@@ -1967,6 +2226,10 @@
+     "description": (
+         "Poll, wait on, or kill background terminal processes (from "
+         "terminal(background=true)). "
++        "report: durable answer to 'what did I start, and did it finish?' — USE "
++        "THIS before describing the state of any background work, including work "
++        "started in an earlier session; it reads the on-disk registry and re-checks "
++        "dead PIDs. "
+         "Completed results remain retrievable by session_id when resuming their owning conversation "
+         "(up to 7 days, newest 64 results per profile; rolling output tail). "
+         "poll: status + new output. log: full output, paged. wait: block "
+@@ -1982,7 +2245,7 @@
+         "properties": {
+             "action": {
+                 "type": "string",
+-                "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close", "handoff"]
++                "enum": ["report", "list", "poll", "log", "wait", "kill", "write", "submit", "close", "handoff"]
+             },
+             "session_id": {
+                 "type": "string",
+@@ -2105,6 +2368,11 @@
+     action = args.get("action", "")
+     # Coerce to string — some models send session_id as an integer
+     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
++    if action == "report":
++        # Deliberately NOT scoped to task_id: after a restart the agent asking
++        # "how is the project going" has a different task_id than the launch did,
++        # and scoping it reproduces the exact blindness this action removes.
++        return json.dumps(describe_background_work(), ensure_ascii=False)
+     if action == "list":
+         return json.dumps(_list_processes(kw.get("task_id")), ensure_ascii=False)
+     if action == "handoff":
+@@ -2117,7 +2385,7 @@
+         handler, redact = _SESSION_ACTIONS[action]
+         result = handler(session_id, args)
+         return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
+-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
++    return tool_error(f"Unknown process action: {action}. Use: report, list, poll, log, wait, kill, write, submit, close, handoff")
+ 
+ 
+ registry.register(

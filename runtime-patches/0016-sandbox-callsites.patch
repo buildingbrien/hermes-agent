@@ -1,0 +1,60 @@
+--- a/tools/environments/local.py
++++ b/tools/environments/local.py
+@@ -707,6 +707,57 @@
+         super().__init__(cwd=_resolve_local_initial_cwd(cwd), timeout=timeout, env=env)
+         self.init_session()
+ 
++    def execute(
++        self,
++        command: str,
++        cwd: str = "",
++        *,
++        timeout: int | None = None,
++        stdin_data: str | None = None,
++        rewrite_compound_background: bool = True,
++        bounded_capture: bool = False,
++        yield_handler=None) -> dict:
++        """FD1 egress-boundary sandbox fold (Lucaryin).
++
++        When the per-agent sandbox executor is armed for this runtime
++        (``AGENT_SANDBOX_USER`` set AND the agent's ``executor.sock`` exists),
++        route the shell command through it so raw network egress crosses the
++        dedicated sandbox user's boundary instead of running as the app user.
++        ``sandbox_routing.maybe_run`` is fail-safe BY CONSTRUCTION: it returns
++        ``None`` on ANY problem (flag off, no socket, executor unreachable,
++        protocol error), so a terminal / execute_code call NEVER breaks because
++        of the sandbox — it just runs in-process via ``super().execute`` as it
++        does today. Only LOCAL execution is routed; docker/ssh/modal backends
++        override ``_run_bash`` and never reach here.
++
++        Flows the stateless per-call executor can't model are left on the
++        in-process path unchanged: ``stdin_data`` (executor runs stdin=DEVNULL)
++        and ``yield_handler`` (background-yield needs a live ProcessHandle).
++        See docs/sprint1-fd1-egress-boundary-design.md.
++        """
++        if stdin_data is None and yield_handler is None:
++            routed = None
++            try:
++                import sandbox_routing
++                routed = sandbox_routing.maybe_run(
++                    "terminal", command,
++                    cwd=(cwd or self.cwd),
++                    timeout=float(timeout or self.timeout),
++                )
++            except Exception:
++                routed = None  # fail-safe: never let routing break a call
++            if routed is not None:
++                effective_timeout = timeout or self.timeout
++                if routed.get("timed_out"):
++                    return {"output": f"[Command timed out after {effective_timeout}s]",
++                            "returncode": 124}
++                out = (routed.get("stdout") or "") + (routed.get("stderr") or "")
++                return {"output": out, "returncode": routed.get("exit_code", 0)}
++        return super().execute(
++            command, cwd, timeout=timeout, stdin_data=stdin_data,
++            rewrite_compound_background=rewrite_compound_background,
++            bounded_capture=bounded_capture, yield_handler=yield_handler)
++
+     def get_temp_dir(self) -> str:
+         """Shell-safe writable temp dir. Precedence: ``TERMINAL_TEMP_DIR``, TMPDIR/TMP/TEMP
+         (Termux has no /tmp), ``HERMES_HOME/cache/terminal`` (real storage: tmpfs /tmp

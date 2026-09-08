@@ -1,0 +1,126 @@
+--- a/tools/cronjob_tools.py
++++ b/tools/cronjob_tools.py
+@@ -506,6 +506,45 @@
+     return result
+ 
+ 
++# Actions a job may carry as standing grants. Payment is deliberately absent
++# (locked doctrine: financial actions are never pre-authorizable), and
++# "standing_grant" itself can never appear (no self-amplification) — both are
++# ALSO refused at the gate, so this list is UX, not the security boundary.
++_GRANTABLE_ACTIONS = {
++    "email_send", "message_send", "calendar_create",
++    "meeting_schedule", "outbound_call", "file_write", "ui_action",
++}
++
++
++def _validate_grants(grants: Any) -> Optional[str]:
++    """Human-quality error or None. The gate re-checks all of this; failing
++    here just gives the model a fixable message instead of a filed card that
++    the user then has to read and reject."""
++    if grants is None:
++        return None
++    if not isinstance(grants, list):
++        return "grants must be a list of grant objects"
++    for g in grants:
++        act = g if isinstance(g, str) else (g.get("action") if isinstance(g, dict) else None)
++        if not act:
++            return f"malformed grant (needs an 'action'): {g!r}"
++        if act in ("payment_execute", "standing_grant"):
++            return (f"'{act}' can never be a standing grant — payment and "
++                    "grant-creation always require a live human decision")
++        if act not in _GRANTABLE_ACTIONS:
++            return (f"'{act}' is not a grantable action "
++                    f"(grantable: {', '.join(sorted(_GRANTABLE_ACTIONS))})")
++        if act == "outbound_call" and not (isinstance(g, dict) and g.get("unattended") is True):
++            return ("an outbound_call grant must be the object form with "
++                    "explicit unattended:true — autonomous dialling is a "
++                    "separate decision from calling")
++        if isinstance(g, dict) and act in ("email_send", "message_send") and not g.get("to"):
++            return (f"an {act} grant needs a 'to' allowlist — 'may email these "
++                    "specific people' is grantable, 'may email anyone' is not "
++                    "something to hand an unattended job")
++    return None
++
++
+ # ---------------------------------------------------------------------------
+ # Tool actions. Each takes the cronjob() argument dict `a` (and the resolved
+ # job record for job-bound actions) and returns the JSON result string.
+@@ -550,7 +589,10 @@
+         # failure_deliver shares deliver's grammar and validators.
+         or _validate_bot_chat_deliver(_normalize_deliver_param(a["failure_deliver"]))
+         or (a["context_from"] and _validate_context_from_refs(
+-            [a["context_from"]] if isinstance(a["context_from"], str) else a["context_from"])))
++            [a["context_from"]] if isinstance(a["context_from"], str) else a["context_from"]))
++        # Standing grants: refuse the bad request here so the model gets a fixable
++        # message instead of filing an approval card the user must reject.
++        or _validate_grants(a["grants"]))
+     if error:
+         return tool_error(error, success=False)
+ 
+@@ -566,6 +608,7 @@
+             model=_normalize_optional_job_value(a["model"]), provider=_normalize_optional_job_value(a["provider"]),
+             base_url=_normalize_optional_job_value(a["base_url"], strip_trailing_slash=True),
+             script=_normalize_optional_job_value(script), context_from=context_from,
++            grants=a["grants"] or [],
+             enabled_toolsets=a["enabled_toolsets"] or None, workdir=_normalize_optional_job_value(a["workdir"]),
+             no_agent=_no_agent, attach_to_session=a["attach_to_session"],
+             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
+@@ -776,6 +819,13 @@
+     if a["workdir"] is not None:
+         # Empty string clears; otherwise update_job() validates/normalizes.
+         updates["workdir"] = _normalize_optional_job_value(a["workdir"]) or None
++    if a["grants"] is not None:
++        # Editing grants in place preserves the job's standing approval; the gate
++        # re-checks these at run time, so this is UX not the security boundary.
++        grant_error = _validate_grants(a["grants"])
++        if grant_error:
++            return grant_error
++        updates["grants"] = a["grants"]
+     if a["no_agent"] is not None:
+         # Flipping to True needs a script on the job or in this same update.
+         target_no_agent = bool(a["no_agent"])
+@@ -875,6 +925,7 @@
+     monitor_url: Optional[str] = None,
+     reasoning_effort: Optional[str] = None,
+     failure_deliver: Optional[Union[str, List[str]]] = None,
++    grants: Optional[List[Any]] = None,
+     task_id: str = None,
+     session_id: Optional[str] = None,
+     paused: bool = False,
+@@ -906,7 +957,9 @@
+     "name": "cronjob_manage",
+     "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
+ 
+-Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Prefer updating an existing job over creating near-duplicates.""",
++Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Prefer updating an existing job over creating near-duplicates.
++
++For a job that carries GRANTS, always prefer action='update' over remove+recreate: the user's standing approval lives on the job, so deleting it burns their consent and recreating files a fresh approval card they must tap again. Update preserves the grant.""",
+     "parameters": {
+         "type": "object",
+         "properties": {
+@@ -984,6 +1037,24 @@
+             "attach_to_session": {
+                 "type": "boolean",
+                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
++            },
++            "grants": {
++                "type": "array",
++                "items": {"type": "object"},
++                "description": (
++                    "Standing permissions this job carries, approved by the user "
++                    "ONCE at creation — runs then act within them with no "
++                    "per-action approval. Use the narrowest scope that covers the "
++                    "job's remit: {\"action\": \"email_send\", \"to\": "
++                    "[\"person@example.com\"], \"max_per_run\": 1, "
++                    "\"max_per_day\": 4, \"expires\": \"YYYY-MM-DD\"}. "
++                    "Creating or updating a job WITH grants raises one approval "
++                    "card naming the powers — tell the user to expect that single "
++                    "tap. email_send/message_send require a 'to' allowlist; "
++                    "payment can never be granted; outbound_call needs explicit "
++                    "unattended:true. Actions outside the grants still gate "
++                    "normally at run time."
++                ),
+             },
+         },
+         "required": ["action"]
