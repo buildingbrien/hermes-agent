@@ -1,2 +1,5 @@
-# Auto-generated files — collapse diffs and exclude from language stats
-web/package-lock.json linguist-generated=true
+# Phase B overlay: keep these LF so build-runtime.sh applies patches on Windows
+# runners too (CRLF checkout turned series entries into "<name>.patch\r").
+build-runtime.sh    text eol=lf
+runtime-patches/series text eol=lf
+runtime-patches/*.patch text eol=lf

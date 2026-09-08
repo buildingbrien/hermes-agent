@@ -30,6 +30,7 @@ cp -R "$VENDOR/." "$OUT/"                       # 1) pristine upstream at UPSTRE
 applied=0
 if [ -f "$PATCHES/series" ]; then
   while IFS= read -r p; do
+    p="${p%$'\r'}"                             # strip CR (series checked out CRLF on Windows)
     [ -z "$p" ] && continue
     case "$p" in \#*) continue ;; esac        # allow comments in series
     if git apply --directory="build/runtime" -p1 "$PATCHES/$p" 2>/dev/null || \
