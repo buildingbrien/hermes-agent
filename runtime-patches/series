@@ -13,3 +13,4 @@
 0014-registry-unavailable-out.patch
 0015-process-registry-reconcile.patch
 0016-sandbox-callsites.patch
+0017-cryptography-intel-macos-wheel.patch

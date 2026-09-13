@@ -1,0 +1,32 @@
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -107,7 +107,16 @@
+   # A pin here is not sufficient on its own. alibabacloud-tea-openapi caps
+   # cryptography<49, so [tool.uv] also holds an override. Read that comment
+   # before you move this version.
+-  "cryptography==50.0.0",  # CVE-2026-69247, GHSA-m2h6-j472-rp4c, GHSA-jwv3-5hgf-82ww, CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf
++  # Lucaryin fold: pyca stopped shipping Intel-macOS (x86_64) wheels at 50.0.0
++  # (its macOS wheels are arm64-only from there). A clean customer Mac has no
++  # Rust/OpenSSL/pkg-config, so pip falls back to the 50.0.0 sdist and the build
++  # dies in openssl-sys -- first-launch provisioning failed on every Intel Mac.
++  # 48.0.1 is the newest release with an Intel wheel (macosx universal2) and it
++  # carries GHSA-537c-gmf6-5ccf; the 49/50-only fixes (PKCS#7 EnvelopedData
++  # oracle, X.509 name-constraint / path-building) are code paths we do not
++  # exercise. Every other platform keeps the 50.0.0 floor.
++  "cryptography==50.0.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",  # CVE-2026-69247, GHSA-m2h6-j472-rp4c, GHSA-jwv3-5hgf-82ww, CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf
++  "cryptography==48.0.1; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+   # Windows has no IANA tzdata shipped with the OS, so Python's ``zoneinfo``
+   # (PEP 615) raises ``ZoneInfoNotFoundError`` for every non-UTC timezone
+   # out of the box.  ``tzdata`` ships the Olson database as a data package
+@@ -406,7 +415,10 @@
+   # [project].dependencies). The package uses cryptography only to sign
+   # requests with RSA and AES, and that API did not break in 49 or 50.
+   # Remove this line when alibabacloud-tea-openapi lifts the cap.
+-  "cryptography>=50,<51",
++  # Lucaryin fold: mirror the Intel-macOS split from [project].dependencies so a
++  # uv resolve stays coherent with what pip installs on customer Macs.
++  "cryptography>=50,<51; sys_platform != 'darwin' or platform_machine != 'x86_64'",
++  "cryptography==48.0.1; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+ ]
+ exclude-newer = "14 days"
+ # h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,
