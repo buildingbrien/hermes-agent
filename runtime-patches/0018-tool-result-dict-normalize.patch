@@ -1,0 +1,23 @@
+--- a/tools/registry.py
++++ b/tools/registry.py
+@@ -801,6 +801,20 @@
+             and result.get("_multimodal") is True
+             and isinstance(result.get("content"), list)):
+             return result
++        # Lucaryin fold: our runtime-addons (email_send, fleet_send, gbrain,
++        # schedule_meeting, action_items, desktop_use, ...) return plain dicts.
++        # The pre-rebase runtime accepted them, and the bridge still calls some
++        # of them directly and reads the dict (server.py email_send fast-path),
++        # so the addons keep that contract. Serialise a plain dict/list to a
++        # JSON string here so the model, hooks, budgeting and persistence get
++        # the str upstream requires. Without this, every such tool call came
++        # back as "unsupported result type: dict" (found on the canary, 2026-09-13).
++        if isinstance(result, (dict, list)):
++            try:
++                return _bound_json_error_result(
++                    json.dumps(result, ensure_ascii=False, default=str))
++            except Exception:  # never let serialisation wedge a turn
++                pass
+         result_type = type(result).__name__
+         logger.error("Tool %s handler returned unsupported result type: %s", name, result_type)
+         return tool_error(
