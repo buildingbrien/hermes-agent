@@ -7,7 +7,9 @@
 #   0012 cronjob grants · 0014 registry unavailable_out · 0015 process_registry reconcile ·
 #   0016 sandbox call-sites   (0013 session-search DROPPED — obsolete upstream) ·
 #   0017 cryptography intel wheel · 0018 tool-result dict normalize ·
-#   0019 read_file extracted-doc not-found rescue (leading-space names; canary 2026-09-13)
+#   0019 read_file extracted-doc not-found rescue (leading-space names; canary 2026-09-13) ·
+#   0020 search_files fallback bounds (no-rg lane: -I/prune/size cap, native drain keeps
+#        partials on timeout, iCloud dataless never read on either lane, honest timeout hint)
 # ADDONS (fork-only files, carried whole under runtime-addons/):
 tools/fleet_send.py
 tools/dial_meeting.py
