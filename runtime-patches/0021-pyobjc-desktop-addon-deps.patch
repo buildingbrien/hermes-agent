@@ -1,0 +1,16 @@
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -185,6 +185,13 @@
+   # devices can still slip through; they get the same resolution failure as
+   # before, worked around by installing with `--no-deps` or an older release.
+   "nemo-relay>=0.8.3,<0.9; (sys_platform == 'darwin' and platform_machine == 'arm64') or (sys_platform == 'linux' and platform_machine == 'x86_64' and 'android' not in platform_release) or (sys_platform == 'linux' and platform_machine == 'aarch64' and 'android' not in platform_release) or (sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'win32' and platform_machine == 'ARM64')",
++  # Lucaryin fold: the desktop computer-use addon (tools/desktop_use.py, #54)
++  # needs pyobjc; the old fork pyproject declared these, the vendored
++  # upstream does not, so fresh machines answered "not provisioned
++  # (pyobjc missing)" (canary soak, 2026-09-13). macOS only.
++  "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
++  "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
++  "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+ ]
+ 
+ [project.optional-dependencies]
