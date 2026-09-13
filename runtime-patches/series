@@ -17,3 +17,4 @@
 0018-tool-result-dict-normalize.patch
 0019-read-extract-not-found-rescue.patch
 0020-search-fallback-bounds.patch
+0021-pyobjc-desktop-addon-deps.patch

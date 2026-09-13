@@ -31,3 +31,5 @@ sandbox_executor.py
 sandbox_routing.py
 # DROPPED: environments/tool_call_parsers/* (RL-training-only), gemini_cloudcode_adapter
 #   (multi-model, violates DeepSeek-lock), matrix.py, browser_providers/base.py (superseded).
+
+0021-pyobjc-desktop-addon-deps.patch — pyproject: pyobjc-framework-{Quartz,Cocoa,ApplicationServices} (darwin) for the desktop_use.py addon; the deps-only runtime install (app #45) reads [project].dependencies, so addon deps must live here.
