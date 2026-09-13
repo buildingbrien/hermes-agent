@@ -1,0 +1,113 @@
+--- a/tools/file_operations.py
++++ b/tools/file_operations.py
+@@ -786,14 +786,18 @@
+         variant = self._unicode_variant_match(path)
+         if variant is not None:
+             result = self.read_file(variant, offset=offset, limit=limit)
+-            note = (
+-                f"Note: '{path}' not found byte-for-byte; resolved to "
+-                f"the unicode-equivalent file '{variant}' (invisible "
+-                "encoding difference: NFC/NFD or special space/quote "
+-                "characters).")
++            note = self._unicode_variant_note(path, variant)
+             result.hint = f"{note} {result.hint}" if result.hint else note
+             return result
+         return self._suggest_similar_files(path)
++
++    @staticmethod
++    def _unicode_variant_note(path: str, variant: str) -> str:
++        return (
++            f"Note: '{path}' not found byte-for-byte; resolved to "
++            f"the unicode-equivalent file '{variant}' (invisible "
++            "difference: NFC/NFD, special space/quote characters, "
++            "or leading/trailing whitespace).")
+ 
+     def _read_binary_file(self, path: str, offset: int, limit: int,
+                           file_size: int, sample_bytes: Optional[bytes]) -> ReadResult:
+@@ -905,9 +909,9 @@
+ 
+     def _unicode_variant_match(self, path: str) -> Optional[str]:
+         """On-disk spelling of a file whose name is unicode-equivalent to ``path``
+-        (NFC/NFD, confusable spaces/quotes). Returns the entry only when EXACTLY one
+-        matches — several candidates = homoglyph collision, guessing would read the
+-        wrong file."""
++        (NFC/NFD, confusable spaces/quotes, leading/trailing whitespace). Returns the
++        entry only when EXACTLY one matches — several candidates = homoglyph
++        collision, guessing would read the wrong file."""
+         dir_path = os.path.dirname(path) or "."
+         filename = os.path.basename(path)
+         if not filename:
+@@ -917,7 +921,10 @@
+             out = unicodedata.normalize("NFC", name)
+             for src, dst in self._CONFUSABLES:
+                 out = out.replace(src, dst)
+-            return out
++            # Lucaryin fold: a leading space (iCloud/Finder " Resume.pdf") is
++            # invisible in ``ls -l`` output — the model retypes it without the
++            # space and can never discover the difference. Same class as NFD.
++            return out.strip()
+ 
+         target = _canon(filename)
+         ls_result = self._exec(f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null")
+@@ -940,7 +947,11 @@
+         ls_result = self._exec(f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50")
+         scored: list = []  # (score, filepath) — higher is better
+         if ls_result.exit_code == 0 and ls_result.stdout.strip():
+-            for f in ls_result.stdout.strip().split('\n'):
++            # Lucaryin fold: no ``.strip()`` on the whole listing — it ate the
++            # leading space of the FIRST entry (" Resume.pdf" sorts first) and
++            # suggested a spelling that does not exist on disk.
++            for f in _strip_terminal_fence_leaks(ls_result.stdout).splitlines():
++                f = f.rstrip("\r")
+                 if not f:
+                     continue
+                 lf = f.lower()
+@@ -995,7 +1006,18 @@
+         path = self._expand_path(path)
+         file_size, status = self._probe_regular_file(path)
+         if status == "missing":
+-            return ReadResult(error=f"File not found: {path}")
++            # Lucaryin fold: the same not-found recovery ``read_file`` gets
++            # (``_read_file_missing``). Document extraction (.pdf/.docx/...) reads
++            # through here, and a bare "File not found" gave the model nothing
++            # when the on-disk name differed invisibly (leading space, NFD, curly
++            # quote) — canary 2026-09-13, "Documents - <Name>’s MacBook Pro/ X.pdf".
++            variant = self._unicode_variant_match(path)
++            if variant is not None:
++                result = self.read_file_bytes(variant, max_bytes=max_bytes)
++                note = self._unicode_variant_note(path, variant)
++                result.hint = f"{note} {result.hint}" if result.hint else note
++                return result
++            return self._suggest_similar_files(path)
+         if status == "not_regular":
+             return self._not_regular_error(path)
+         if status == "env_unavailable":
+--- a/tools/file_tools.py
++++ b/tools/file_tools.py
+@@ -425,6 +425,11 @@
+     file_ops = _get_file_ops(task_id)
+     try:
+         binary = file_ops.read_file_bytes(str(_resolved), max_bytes=MAX_DOCUMENT_BYTES)
++        if binary.error and binary.error.startswith("File not found:"):
++            # Lucaryin fold: a missing document is a not-found, not an
++            # extraction failure. Return the text path's shape (error +
++            # similar_files) so the model gets a did-you-mean, not a dead end.
++            return json.dumps(binary.to_dict(), ensure_ascii=False)
+         if binary.error or binary.base64_content is None:
+             raise ExtractionError(binary.error or "Document bytes unavailable")
+         document_bytes = base64.b64decode(binary.base64_content, validate=True)
+@@ -454,10 +459,13 @@
+         "file_size": binary.file_size,
+         "truncated": total_lines > end_line,
+         "extracted_document": True}
++    if binary.hint:  # unicode-variant resolution note from read_file_bytes
++        result_dict["hint"] = binary.hint
+     if result_dict["truncated"]:
+-        result_dict["hint"] = (
++        _cont = (
+             f"Use offset={end_line + 1} to continue reading "
+             f"(showing {offset}-{min(end_line, total_lines)} of {total_lines} lines)")
++        result_dict["hint"] = f"{binary.hint} {_cont}" if binary.hint else _cont
+     max_chars = _get_max_read_chars()
+     if len(result_dict["content"]) > max_chars:
+         _apply_char_budget(result_dict, result_dict["content"], offset, total_lines, max_chars)
