@@ -65,3 +65,20 @@ class TestExtractedDocumentNotFoundRescue:
         result = json.loads(read_file_tool(str(ws / "nothing-like-it.docx")))
         assert (result.get("error") or "").startswith("File not found:"), result
         assert "document extraction failed" not in result["error"]
+
+    def test_denied_path_never_reaches_the_recovery(self, ws, monkeypatch):
+        # Adversarial-review finding: on a MISS inside a read-denied directory
+        # (HERMES_HOME credential stores, mcp-tokens/, browser-profile/) the
+        # recovery would `ls` that directory and surface sibling names. The
+        # deny-list check must run BEFORE read_file_bytes, as on the text path.
+        (ws / "secret-token.pdf").write_bytes(b"%PDF-1.4\n")
+        monkeypatch.setattr(
+            "tools.file_tools.get_read_block_error",
+            lambda p: "Reading credential stores is blocked" if "MacBook Pro" in p else None)
+        result = json.loads(read_file_tool(str(ws / "missing.pdf")))
+        assert result.get("error") == "Reading credential stores is blocked", result
+        assert "similar_files" not in result
+        assert "secret-token" not in json.dumps(result)
+        # And an EXISTING document in a denied dir is blocked too, not extracted.
+        result = json.loads(read_file_tool(str(ws / ON_DISK)))
+        assert result.get("error") == "Reading credential stores is blocked", result

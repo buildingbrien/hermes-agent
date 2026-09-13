@@ -84,8 +84,18 @@
          if status == "env_unavailable":
 --- a/tools/file_tools.py
 +++ b/tools/file_tools.py
-@@ -425,6 +425,11 @@
+@@ -423,8 +423,21 @@
+     if not is_extractable_document(str(_resolved)):
+         return None
      file_ops = _get_file_ops(task_id)
++    # Lucaryin fold: deny-listed paths (HERMES_HOME credential stores,
++    # mcp-tokens/, browser-profile/, .env files) must not reach
++    # read_file_bytes — its not-found recovery lists the directory and
++    # would surface sibling names from a credential store. The text path
++    # runs this check before reading; the document path now does too.
++    block_error = get_read_block_error(str(_resolved))
++    if block_error:
++        return tool_error(block_error)
      try:
          binary = file_ops.read_file_bytes(str(_resolved), max_bytes=MAX_DOCUMENT_BYTES)
 +        if binary.error and binary.error.startswith("File not found:"):
@@ -96,7 +106,7 @@
          if binary.error or binary.base64_content is None:
              raise ExtractionError(binary.error or "Document bytes unavailable")
          document_bytes = base64.b64decode(binary.base64_content, validate=True)
-@@ -454,10 +459,13 @@
+@@ -454,10 +467,13 @@
          "file_size": binary.file_size,
          "truncated": total_lines > end_line,
          "extracted_document": True}
