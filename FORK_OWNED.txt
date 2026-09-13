@@ -9,7 +9,9 @@
 #   0017 cryptography intel wheel · 0018 tool-result dict normalize ·
 #   0019 read_file extracted-doc not-found rescue (leading-space names; canary 2026-09-13) ·
 #   0020 search_files fallback bounds (no-rg lane: -I/prune/size cap, native drain keeps
-#        partials on timeout, iCloud dataless never read on either lane, honest timeout hint)
+#        partials on timeout, iCloud dataless never read on either lane, honest timeout hint;
+#        r2: EPERM-tolerant at-bound kill, root-anchored space-named hits, diagnostics never
+#        spend the bound, ~/Library cloud routing, realpath rg anchoring, find -H + abs root)
 # ADDONS (fork-only files, carried whole under runtime-addons/):
 tools/fleet_send.py
 tools/dial_meeting.py

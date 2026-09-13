@@ -22,31 +22,141 @@
  def _macos_protected_search_exclusions(
      path: str, *, cwd: Optional[str] = None, home: Optional[str] = None, platform: Optional[str] = None,
  ) -> List[str]:
-@@ -118,6 +132,12 @@
+@@ -116,6 +130,64 @@
+     if result.exit_code == 124:
+         return _SEARCH_TIMEOUT_MARKER_RE.sub("", result.stdout), "search_timeout"
      return result.stdout, None
- 
- 
++
++
 +def _cap_output_columns(output: str, width: int) -> str:
 +    """Lucaryin fold: the ``cut -c1-<width>`` of the shell grep pipeline, applied
 +    in-process when that pipeline runs natively (giant single-line containment)."""
 +    return "\n".join(line[:width] for line in output.split("\n"))
 +
 +
++# Lucaryin fold (0020): the stderr prefixes of the three engines. A line carrying
++# one is a diagnostic wherever it turns up — in the merged stream of the native
++# drain (where it must not spend the fetch bound) and in the exec_folded shape
++# recovery (where only such a line may promote a folded find exit to a failure).
++_TOOL_DIAGNOSTIC_PREFIXES = ("rg: ", "grep: ", "find: ")
++_TOOL_DIAGNOSTIC_PREFIXES_BYTES = tuple(prefix.encode() for prefix in _TOOL_DIAGNOSTIC_PREFIXES)
++# Diagnostics kept from an unbounded merged stream (they only feed the error text).
++_MAX_RETAINED_DIAGNOSTIC_LINES = 200
++
++
++def _is_tool_diagnostic(line: str) -> bool:
++    """Lucaryin fold: whether ``line`` is an engine's own stderr line."""
++    return line.lstrip().startswith(_TOOL_DIAGNOSTIC_PREFIXES)
++
++
++def _payload_root_prefix(root: Optional[str]) -> Optional[str]:
++    """Lucaryin fold: the prefix every hit printed under ``root`` carries — the
++    root exactly as handed to the engine plus a separator. None when the literal
++    root is unknown (the shell lane's ``"$PWD"`` is expanded by bash)."""
++    if not root:
++        return None
++    stripped = root.rstrip("/")
++    return stripped + "/" if stripped else "/"
++
++
++def _kill_native_search_group(proc) -> None:
++    """Lucaryin fold (0020): tear down a native search's process group at the
++    bound or the deadline. Upstream's ``_kill_process_group_posix`` tolerates only
++    ProcessLookupError, but macOS ``killpg`` answers EPERM for a group whose
++    members are already exiting — exactly the at-bound state of ``find -exec grep``
++    once every hit sits in the pipe buffer — which turned any local-Mac content
++    search with more hits than the page into ``[Errno 1] Operation not permitted``.
++    Any OSError from the group kill degrades to a best-effort TERM/KILL of the
++    leader; its stragglers die on the closed pipe."""
++    from tools.environments.local import _kill_process_group_posix
++    try:
++        _kill_process_group_posix(proc)
++    except OSError:
++        if proc.poll() is not None:
++            return
++        try:
++            proc.terminate()  # Popen.send_signal already swallows a vanished pid
++            proc.wait(timeout=1.0)
++        except subprocess.TimeoutExpired:
++            try:
++                proc.kill()
++            except OSError:
++                pass
++        except OSError:
++            pass
+ 
+ 
  # A real rg/grep output line is a whitespace-free path token followed by ``:``
- # (match/count), ``-`` (context), or nothing (files_only); tool diagnostics
- # ("rg: ...", indented carets) never match.
-@@ -135,7 +155,9 @@
+@@ -124,21 +196,30 @@
+ _SEARCH_OUTPUT_RE = re.compile(r'^([A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^[^\s:][^\s]*$')
+ 
+ 
+-def _split_tool_diagnostics(output: str) -> tuple[str, str]:
++def _split_tool_diagnostics(output: str, payload_root: Optional[str] = None) -> tuple[str, str]:
+     """Separate rg/grep diagnostic lines from real match output → ``(diagnostics, payload)``.
+     ``_exec`` merges stderr into stdout; classifying by SHAPE lets the exit-2 guard
+     tell a pure failure (no payload) from a partial one (one unreadable file, others
+-    matched) and guarantees error text is never parsed as a match."""
++    matched) and guarantees error text is never parsed as a match. Lucaryin fold:
++    ``payload_root`` (the root as handed to the engine) admits hits the shape
++    rejects — a files_only path with whitespace in it ("Bonini Contract.txt") has
++    no ``:<digit>`` tail and is not whitespace-free, yet every hit the engine
++    prints starts with the root it was given, which no diagnostic does."""
++    root_prefix = _payload_root_prefix(payload_root)
+     diagnostics: list[str] = []
+     payload: list[str] = []
+     for line in output.split('\n'):
          if not line.strip():
              continue
          # Prefix check first: a match path can contain "-<digit>" (".../pytest-686/...").
 -        if line.lstrip().startswith(("rg: ", "grep: ")):
 +        # Lucaryin fold: "find: <path>: Permission denied" joins the merged stream
 +        # once the find-enumerated grep lane keeps stderr (exec_folded).
-+        if line.lstrip().startswith(("rg: ", "grep: ", "find: ")):
++        if _is_tool_diagnostic(line):
              diagnostics.append(line)
          elif line == "--" or _SEARCH_OUTPUT_RE.match(line):
              payload.append(line)
-@@ -322,7 +344,7 @@
++        elif root_prefix and (line.startswith(root_prefix) or line == payload_root):
++            payload.append(line)  # Lucaryin fold: root-anchored hit (see above)
+         else:
+             diagnostics.append(line)
+     return '\n'.join(diagnostics), '\n'.join(payload)
+@@ -180,11 +261,14 @@
+     if result.error and not _is_line_oriented_newline_error(result.error):
+         return result
+     result.error = None
+-    result.warning = (
++    newline_note = (
+         "0 results found. Note: search_files content search is line-oriented "
+         "and does not run ripgrep with -U/--multiline, so `\\n` in the regex "
+         "does not match line breaks. Use context=N to inspect neighboring "
+         "lines, or escape as `\\\\n` when searching for a literal backslash+n.")
++    # Lucaryin fold: keep the lane's own skip note (what a zero-result grep walk
++    # never read) next to the newline explanation instead of overwriting it.
++    result.warning = f"{newline_note} {result.warning}" if result.warning else newline_note
+     return result
+ 
+ 
+@@ -197,13 +281,15 @@
+ 
+ 
+ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
+-                         context: int, warning: Optional[str] = None) -> SearchResult:
++                         context: int, warning: Optional[str] = None,
++                         payload_root: Optional[str] = None) -> SearchResult:
+     """Parse rg/grep ``| head`` output into a SearchResult (shared by both engines).
+     Exit codes: 0=matches, 1=none, 2=error — but both tools return 2 on PARTIAL
+     errors (one unreadable file), so an error is surfaced only when exit==2 AND no
+-    usable payload remains. ``warning`` is attached to files_only/content results."""
++    usable payload remains. ``warning`` is attached to files_only/content results.
++    ``payload_root`` (Lucaryin fold): the literal root, see _split_tool_diagnostics."""
+     stdout, limit_reason = _search_stdout_and_limit(result)
+-    diagnostics, payload = _split_tool_diagnostics(stdout)
++    diagnostics, payload = _split_tool_diagnostics(stdout, payload_root=payload_root)
+     if result.exit_code == 2 and not payload.strip():
+         error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
+         return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
+@@ -322,7 +408,7 @@
      # --- native rg transport (local POSIX) --------------------------------------
  
      def _run_rg_native(self, argv: List[str], fetch_limit: int, timeout: int,
@@ -55,18 +165,52 @@
          """Run ``argv`` (shell-quoted rg words) natively and stop reading after
          ``fetch_limit`` lines — the ``| head -n`` of the shell pipeline without the
          two bash spawns. ``shlex.split`` undoes the escaping the builders apply for
-@@ -334,7 +356,9 @@
+@@ -333,8 +419,10 @@
+         ``merge_stderr`` mirrors the shell path's stderr handling: merged for content
          search (diagnostics feed the error message), discarded (``2>/dev/null``) for
          file lists and probes."""
-         from tools.environments.local import _kill_process_group_posix, _make_run_env
+-        from tools.environments.local import _kill_process_group_posix, _make_run_env
 -        cwd = getattr(self.env, "cwd", None) or self.cwd
++        from tools.environments.local import _make_run_env
 +        # Lucaryin fold: ``cwd`` runs the engine inside the search root (rg resolves
 +        # ``--glob`` against its CWD — see _rg_run_cwd); default is the live cwd.
 +        cwd = cwd or getattr(self.env, "cwd", None) or self.cwd
          args = shlex.split(" ".join(argv))
          try:
              proc = subprocess.Popen(
-@@ -386,15 +410,17 @@
+@@ -350,9 +438,20 @@
+         bounded = threading.Event()
+ 
+         def _drain() -> None:
++            hits = 0
+             for raw in proc.stdout:
++                # Lucaryin fold: with merged stderr a tool diagnostic ("find: …:
++                # Permission denied") rides this pipe. It is kept (capped) for the
++                # error text but never spends the bound — a protected tree of them
++                # used to exhaust fetch_limit before the first hit and, through
++                # exec_folded, surface as a hard error with hits further along.
++                if merge_stderr and raw.lstrip().startswith(_TOOL_DIAGNOSTIC_PREFIXES_BYTES):
++                    if len(lines) - hits < _MAX_RETAINED_DIAGNOSTIC_LINES:
++                        lines.append(raw)
++                    continue
+                 lines.append(raw)
+-                if len(lines) >= fetch_limit:
++                hits += 1
++                if hits >= fetch_limit:
+                     bounded.set()
+                     break
+ 
+@@ -371,7 +470,8 @@
+                 exit_code = 124
+                 break
+         if proc.poll() is None:
+-            _kill_process_group_posix(proc)  # native lane is POSIX-only (gate above)
++            # Lucaryin fold: EPERM-tolerant group kill (macOS, members mid-exit).
++            _kill_native_search_group(proc)  # native lane is POSIX-only (gate above)
+         proc.wait()
+         drainer.join()
+         proc.stdout.close()
+@@ -386,15 +486,17 @@
  
      def _run_rg_bounded(self, words: List[str], fetch_limit: int, timeout: int, *,
                          merge_stderr: bool = False, native_ok: bool = True,
@@ -88,10 +232,11 @@
  
      def _quote_executable(self, executable: str) -> str:
          """Quote an executable without leaking controller path semantics."""
-@@ -471,6 +497,77 @@
+@@ -470,7 +572,105 @@
+         for item in self._macos_search_exclusions(path):
              out.extend(["--glob", self._escape_shell_arg(f"!{item}/**")])
          return out
- 
++
 +    # --- Lucaryin fold (0020): local-macOS content-search bounds -------------------
 +
 +    def _local_darwin_env(self) -> bool:
@@ -110,23 +255,42 @@
 +        CWD, not the search root, so ``!Documents/**`` only kept rg out of
 +        ``$HOME/Documents`` when the shell happened to sit in ``$HOME`` — from any
 +        other cwd it walked straight into Documents/Desktop/Library (unattended TCC
-+        prompt, iCloud download). Callers pass the absolute root on the command line
-+        so output paths keep their shape."""
-+        root = self._absolute_root(path)
-+        cwd = getattr(self.env, "cwd", None) or self.cwd
-+        return None if root == os.path.normpath(cwd) else root
++        prompt, iCloud download). Callers pass the returned root on the command line
++        so output paths keep their shape. realpath on both sides: rg's own getcwd()
++        is canonical, so a symlinked cwd or root (/tmp vs /private/tmp) made rg's
++        root-prefix strip miss and the anchoring silently fail — the canonical root
++        is what rg is handed, and a symlinked absolute root is re-anchored even
++        when the live cwd already is that directory."""
++        root = os.path.realpath(self._absolute_root(path))
++        cwd = os.path.realpath(getattr(self.env, "cwd", None) or self.cwd)
++        if root == cwd and (not os.path.isabs(path) or os.path.normpath(path) == root):
++            return None
++        return root
 +
 +    def _macos_cloud_synced_root(self, path: str) -> bool:
-+        """Whether a local-macOS search root sits at/inside a cloud-synced folder
-+        (case-folded: the default APFS volume is case-insensitive)."""
++        """Whether a local-macOS content search rooted at ``path`` can reach cloud
++        placeholders: the root sits at/inside a cloud-synced folder, or one lies
++        below the root and no protected-folder exclusion already keeps the engine
++        out of it (an explicit ``~/Library`` gets no exclusions — Library IS the
++        root — yet holds Mobile Documents and CloudStorage, so rg would materialise
++        the whole iCloud Drive). Case-folded: the default APFS volume is
++        case-insensitive."""
 +        if not self._local_darwin_env():
 +            return False
 +        from tools import file_operations as _fo  # lazy: _HOME is monkeypatched there
 +        root = self._absolute_root(path).lower()
 +        home = os.path.normpath(_fo._HOME).lower()
++        excluded = [os.path.normpath(os.path.join(root, item.lower()))
++                    for item in self._macos_search_exclusions(path)]
++
++        def below(node: str, ancestor: str) -> bool:
++            return node == ancestor or node.startswith(ancestor + os.sep)
++
 +        for dirname in _MACOS_CLOUD_SYNCED_HOME_DIRS:
-+            target = os.path.join(home, dirname.lower())
-+            if root == target or root.startswith(target + os.sep):
++            cloud = os.path.join(home, dirname.lower())
++            if below(root, cloud):
++                return True
++            if below(cloud, root) and not any(below(cloud, item) for item in excluded):
 +                return True
 +        return False
 +
@@ -147,12 +311,15 @@
 +        pruned name (an explicit ``.../build`` search must still search it)."""
 +        names = " -o ".join(f"-name {self._escape_shell_arg(name)}" for name in sorted(SEARCH_PRUNE_DIR_NAMES))
 +        return f"\\( -type d \\( {names} \\) ! -path {root} \\) -prune"
-+
+ 
 +    @staticmethod
-+    def _grep_lane_skip_note(cloud: bool) -> str:
++    def _grep_lane_skip_note(cloud: bool, partials_lost: bool = False) -> str:
 +        """What the find/grep lane never reads. Attached when a search timed out (so
-+        "0" is never mistaken for "nothing matches") and on cloud-synced roots (where
-+        most entries may be placeholders — 778 of 978 files on the canary Mac)."""
++        "0" is never mistaken for "nothing matches"), when it found nothing (the
++        prune policy is otherwise silent) and on cloud-synced roots (where most
++        entries may be placeholders — 778 of 978 files on the canary Mac).
++        ``partials_lost``: the shell pipeline (HERMES_NATIVE_FILE_READ=0) drops every
++        hit still in grep's/head's buffers when the deadline kills it — say so."""
 +        skipped = [
 +            "binary files",
 +            f"files over {_CONTENT_SEARCH_MAX_FILE_MB} MB",
@@ -161,12 +328,53 @@
 +        if cloud:
 +            skipped.append("cloud files not downloaded to this Mac (iCloud/File Provider "
 +                           "placeholders — download them in Finder to include them)")
-+        return "Content search skipped " + ", ".join(skipped) + "."
++        note = "Content search skipped " + ", ".join(skipped) + "."
++        if partials_lost:
++            note += (" Any hits found before the deadline were discarded along with the "
++                     "shell pipeline (native search lane not in use; HERMES_NATIVE_FILE_READ=0 "
++                     "disables it on a local host).")
++        return note
 +
      def _path_exists_probe(self, path: str) -> str:
          """Stdout of the existence probe: contains "exists" or "not_found"."""
          if self._native_read_enabled():
-@@ -586,6 +683,12 @@
+@@ -522,10 +722,17 @@
+             (existing if "exists" in self._path_exists_probe(expanded) else missing).append(expanded)
+         if not existing:
+             return None
++        # Lucaryin fold: the engines' own notes (a timed-out lane's skip list, the
++        # zero-match hint) and limit_reason must survive the merge — they used to be
++        # overwritten by the multi-path note and dropped, so a timed-out sub-search
++        # read as complete.
++        engine_notes: List[str] = []
+         if target == "files":
+             # One global traversal across roots so modified ordering and pagination
+             # are exact; root admission wraps the actual rg/find invocation.
+             merged = self._search_files(pattern, existing, limit, offset, order)
++            if merged.warning:
++                engine_notes.append(merged.warning)
+         else:
+             merged = SearchResult()
+             for root in existing:
+@@ -537,6 +744,9 @@
+                 merged.counts.update(sub.counts)
+                 merged.total_count += sub.total_count
+                 merged.truncated = merged.truncated or sub.truncated
++                merged.limit_reason = merged.limit_reason or sub.limit_reason
++                if sub.warning and sub.warning not in engine_notes:
++                    engine_notes.append(sub.warning)
+             merged.matches = merged.matches[:limit]
+             merged.files = merged.files[:limit]
+         note = f"path contained {len(parts)} entries; searched {len(existing)} that exist"
+@@ -549,6 +759,7 @@
+             protected_paths = [absolute for _r, _rel, absolute in self._effective_macos_search_exclusions(existing)]
+             if protected_paths:
+                 warning_parts.append(self._macos_protected_search_warning(protected_paths))
++        warning_parts.extend(engine_notes)
+         merged.warning = " ".join(warning_parts)
+         return merged
+ 
+@@ -586,6 +797,12 @@
          rg = self._quote_executable(rg_executable)
          has_meta = bool(re.search(r"[.\[\](){}?*+^$\\|]", pattern))
          glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
@@ -179,7 +387,7 @@
          for flags, template in self._ZERO_MATCH_PROBES:
              if flags == "-F" and not has_meta:
                  continue
-@@ -595,9 +698,9 @@
+@@ -595,9 +812,9 @@
                  glob_expr_probe = f"{glob_expr} {self._search_prune_glob_args()}"
              else:
                  glob_expr_probe = glob_expr
@@ -192,7 +400,7 @@
              total, per_file = 0, []
              for line in (probe.stdout or "").strip().splitlines():
                  p, _sep, n = line.rpartition(":")
-@@ -772,13 +875,19 @@
+@@ -772,13 +989,19 @@
                  return SearchResult(error=capability_error)
          rg = self._quote_executable(rg_executable)
          sort_arg = " --sortr=modified" if order == "modified" else ""
@@ -213,13 +421,14 @@
          stdout, limit_reason = _search_stdout_and_limit(result)
          all_files = [f for f in stdout.splitlines() if f]
          if scoped_common:
-@@ -799,7 +908,12 @@
+@@ -799,7 +1022,13 @@
      def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
                          limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
          """Content search: rg, else grep; attaches zero-match steering hints."""
 -        used_rg = self._has_command('rg')
 +        has_rg = self._has_command('rg')
-+        # Lucaryin fold: at/below a cloud-synced folder rg cannot tell a placeholder
++        # Lucaryin fold: at/below a cloud-synced folder — or above one that no
++        # protected-folder glob excludes (~/Library) — rg cannot tell a placeholder
 +        # from a file and would download every one it opens; the find-enumerated grep
 +        # lane skips them at the metadata layer (``-flags +dataless``).
 +        cloud_root = has_rg and self._macos_cloud_synced_root(path)
@@ -227,7 +436,7 @@
          if used_rg:
              result = self._search_with_rg(pattern, path, file_glob, limit, offset, output_mode, context,
                                            rg_executable=self._resolve_command("rg") or "rg")
-@@ -810,7 +924,8 @@
+@@ -810,7 +1039,8 @@
                  error="Content search requires ripgrep (rg) or grep. "
                        "Install ripgrep: https://github.com/BurntSushi/ripgrep#installation")
          if (not result.error and result.total_count == 0
@@ -237,13 +446,14 @@
              try:
                  hint = self._zero_match_probe(pattern, path, file_glob)
              except Exception:
-@@ -825,23 +940,46 @@
+@@ -825,24 +1055,53 @@
  
      def _run_search_pipeline(self, cmd_parts: List[str], output_mode: str, limit: int,
                               offset: int, context: int, warning: Optional[str] = None,
 -                             line_cap: bool = False) -> SearchResult:
 +                             line_cap: bool = False, cwd: Optional[str] = None,
-+                             exec_folded: bool = False) -> SearchResult:
++                             exec_folded: bool = False,
++                             payload_root: Optional[str] = None) -> SearchResult:
          """Run ``cmd_parts | head -n <fetch_limit>`` under pipefail and parse. Extra
          rows report the true total (context mode also emits "--" separators, so
          grab 200 more). pipefail keeps the engine's exit 2 alive across ``| head``
@@ -253,7 +463,8 @@
 -        files_only/count where lines are paths/counts."""
 +        files_only/count where lines are paths/counts. Lucaryin fold: ``cwd`` runs
 +        the engine inside that directory; ``exec_folded`` marks a ``find -exec grep``
-+        pipeline, whose find exit status hides grep's."""
++        pipeline, whose find exit status hides grep's; ``payload_root`` is the root
++        as handed to the engine (see _split_tool_diagnostics)."""
          fetch_limit = limit + offset + (200 if context > 0 else 0)
 -        if line_cap:  # grep/find pipelines: shell only, with the column cap
 -            parts = cmd_parts + ["|", "head", "-n", str(fetch_limit)]
@@ -280,20 +491,26 @@
 +            if exec_folded and result.exit_code in (0, 1):
 +                # Lucaryin fold: find swallows grep's exit 2 (bad regex, unreadable
 +                # tree) — BSD find even returns 1 for a no-match batch — so the hard
-+                # failure grep -r reports is recovered by shape: diagnostics and no
-+                # payload at all. Timeouts (124) keep their partial output.
-+                diagnostics, payload = _split_tool_diagnostics(result.stdout)
-+                if diagnostics.strip() and not payload.strip():
++                # failure grep -r reports is recovered by shape: an engine-prefixed
++                # diagnostic ("grep: …") and no payload at all. Only a real engine
++                # line may promote: a files_only hit with whitespace in its name
++                # fails the payload shape too, and was reported as the failure text.
++                # Timeouts (124) keep their partial output.
++                diagnostics, payload = _split_tool_diagnostics(result.stdout, payload_root=payload_root)
++                if not payload.strip() and any(_is_tool_diagnostic(line) for line in diagnostics.splitlines()):
 +                    result.exit_code = 2
          else:
 -            result = self._run_rg_bounded(cmd_parts, fetch_limit, timeout=60, merge_stderr=True,
 -                                          shell_prefix="set -o pipefail; ")
+-        return _parse_search_output(result, output_mode, limit, offset, context, warning=warning)
 +            result = self._run_rg_bounded(cmd_parts, fetch_limit, timeout=_CONTENT_SEARCH_TIMEOUT_SECONDS,
 +                                          merge_stderr=True, shell_prefix="set -o pipefail; ", cwd=cwd)
-         return _parse_search_output(result, output_mode, limit, offset, context, warning=warning)
++        return _parse_search_output(result, output_mode, limit, offset, context, warning=warning,
++                                    payload_root=payload_root)
  
      def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
-@@ -865,24 +1003,32 @@
+                         limit: int, offset: int, output_mode: str, context: int,
+@@ -865,24 +1124,32 @@
              cmd_parts.append("--multiline")
          if context > 0:
              cmd_parts.extend(["-C", str(context)])
@@ -316,7 +533,7 @@
          ) if multiline else None
 -        return self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context, warning=ml_note)
 +        return self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context,
-+                                         warning=ml_note, cwd=run_cwd)
++                                         warning=ml_note, cwd=run_cwd, payload_root=run_cwd or path)
  
      def _grep_cmd(self, head: List[str], pattern: str, output_mode: str, context: int,
                    file_glob: Optional[str] = None) -> List[str]:
@@ -329,7 +546,7 @@
          if context > 0:
              parts.extend(["-C", str(context)])
          if file_glob:
-@@ -898,17 +1044,24 @@
+@@ -898,24 +1165,35 @@
          # grep's --exclude-dir matches BASENAMES anywhere, so it can't express "only
          # the home-level Downloads"; route pruning through find's path-scoped -prune.
          protected_paths = self._protected_prune_paths(path)
@@ -348,15 +565,27 @@
          # --exclude-dir applies to the root too, so "." would be excluded by '.*';
          # anchor relative paths at the shell's live $PWD.
          is_absolute = path.startswith(("/", "\\\\")) or bool(re.match(r"^[A-Za-z]:[\\/]", path))
++        payload_root: Optional[str] = None  # Lucaryin fold: the literal root, when known
          if is_absolute:
++            payload_root = path
              search_root = self._escape_shell_arg(path)
 +        elif self._native_read_enabled():
 +            # Lucaryin fold: no shell expands "$PWD" on the native lane.
-+            search_root = self._escape_shell_arg(self._absolute_root(path))
++            payload_root = self._absolute_root(path)
++            search_root = self._escape_shell_arg(payload_root)
          else:
              relative_path = path[2:] if path.startswith("./") else path
              search_root = '"$PWD"'
-@@ -923,16 +1076,34 @@
+             if relative_path not in {"", "."}:
+                 search_root += f"/{self._escape_shell_arg(relative_path)}"
+         cmd_parts.append(search_root)
+-        return self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context, line_cap=True)
++        return self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context,
++                                         line_cap=True, payload_root=payload_root)
+ 
+     def _search_with_grep_pruned(self, pattern: str, path: str, file_glob: Optional[str],
+                                  limit: int, offset: int, output_mode: str, context: int,
+@@ -923,16 +1201,46 @@
          """grep fallback with PATH-scoped protected-dir pruning: ``find ... -prune``
          enumerates files (traversal never enters protected dirs) and hands them to
          grep via ``-exec {} +``; hidden dirs pruned to mirror ``--exclude-dir='.*'``.
@@ -373,7 +602,14 @@
 -            "\\( -type d -name '.*' \\) -prune", "-o",
 -            "-type f",
 -        ]
-+        root = self._escape_shell_arg(path or ".")
++        root_path = path or "."
++        if self._native_read_enabled() and not os.path.isabs(root_path):
++            # Lucaryin fold: anchor a relative root to its absolute path (as the
++            # grep -r lane does natively) so hits keep the absolute shape the old
++            # lane printed instead of "./x"; the protected prunes follow the root.
++            root_path = self._absolute_root(root_path)
++            protected_paths = self._protected_prune_paths(root_path)
++        root = self._escape_shell_arg(root_path)
 +        prunes: List[str] = []
 +        if protected_paths:
 +            prunes.append(self._prune_expr(protected_paths))
@@ -385,7 +621,9 @@
 +            # A dataless entry (file or folder) is a placeholder: never opened, never
 +            # entered — reading one makes macOS download it. Metadata-only test.
 +            prunes.append("-flags +dataless -prune")
-+        find_parts = ["find", root]
++        # -H follows a symlinked ROOT only (a symlink handed in as the root listed
++        # nothing below it); symlinks met during the walk stay unfollowed.
++        find_parts = ["find", "-H", root]
 +        for term in prunes:
 +            find_parts.extend([term, "-o"])
 +        find_parts.extend(["-type f", f"-size -{_CONTENT_SEARCH_MAX_FILE_MB}M"])
@@ -395,10 +633,13 @@
 -        return self._run_search_pipeline(find_parts, output_mode, limit, offset, context, line_cap=True)
 +        find_parts.extend(["-exec", *grep_parts, "{}", "+"])
 +        result = self._run_search_pipeline(find_parts, output_mode, limit, offset, context,
-+                                           line_cap=True, exec_folded=True)
-+        if not result.error and (result.limit_reason == "search_timeout"
++                                           line_cap=True, exec_folded=True, payload_root=root_path)
++        timed_out = result.limit_reason == "search_timeout"
++        if not result.error and (timed_out or result.total_count == 0
 +                                 or self._macos_cloud_synced_root(path)):
-+            note = self._grep_lane_skip_note(cloud_safe)
++            # Zero results carry the note too: the prune policy is otherwise silent.
++            note = self._grep_lane_skip_note(
++                cloud_safe, partials_lost=timed_out and not self._native_read_enabled())
 +            result.warning = f"{result.warning} {note}" if result.warning else note
 +        return result
 --- a/tools/file_operations.py
@@ -420,7 +661,7 @@
  
 --- a/tools/file_tools.py
 +++ b/tools/file_tools.py
-@@ -1004,7 +1004,12 @@
+@@ -1012,7 +1012,12 @@
          # Structured like ``_warning`` above: text appended after the JSON
          # breaks every json.loads consumer (execute_code RPC, strict tool-message
          # providers) — #90322.
@@ -429,21 +670,22 @@
 +            # Lucaryin fold: paging a timed-out search re-runs it to the same
 +            # deadline, and "total_count 0 + Use offset=30" read as "no matches,
 +            # page on" on the canary. Say what happened instead.
-+            result_dict["_hint"] = _search_timeout_hint(result_dict)
++            result_dict["_hint"] = _search_timeout_hint(result_dict, target)
 +        elif result_dict.get("truncated"):
              result_dict["_hint"] = (
                  f"Results truncated. Use offset={offset + limit} to see more, "
                  "or narrow with a more specific pattern or file_glob."
-@@ -1012,6 +1017,27 @@
+@@ -1020,6 +1025,35 @@
          return json.dumps(result_dict, ensure_ascii=False)
      except Exception as e:
          return tool_error(str(e))
 +
 +
-+def _search_timeout_hint(result_dict: dict) -> str:
++def _search_timeout_hint(result_dict: dict, target: str = "content") -> str:
 +    """Lucaryin fold: honest shape for a search that hit its time limit. The engine
 +    stops wherever the deadline caught it, so total_count only covers the part it
-+    reached — and 0 there is not "no matches"."""
++    reached — and 0 there is not "no matches". Tailored by ``target``: a filename
++    search reads nothing, so its advice is about the walk, not file contents."""
 +    found = any(result_dict.get(key) for key in ("matches", "matches_text", "files", "counts"))
 +    if found:
 +        coverage = ("Results are partial: only what was reached before the deadline; "
@@ -451,6 +693,13 @@
 +    else:
 +        coverage = ("0 results means nothing matched in the part reached before the "
 +                    "deadline — NOT that nothing matches.")
++    if target == "files":
++        return (
++            f"File search timed out before finishing. {coverage} Never searched: whatever "
++            "lies past the deadline, plus what a filename search skips by policy (listed in "
++            "'warning' when it applies: macOS protected folders on a broad root, hidden and "
++            "dependency/build/cache directories). Narrow 'path' to one folder or use a more "
++            "specific name pattern (e.g. 'invoice*.pdf').")
 +    return (
 +        f"Search timed out before finishing. {coverage} Never searched: whatever lies "
 +        "past the deadline, plus what this search skips by policy (listed in 'warning' "
