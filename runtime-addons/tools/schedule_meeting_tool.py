@@ -30,6 +30,20 @@ DEFAULT_LEAD_MINUTES = 2
 GRANT_EXPIRY_MINUTES_AFTER_START = 30
 VALID_STYLES = ("clerk", "scribe", "hold", "driver")
 
+# The prompt stored on the meeting_join job. The job is executed
+# deterministically by the scheduler (cron/meeting_join.py — no model; the
+# prompt is never read), so this used to be "". Upstream's create_job
+# (cron/jobs.py, v2026.9.7) now refuses an empty payload — blank prompt, no
+# script, no skills — with EMPTY_PAYLOAD_ERROR before it ever looks at the
+# fold's job_type/meeting (runtime-patches/0007), so every schedule_meeting
+# call failed at job creation. A fixed, self-describing prompt satisfies the
+# guard without changing what runs. Constant on purpose: the user-supplied
+# label is untrusted text and must not reach create_job's gateway-lifecycle
+# scan of the prompt (it lands in the job name and meeting payload only).
+# Byte-identical to hermes-bridge/server.py::_MEETING_JOIN_PROMPT (lucaryin-ai
+# PR #57), the other writer of meeting_join jobs, so both store the same record.
+MEETING_JOIN_PROMPT = "Join the scheduled meeting (deterministic dial; no model run)."
+
 
 def _classify_join_surface(url: str) -> str:
     """Mirror of the bridge's classify_join_url (the venv can't import it): tag
@@ -143,7 +157,7 @@ def schedule_meeting_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
         origin = None
 
     job = create_job(
-        prompt="",
+        prompt=MEETING_JOIN_PROMPT,
         schedule=fire_dt.isoformat(),
         name=f"Dial {label}",
         repeat=1,
