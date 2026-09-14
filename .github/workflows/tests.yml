@@ -108,6 +108,17 @@ jobs:
           cache: pip
           cache-dependency-path: build/runtime/pyproject.toml
 
+      # The runtime always runs INSIDE a venv on real machines (~/.lucaryin/venvs/
+      # hermes) and in upstream's uv-managed CI. tools/environments/local.py gates
+      # its venv-site-packages stripping on sys.base_prefix != sys.prefix, so the
+      # bare hosted-toolcache interpreter failed 7 tests in test_local_env_blocklist
+      # on the first runs. Same interpreter, same pip cache — just a venv.
+      - name: Create the venv the tests run in
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$RUNNER_TEMP/venv" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/venv/bin/python" -c 'import sys; assert sys.prefix != sys.base_prefix; print("venv:", sys.prefix)'
       - name: Install runtime dependencies (product set + upstream's test extras)
         run: |
           python - build/runtime/pyproject.toml \
@@ -246,6 +257,17 @@ jobs:
           cache: pip
           cache-dependency-path: build/runtime/pyproject.toml
 
+      # The runtime always runs INSIDE a venv on real machines (~/.lucaryin/venvs/
+      # hermes) and in upstream's uv-managed CI. tools/environments/local.py gates
+      # its venv-site-packages stripping on sys.base_prefix != sys.prefix, so the
+      # bare hosted-toolcache interpreter failed 7 tests in test_local_env_blocklist
+      # on the first runs. Same interpreter, same pip cache — just a venv.
+      - name: Create the venv the tests run in
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$RUNNER_TEMP/venv" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/venv/bin/python" -c 'import sys; assert sys.prefix != sys.base_prefix; print("venv:", sys.prefix)'
       - name: Install runtime dependencies (product set + dev)
         # Same extractor as the Linux lane (keep the two in lockstep); only
         # the `dev` extra here — the darwin-lane files need nothing else.
