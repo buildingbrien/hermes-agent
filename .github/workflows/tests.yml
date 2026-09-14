@@ -190,11 +190,14 @@ jobs:
           # shellcheck disable=SC2086 — repo-relative paths, no spaces
           python -m pytest $ADDON_TESTS -q -p no:cacheprovider
 
-      - name: Upstream suite for the patched surface (tests/tools + tests/agent, slice ${{ matrix.slice }}/3)
+      - name: Upstream suite for the patched surface (tests/tools + tests/agent + tests/cron, slice ${{ matrix.slice }}/3)
         # Every fold patch lands in tools/, agent/, run_agent.py, toolsets.py,
         # cron/ or hermes_cli/ — tests/tools + tests/agent (1102 files,
         # ~15.2k tests) are the upstream tests for the files we actually
-        # rewrite. Measured 2026-09-13 on an 8-core M-series, 8 workers:
+        # rewrite; tests/cron (103 files, ~1.3k tests, ~100 s on 8 workers)
+        # joined on 2026-09-14 with patch 0023, which rewrites the cron
+        # delivery path (0007 already folded cron/ untested here).
+        # Measured 2026-09-13 on an 8-core M-series, 8 workers:
         # 19 min wall, 8.7k subprocess-seconds (tools 5.9k, agent 2.8k). A
         # 4-core ubuntu-latest is slower per core, so the suite is split into
         # 3 count-balanced slices (≈15–20 min each). The FULL upstream suite
@@ -221,7 +224,7 @@ jobs:
             [ -n "$line" ] && DESELECT+=("--deselect=$line")
           done < ../../runtime-patches/upstream-test-deselect.txt
           echo "deselecting ${#DESELECT[@]} upstream test(s) (see runtime-patches/upstream-test-deselect.txt)"
-          python scripts/run_tests_parallel.py tests/tools tests/agent \
+          python scripts/run_tests_parallel.py tests/tools tests/agent tests/cron \
             --slice "${{ matrix.slice }}/$SLICES" -j "$(nproc)" \
             -q -p no:cacheprovider "${DESELECT[@]}"
 
