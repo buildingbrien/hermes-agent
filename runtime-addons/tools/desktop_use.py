@@ -170,7 +170,7 @@ def _pid_executable_path(pid: int) -> str:
     except Exception:
         pass
     try:
-        out = subprocess.run(["ps", "-o", "comm=", "-p", str(int(pid))], capture_output=True,
+        out = subprocess.run(["ps", "-o", "comm=", "-p", str(int(pid))], capture_output=True, stdin=subprocess.DEVNULL,
                              text=True, timeout=5, check=False).stdout.strip()
         return out if out.startswith("/") else ""
     except Exception:
