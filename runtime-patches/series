@@ -18,3 +18,4 @@
 0019-read-extract-not-found-rescue.patch
 0020-search-fallback-bounds.patch
 0021-pyobjc-desktop-addon-deps.patch
+0022-deepseek-vision-default.patch

@@ -60,3 +60,16 @@ tests/tools/test_macos_protected_search.py::test_grep_pruned_search_still_finds_
 # 4-core runner (passes on upstream's 96-core runner and locally). Timing, not
 # behaviour — failed identically on the retry.
 tests/agent/test_owned_process_cleanup.py::test_child_close_kills_only_its_processes
+
+# 0022 adds; the two branches touch this path add/add, so at merge time keep
+# the ci/runtime-tests file and append the section below after its last
+# fold-patch section (ahead of the ENVIRONMENTAL / KNOWN FINDINGS tails).
+
+# 0022 — deepseek is now a first-class vision provider
+# _PROVIDER_VISION_MODELS gains "deepseek": "deepseek-v4-flash-vision-exp", so
+# a DeepSeek main provider resolves vision to that image-input model (the same
+# way xiaomi / zai already do) instead of being skipped as text-only; upstream
+# asserts that a deepseek main with no aggregator credentials builds NO client
+# on the auto route. Verified 2026-09-13 against v2026.9.7: the file is 8/8 on
+# the tree without 0022 and exactly this one fails with it (the other 7 pass).
+tests/agent/test_vision_routing_31179.py::TestTextOnlyMainSkippedForVision::test_text_only_main_skipped_when_no_aggregator
