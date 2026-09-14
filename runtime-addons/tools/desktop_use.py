@@ -115,25 +115,137 @@ def _tcc_process_name_for_path(path: str) -> str:
     return os.path.basename(path or "") or "python"
 
 
+# ── TCC subject: the process macOS files the grant under ─────────────────────
+# macOS attributes a TCC request to the RESPONSIBLE process — normally the app that launched the
+# requesting process (libquarantine's ``responsibility_get_pid_responsible_for_pid``), and the
+# requester itself only when nothing above it holds responsibility (launchd, sshd, a plain CLI
+# run). The fleet's bridges are spawned by the Electron app, so their Screen Recording /
+# Accessibility grants are filed under the app: TCC.db on the canary box carries
+# kTCCServiceScreenCapture + kTCCServiceAccessibility rows for com.lucaryin.lucaryin-ai (Developer
+# ID csreq) and NO python3.12 row, and System Settings lists "Lucaryin AI" (canary.6 verification
+# sweep, 2026-09-14). The interpreter image name — "python3.12" for the fleet's python-build-
+# standalone binary, "Python" on a framework build — is right only for a worker with no app above
+# it, the shape the canary.5 field report came from (screencapture run from a terminal tool).
+# Naming the interpreter while under the app sent the user to an entry that does not exist, so
+# the subject is computed at runtime from whichever process TCC will actually file it under.
+
+def _responsible_pid(pid: int) -> int:
+    """The pid macOS holds responsible for ``pid`` — libquarantine's
+    ``responsibility_get_pid_responsible_for_pid`` (also exported through libSystem). 0 off darwin
+    or on any failure; callers treat 0 as "nothing above this process"."""
+    if sys.platform != "darwin":
+        return 0
+    try:
+        import ctypes  # noqa: WPS433
+        for lib in ("/usr/lib/system/libquarantine.dylib", None):
+            try:
+                fn = ctypes.CDLL(lib).responsibility_get_pid_responsible_for_pid
+            except (OSError, AttributeError):
+                continue
+            fn.restype = ctypes.c_int32
+            fn.argtypes = [ctypes.c_int32]
+            got = int(fn(int(pid)))
+            return got if got > 0 else 0
+    except Exception:
+        pass
+    return 0
+
+
+def _pid_executable_path(pid: int) -> str:
+    """Executable image path of ``pid``: libproc ``proc_pidpath``, else ``ps -o comm=`` (an
+    absolute path on macOS). "" off darwin or on any failure."""
+    if sys.platform != "darwin" or pid <= 0:
+        return ""
+    try:
+        import ctypes  # noqa: WPS433
+        fn = ctypes.CDLL("libproc.dylib").proc_pidpath
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        buf = ctypes.create_string_buffer(4096)  # PROC_PIDPATHINFO_MAXSIZE
+        if fn(int(pid), buf, len(buf)) > 0 and buf.value:
+            return buf.value.decode("utf-8", "surrogateescape")
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "comm=", "-p", str(int(pid))], capture_output=True,
+                             text=True, timeout=5, check=False).stdout.strip()
+        return out if out.startswith("/") else ""
+    except Exception:
+        return ""
+
+
+_APP_BUNDLE_DIR = re.compile(r"^(.*\.app)/Contents/MacOS/")  # greedy: the innermost bundle
+
+
+def _bundle_info(bundle_dir: str) -> dict:
+    """``Contents/Info.plist`` of an app bundle as a dict (plistlib); {} on any failure."""
+    try:
+        import plistlib  # noqa: WPS433
+        with open(os.path.join(bundle_dir, "Contents", "Info.plist"), "rb") as f:
+            info = plistlib.load(f)
+        return info if isinstance(info, dict) else {}
+    except Exception:
+        return {}
+
+
+def _tcc_subject_for(own_pid: int, responsible_pid: int, responsible_path: str,
+                     image_path: str, bundle_info=None) -> dict:
+    """Pure mapping (unit-tested without macOS): the System Settings entry a TCC grant for this
+    worker lands on — ``{"process", "subject_kind", "bundle_id"}``.
+
+    * ``responsible_pid`` is another process whose executable sits inside an app bundle
+      (``…/Lucaryin AI.app/Contents/MacOS/Lucaryin AI``) → kind "app": the bundle's display name
+      (Info.plist ``CFBundleDisplayName``, else ``CFBundleName``, else the ``.app`` folder name)
+      plus its ``CFBundleIdentifier`` when the plist is readable.
+    * otherwise → kind "interpreter": named exactly as before from the worker's own executable
+      image (``_tcc_process_name_for_path``) — ``python3.12`` for the fleet's python-build-
+      standalone binary, ``Python`` for a framework build, ``python`` when nothing is known."""
+    read_info = bundle_info if bundle_info is not None else _bundle_info
+    if responsible_pid > 0 and responsible_pid != own_pid and responsible_path:
+        m = _APP_BUNDLE_DIR.match(responsible_path)
+        if m:
+            bundle_dir = m.group(1)
+            info = read_info(bundle_dir) or {}
+            name = (str(info.get("CFBundleDisplayName") or "").strip()
+                    or str(info.get("CFBundleName") or "").strip()
+                    or os.path.basename(bundle_dir)[:-len(".app")])
+            bundle_id = str(info.get("CFBundleIdentifier") or "").strip() or None
+            return {"process": name, "subject_kind": "app", "bundle_id": bundle_id}
+    return {"process": _tcc_process_name_for_path(image_path), "subject_kind": "interpreter",
+            "bundle_id": None}
+
+
+def _tcc_subject() -> dict:
+    """``_tcc_subject_for`` fed by the live lookups. Every lookup is guarded and each is a module
+    attribute (``_responsible_pid`` / ``_pid_executable_path`` / ``_executable_image_path`` /
+    ``_bundle_info``) so tests pin them instead of calling libquarantine."""
+    own = os.getpid()
+    responsible = _responsible_pid(own)
+    responsible_path = _pid_executable_path(responsible) if responsible and responsible != own else ""
+    return _tcc_subject_for(own, responsible, responsible_path, _executable_image_path())
+
+
 def _agent_process_name() -> str:
-    """The name macOS files the TCC grant under: the REAL binary running this agent worker. TCC
-    attributes Screen Recording / Accessibility to the executable image, not to the app that
-    spawned it, so the entry in System Settings, and the "… is requesting to access …" prompt,
-    carry ``python3.12`` on the canary boxes (the venv symlink's target) or ``Python`` on a
-    framework build — never "Lucaryin". Telling the user to look for "Lucaryin" sent them to an
-    entry that does not exist (canary.5 soak, 2026-09-14)."""
-    return _tcc_process_name_for_path(_executable_image_path())
+    """The name System Settings lists this worker's TCC grant under (see ``_tcc_subject``)."""
+    return _tcc_subject()["process"]
 
 
-def _tcc_help(permission: str, pane: str) -> str:
-    """Honest, actionable TCC error: names the process the user must enable and the pane."""
-    proc = _agent_process_name()
+def _tcc_help(permission: str, pane: str, subject: Optional[dict] = None) -> str:
+    """Honest, actionable TCC error: names the entry the user must enable and the pane. ``subject``
+    is a ``_tcc_subject()`` result (``_tcc_status()`` carries one); computed here when absent."""
+    subject = subject if subject and subject.get("process") else _tcc_subject()
+    proc = subject["process"]
+    if subject.get("subject_kind") == "app":
+        filed = (f"macOS files this permission under the app that launched the worker, so it "
+                 f"appears as \"{proc}\"")
+    else:
+        filed = (f"macOS files this permission under the Python binary running the agent (no app "
+                 f"launched this worker), so it appears as \"{proc}\" (not \"Lucaryin\")")
     return (
-        f"{permission} permission is off for the agent worker. macOS files this permission under "
-        f"the Python binary running the agent, so it appears as \"{proc}\" (not \"Lucaryin\") in "
-        f"System Settings → Privacy & Security → {pane}. Switch \"{proc}\" on there (macOS may have "
-        f"just prompted for it), then retry this action; if it still fails after enabling, "
-        f"relaunch the Lucaryin app so the worker picks up the grant."
+        f"{permission} permission is off for the agent worker. {filed} in System Settings → "
+        f"Privacy & Security → {pane}. Switch \"{proc}\" on there (macOS may have just prompted "
+        f"for it), then retry this action; if it still fails after enabling, relaunch the "
+        f"Lucaryin app so the worker picks up the grant."
     )
 
 
@@ -182,8 +294,8 @@ def _request_accessibility() -> Optional[bool]:
 
 def _tcc_status() -> dict:
     mods = _pyobjc()
-    out = {"pyobjc": bool(mods), "screen_recording": None, "accessibility": None,
-           "process": _agent_process_name()}
+    out = {"pyobjc": bool(mods), "screen_recording": None, "accessibility": None}
+    out.update(_tcc_subject())  # "process" / "subject_kind" / "bundle_id": where the grant is filed
     if not mods:
         return out
     Quartz, _ = mods
@@ -322,10 +434,10 @@ def _require_ready(app: str, *, need_input: bool) -> Optional[dict]:
     tcc = _tcc_status()
     if tcc.get("screen_recording") is False:
         _request_screen_recording()  # first refusal: pop the prompt / create the entry
-        return _err(_tcc_help("Screen Recording", "Screen Recording"))
+        return _err(_tcc_help("Screen Recording", "Screen Recording", subject=tcc))
     if need_input and tcc.get("accessibility") is False:
         _request_accessibility()
-        return _err(_tcc_help("Accessibility", "Accessibility"))
+        return _err(_tcc_help("Accessibility", "Accessibility", subject=tcc))
     return None
 
 
@@ -354,11 +466,15 @@ def desktop_list_apps(task_id: str = "", **_) -> dict:
     if not _pyobjc():
         return _err("Desktop control isn't provisioned on this machine yet (pyobjc missing).")
     allowed = [a for a in _allowlist() if not _is_financial(a)]
-    permissions = dict(_tcc_status())  # carries "process": the worker binary the grant is filed under
+    permissions = dict(_tcc_status())  # carries "process" + "subject_kind": where the grant is filed
+    proc = permissions.get("process") or "python"
+    if permissions.get("subject_kind") == "app":
+        listed = f"file this agent worker's grant under the app that launched it, \"{proc}\""
+    else:
+        listed = f"list this agent worker as \"{proc}\" (the Python binary — no app launched it)"
     permissions["grant_under"] = (
-        f"System Settings → Privacy & Security → Screen Recording / Accessibility list this agent "
-        f"worker as \"{permissions['process']}\"; enable that entry, retry, and relaunch Lucaryin if "
-        "it still fails.")
+        f"System Settings → Privacy & Security → Screen Recording / Accessibility {listed}; "
+        "enable that entry, retry, and relaunch Lucaryin if it still fails.")
     return {"ok": True, "operable_apps": allowed, "permissions": permissions}
 
 
