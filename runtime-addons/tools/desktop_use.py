@@ -116,18 +116,21 @@ def _tcc_process_name_for_path(path: str) -> str:
 
 
 # ── TCC subject: the process macOS files the grant under ─────────────────────
-# macOS attributes a TCC request to the RESPONSIBLE process — normally the app that launched the
-# requesting process (libquarantine's ``responsibility_get_pid_responsible_for_pid``), and the
-# requester itself only when nothing above it holds responsibility (launchd, sshd, a plain CLI
-# run). The fleet's bridges are spawned by the Electron app, so their Screen Recording /
-# Accessibility grants are filed under the app: TCC.db on the canary box carries
-# kTCCServiceScreenCapture + kTCCServiceAccessibility rows for com.lucaryin.lucaryin-ai (Developer
-# ID csreq) and NO python3.12 row, and System Settings lists "Lucaryin AI" (canary.6 verification
-# sweep, 2026-09-14). The interpreter image name — "python3.12" for the fleet's python-build-
-# standalone binary, "Python" on a framework build — is right only for a worker with no app above
-# it, the shape the canary.5 field report came from (screencapture run from a terminal tool).
-# Naming the interpreter while under the app sent the user to an entry that does not exist, so
-# the subject is computed at runtime from whichever process TCC will actually file it under.
+# macOS attributes a TCC request to the RESPONSIBLE process (libquarantine's
+# ``responsibility_get_pid_responsible_for_pid``). Responsibility is held by whatever launchd
+# started and is inherited by its children — an app (the Electron app for the fleet's bridges;
+# Terminal.app for the shells it runs), a LaunchAgent's wrapper script (``bash``), an SSH session
+# (``sshd-keygen-wrapper``, the well-known Full Disk Access entry) — and the requester itself only
+# when launchd started it directly, or when the lookup fails. The fleet's bridges are spawned by
+# the Electron app, so their Screen Recording / Accessibility grants are filed under the app:
+# TCC.db on the canary box carries kTCCServiceScreenCapture + kTCCServiceAccessibility rows for
+# com.lucaryin.lucaryin-ai (Developer ID csreq) and NO python3.12 row, and System Settings lists
+# "Lucaryin AI" (canary.6 verification sweep, 2026-09-14). The interpreter image name —
+# "python3.12" for the fleet's python-build-standalone binary, "Python" on a framework build — is
+# right only for a worker nothing else is responsible for. Naming the interpreter while under the
+# app sent the user to an entry that does not exist, so the subject is computed at runtime from
+# whichever process TCC will actually file it under — and a responsible process that is not an
+# app is still named, by its binary, rather than falling back to the interpreter.
 
 def _responsible_pid(pid: int) -> int:
     """The pid macOS holds responsible for ``pid`` — libquarantine's
@@ -188,29 +191,62 @@ def _bundle_info(bundle_dir: str) -> dict:
         return {}
 
 
+def _bundle_display_name(bundle_dir: str) -> str:
+    """The name LaunchServices shows for an app bundle on disk — the label System Settings puts on
+    its TCC entry — via ``NSFileManager.displayNameAtPath_`` (pyobjc, darwin). "" when pyobjc is
+    absent, off darwin, when the bundle is not on disk (the API then merely echoes the path
+    component, ".app" and all) or on any failure. A trailing ".app" (Finder set to show every
+    extension) is dropped: the Privacy & Security pane never shows one."""
+    if sys.platform != "darwin" or not os.path.isdir(bundle_dir):
+        return ""
+    mods = _pyobjc()
+    if not mods:
+        return ""
+    _, AppKit = mods
+    try:
+        name = str(AppKit.NSFileManager.defaultManager().displayNameAtPath_(bundle_dir) or "").strip()
+    except Exception:
+        return ""
+    if name.lower().endswith(".app"):
+        name = name[:-len(".app")].strip()
+    return name
+
+
 def _tcc_subject_for(own_pid: int, responsible_pid: int, responsible_path: str,
-                     image_path: str, bundle_info=None) -> dict:
+                     image_path: str, bundle_info=None, display_name=None) -> dict:
     """Pure mapping (unit-tested without macOS): the System Settings entry a TCC grant for this
     worker lands on — ``{"process", "subject_kind", "bundle_id"}``.
 
     * ``responsible_pid`` is another process whose executable sits inside an app bundle
-      (``…/Lucaryin AI.app/Contents/MacOS/Lucaryin AI``) → kind "app": the bundle's display name
-      (Info.plist ``CFBundleDisplayName``, else ``CFBundleName``, else the ``.app`` folder name)
-      plus its ``CFBundleIdentifier`` when the plist is readable.
-    * otherwise → kind "interpreter": named exactly as before from the worker's own executable
-      image (``_tcc_process_name_for_path``) — ``python3.12`` for the fleet's python-build-
-      standalone binary, ``Python`` for a framework build, ``python`` when nothing is known."""
+      (``…/Lucaryin AI.app/Contents/MacOS/Lucaryin AI``) → kind "app": the bundle's LaunchServices
+      display name (``_bundle_display_name`` — the label the pane shows), else Info.plist
+      ``CFBundleDisplayName``, else the ``.app`` folder name — never ``CFBundleName`` (on a dev Mac
+      claude.app carries CFBundleName "Claude Code" while the pane shows "claude") — plus its
+      ``CFBundleIdentifier`` when the plist is readable.
+    * ``responsible_pid`` is another process whose executable is NOT inside an app bundle — a
+      LaunchAgent's wrapper script (``/bin/bash`` → python), an SSH session
+      (``/usr/libexec/sshd-keygen-wrapper``) — → kind "process": that binary's file name. The
+      grant is filed under it all the same; naming the interpreter instead would point at an
+      entry that does not exist.
+    * otherwise (this process is responsible for itself, or the lookup failed) → kind
+      "interpreter": named exactly as before from the worker's own executable image
+      (``_tcc_process_name_for_path``) — ``python3.12`` for the fleet's python-build-standalone
+      binary, ``Python`` for a framework build, ``python`` when nothing is known."""
     read_info = bundle_info if bundle_info is not None else _bundle_info
+    read_display = display_name if display_name is not None else _bundle_display_name
     if responsible_pid > 0 and responsible_pid != own_pid and responsible_path:
         m = _APP_BUNDLE_DIR.match(responsible_path)
         if m:
             bundle_dir = m.group(1)
             info = read_info(bundle_dir) or {}
-            name = (str(info.get("CFBundleDisplayName") or "").strip()
-                    or str(info.get("CFBundleName") or "").strip()
+            name = (str(read_display(bundle_dir) or "").strip()
+                    or str(info.get("CFBundleDisplayName") or "").strip()
                     or os.path.basename(bundle_dir)[:-len(".app")])
             bundle_id = str(info.get("CFBundleIdentifier") or "").strip() or None
             return {"process": name, "subject_kind": "app", "bundle_id": bundle_id}
+        name = os.path.basename(responsible_path.rstrip("/"))
+        if name:
+            return {"process": name, "subject_kind": "process", "bundle_id": None}
     return {"process": _tcc_process_name_for_path(image_path), "subject_kind": "interpreter",
             "bundle_id": None}
 
@@ -218,16 +254,12 @@ def _tcc_subject_for(own_pid: int, responsible_pid: int, responsible_path: str,
 def _tcc_subject() -> dict:
     """``_tcc_subject_for`` fed by the live lookups. Every lookup is guarded and each is a module
     attribute (``_responsible_pid`` / ``_pid_executable_path`` / ``_executable_image_path`` /
-    ``_bundle_info``) so tests pin them instead of calling libquarantine."""
+    ``_bundle_info`` / ``_bundle_display_name``) so tests pin them instead of calling
+    libquarantine, libproc or AppKit."""
     own = os.getpid()
     responsible = _responsible_pid(own)
     responsible_path = _pid_executable_path(responsible) if responsible and responsible != own else ""
     return _tcc_subject_for(own, responsible, responsible_path, _executable_image_path())
-
-
-def _agent_process_name() -> str:
-    """The name System Settings lists this worker's TCC grant under (see ``_tcc_subject``)."""
-    return _tcc_subject()["process"]
 
 
 def _tcc_help(permission: str, pane: str, subject: Optional[dict] = None) -> str:
@@ -238,6 +270,9 @@ def _tcc_help(permission: str, pane: str, subject: Optional[dict] = None) -> str
     if subject.get("subject_kind") == "app":
         filed = (f"macOS files this permission under the app that launched the worker, so it "
                  f"appears as \"{proc}\"")
+    elif subject.get("subject_kind") == "process":
+        filed = (f"macOS files this permission under the process that launched the worker, the "
+                 f"\"{proc}\" binary, so it appears as \"{proc}\" (not \"Lucaryin\")")
     else:
         filed = (f"macOS files this permission under the Python binary running the agent (no app "
                  f"launched this worker), so it appears as \"{proc}\" (not \"Lucaryin\")")
@@ -470,6 +505,9 @@ def desktop_list_apps(task_id: str = "", **_) -> dict:
     proc = permissions.get("process") or "python"
     if permissions.get("subject_kind") == "app":
         listed = f"file this agent worker's grant under the app that launched it, \"{proc}\""
+    elif permissions.get("subject_kind") == "process":
+        listed = (f"file this agent worker's grant under the process that launched it, the "
+                  f"\"{proc}\" binary")
     else:
         listed = f"list this agent worker as \"{proc}\" (the Python binary — no app launched it)"
     permissions["grant_under"] = (

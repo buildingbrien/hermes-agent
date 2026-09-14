@@ -305,14 +305,18 @@ jobs:
       - name: Darwin-lane tests
         # The addon tests (their DARWIN_ONLY cases run for real here) plus
         # upstream's macOS protected-folder search test, which patch 0020
-        # rewrites around. `-p no:cacheprovider` keeps .pytest_cache out of
-        # the materialized tree.
+        # rewrites around. test_desktop_use_addon.py's darwin-only cases
+        # (libquarantine responsible pid, libproc proc_pidpath, dyld image
+        # path, NSFileManager display name) execute ONLY here — the Linux
+        # addon job skips them. `-p no:cacheprovider` keeps .pytest_cache
+        # out of the materialized tree.
         working-directory: build/runtime
         run: |
           python -m pytest \
             tests/tools/test_search_fallback_bounds.py \
             tests/tools/test_read_extract_not_found_rescue.py \
             tests/tools/test_macos_protected_search.py \
+            tests/tools/test_desktop_use_addon.py \
             -q -p no:cacheprovider
 
   # ── Pre-rebase root tree (does NOT ship) ───────────────────────────────────
