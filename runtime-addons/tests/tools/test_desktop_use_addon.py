@@ -11,6 +11,10 @@ and honest TCC errors. Canary.5 soak, 2026-09-14:
 2. The permission error said Screen Recording "is off for Lucaryin", but macOS files the grant
    under the Python binary running the agent worker — the box's prompt said "python3.12 is
    requesting to access…" and the System Settings entry is "python3.12", not "Lucaryin".
+   Review fix-up: the name comes from the kernel's executable image (dyld
+   ``_NSGetExecutablePath``, resolved), not ``sys.executable`` — on Homebrew / python.org
+   framework builds ``bin/python3.13`` is a launcher that execs ``Python.app/Contents/MacOS/Python``
+   and System Settings lists the bundle, "Python".
 
 Bare tier: no pyobjc, no macOS — everything platform-specific is monkeypatched so this runs on
 the Linux CI lane too.
@@ -100,10 +104,19 @@ class TestToolDefinitions:
 
 # ── Fix 3: honest TCC errors ─────────────────────────────────────────────────
 
+HOMEBREW_FRAMEWORK_IMAGE = ("/opt/homebrew/Cellar/python@3.13/3.13.15/Frameworks/Python.framework/"
+                            "Versions/3.13/Resources/Python.app/Contents/MacOS/Python")
+PYTHON_ORG_FRAMEWORK_IMAGE = ("/Library/Frameworks/Python.framework/Versions/3.13/Resources/"
+                              "Python.app/Contents/MacOS/Python")
+STANDALONE_IMAGE = "/Users/someone/.lucaryin/python/python/bin/python3.12"
+
+
 @pytest.fixture
 def worker_binary(tmp_path, monkeypatch):
-    """A venv-style ``bin/python`` symlink to a ``python3.12`` binary, like
-    ``~/.lucaryin/venvs/hermes/bin/python -> ~/.lucaryin/python/python/bin/python3.12``."""
+    """The fleet shape: a venv-style ``bin/python`` symlink to a real ``python3.12`` Mach-O, like
+    ``~/.lucaryin/venvs/hermes/bin/python -> ~/.lucaryin/python/python/bin/python3.12``. dyld reports
+    the path AS EXEC'D — the symlink (verified on macOS: ``_NSGetExecutablePath`` does not resolve
+    it) — so the kernel path is the symlink here and the name must come from its target."""
     real = tmp_path / "python" / "bin" / "python3.12"
     real.parent.mkdir(parents=True)
     real.write_text("#!/bin/sh\n")
@@ -111,6 +124,7 @@ def worker_binary(tmp_path, monkeypatch):
     link.parent.mkdir(parents=True)
     os.symlink(real, link)
     monkeypatch.setattr(sys, "executable", str(link))
+    monkeypatch.setattr(du, "_kernel_image_path", lambda: str(link))
     return "python3.12"
 
 
@@ -125,14 +139,62 @@ def ready_app(monkeypatch):
     return calls
 
 
-class TestTccErrors:
+class TestProcessName:
     def test_process_name_is_the_resolved_interpreter_binary(self, worker_binary):
         assert du._agent_process_name() == worker_binary
 
+    def test_kernel_image_wins_over_sys_executable_on_framework_builds(self, monkeypatch):
+        """Homebrew / python.org: ``bin/python3.13`` is a launcher that execs
+        ``Python.app/Contents/MacOS/Python``; ``sys.executable`` is rewritten to the launcher while
+        the kernel holds the bundle image — the one TCC lists, as "Python"."""
+        monkeypatch.setattr(sys, "executable", "/opt/homebrew/opt/python@3.13/bin/python3.13")
+        monkeypatch.setattr(du, "_kernel_image_path", lambda: HOMEBREW_FRAMEWORK_IMAGE)
+        assert du._agent_process_name() == "Python"
+
+    def test_falls_back_to_sys_executable_without_a_kernel_path(self, tmp_path, monkeypatch):
+        """Off darwin / dyld failure: ``realpath(sys.executable)`` as before."""
+        real = tmp_path / "python" / "bin" / "python3.12"
+        real.parent.mkdir(parents=True)
+        real.write_text("#!/bin/sh\n")
+        link = tmp_path / "venv" / "bin" / "python"
+        link.parent.mkdir(parents=True)
+        os.symlink(real, link)
+        monkeypatch.setattr(du, "_kernel_image_path", lambda: "")
+        monkeypatch.setattr(sys, "executable", str(link))
+        assert du._agent_process_name() == "python3.12"
+
     def test_process_name_falls_back_to_python(self, monkeypatch):
+        monkeypatch.setattr(du, "_kernel_image_path", lambda: "")
         monkeypatch.setattr(sys, "executable", "")
         assert du._agent_process_name() == "python"
 
+    @pytest.mark.parametrize("path, expected", [
+        (HOMEBREW_FRAMEWORK_IMAGE, "Python"),
+        (PYTHON_ORG_FRAMEWORK_IMAGE, "Python"),
+        (STANDALONE_IMAGE, "python3.12"),
+        ("/Applications/Outer.app/Contents/MacOS/Inner.app/Contents/MacOS/Inner", "Inner"),
+        ("/Applications/Xcode.app/Contents/Developer/usr/bin/python3", "python3"),
+        ("", "python"),
+    ])
+    def test_tcc_name_mapping_is_the_bundle_or_the_file_name(self, path, expected):
+        """Pure mapping, no ctypes: an executable inside an app bundle is listed as the (innermost)
+        bundle; a bare Mach-O by file name; a path under an .app that is NOT its Contents/MacOS
+        executable is not a bundle executable."""
+        assert du._tcc_process_name_for_path(path) == expected
+
+    def test_kernel_image_path_is_empty_off_darwin(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert du._kernel_image_path() == ""
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="dyld _NSGetExecutablePath is macOS-only")
+    def test_kernel_image_path_is_this_interpreter_on_darwin(self):
+        path = du._kernel_image_path()
+        assert os.path.isabs(path) and os.path.exists(path)
+        assert du._executable_image_path() == os.path.realpath(path)
+        assert du._agent_process_name() == du._tcc_process_name_for_path(os.path.realpath(path))
+
+
+class TestTccErrors:
     def test_screen_recording_error_names_the_binary_pane_and_recovery(self, worker_binary, ready_app, monkeypatch):
         monkeypatch.setattr(du, "_tcc_status", lambda: {
             "pyobjc": True, "screen_recording": False, "accessibility": True})
@@ -175,17 +237,17 @@ class TestTccErrors:
         fake.AXIsProcessTrusted = lambda: (_ for _ in ()).throw(AssertionError("prompting API exists"))
         monkeypatch.setitem(sys.modules, "ApplicationServices", fake)
         monkeypatch.setattr(du, "_TCC_PROMPTED", set())
-        du._request_accessibility()
-        du._request_accessibility()
+        assert du._request_accessibility() is False  # the trust answer is returned, not discarded
+        assert du._request_accessibility() is None   # already asked this process: no call, no answer
         assert seen == [{"AXTrustedCheckOptionPrompt": True}]
 
     def test_accessibility_prompt_falls_back_to_non_prompting_check(self, monkeypatch):
         seen = []
         fake = types.ModuleType("ApplicationServices")  # no *WithOptions, no option constant
-        fake.AXIsProcessTrusted = lambda: seen.append("plain") or False
+        fake.AXIsProcessTrusted = lambda: seen.append("plain") or True
         monkeypatch.setitem(sys.modules, "ApplicationServices", fake)
         monkeypatch.setattr(du, "_TCC_PROMPTED", set())
-        du._request_accessibility()
+        assert du._request_accessibility() is True  # the fallback's answer is returned too
         assert seen == ["plain"]
 
     def test_prompt_helpers_never_raise_without_pyobjc(self, monkeypatch):
@@ -193,13 +255,16 @@ class TestTccErrors:
         monkeypatch.setitem(sys.modules, "ApplicationServices", None)  # import fails
         monkeypatch.setattr(du, "_TCC_PROMPTED", set())
         du._request_screen_recording()
-        du._request_accessibility()
+        assert du._request_accessibility() is None
 
-    def test_list_apps_permissions_name_the_process_to_enable(self, worker_binary, monkeypatch):
+    def test_list_apps_permissions_name_the_process_to_enable(self, monkeypatch):
+        """``permissions`` is ``_tcc_status()`` (which carries "process") plus the grant_under line —
+        the process name is not re-derived here."""
         monkeypatch.setattr(du, "_pyobjc", lambda: (object(), object()))
         monkeypatch.setattr(du, "_allowlist", lambda: ["TextEdit", "Quicken"])
         monkeypatch.setattr(du, "_tcc_status", lambda: {
-            "pyobjc": True, "screen_recording": False, "accessibility": None})
+            "pyobjc": True, "screen_recording": False, "accessibility": None, "process": "python3.12"})
+        monkeypatch.setattr(du, "_agent_process_name", lambda: "not-the-source")
         out = du.desktop_list_apps()
         assert out["ok"] is True
         assert out["operable_apps"] == ["TextEdit"]  # financial app filtered

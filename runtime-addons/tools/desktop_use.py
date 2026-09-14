@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -60,20 +61,68 @@ def _pyobjc():
         return None
 
 
-def _agent_process_name() -> str:
-    """The name macOS files the TCC grant under: the REAL interpreter binary running this
-    agent worker. TCC attributes Screen Recording / Accessibility to the executable, not to
-    the app that spawned it — ``sys.executable`` is the venv symlink
-    (``~/.lucaryin/venvs/hermes/bin/python``) but the entry in System Settings, and the
-    "… is requesting to access …" prompt, carry the symlink's target (``python3.12`` on the
-    canary boxes), never "Lucaryin". Telling the user to look for "Lucaryin" sent them to an
-    entry that does not exist (canary.5 soak, 2026-09-14)."""
-    exe = sys.executable or ""
+def _kernel_image_path() -> str:
+    """The executable image path the kernel holds for this process, from dyld's
+    ``_NSGetExecutablePath`` (darwin only); "" on any failure or off darwin.
+
+    ``sys.executable`` is not that path on framework builds: Homebrew's / python.org's
+    ``bin/python3.13`` is a small launcher that execs ``…/Python.framework/Versions/3.13/Resources/
+    Python.app/Contents/MacOS/Python`` — the image macOS attributes the TCC grant to (System Settings
+    lists the bundle, "Python") — while ``sys.executable`` is rewritten to the launcher. dyld
+    reports the path as exec'd, which may itself be a symlink (the venv's ``bin/python``), so the
+    caller resolves it."""
+    if sys.platform != "darwin":
+        return ""
     try:
-        name = os.path.basename(os.path.realpath(exe)) if exe else ""
+        import ctypes  # noqa: WPS433
+        buf = ctypes.create_string_buffer(4096)
+        size = ctypes.c_uint32(len(buf))
+        if ctypes.CDLL(None)._NSGetExecutablePath(buf, ctypes.byref(size)) != 0:
+            return ""
+        return buf.value.decode("utf-8", "surrogateescape")
     except Exception:
-        name = ""
-    return name or "python"
+        return ""
+
+
+def _executable_image_path() -> str:
+    """Resolved path of the binary running this worker — what macOS files the TCC grant under: the
+    kernel's image path (``_kernel_image_path``), else ``sys.executable``, either followed through
+    symlinks (the fleet's ``~/.lucaryin/venvs/hermes/bin/python`` → ``…/python/bin/python3.12``, a
+    real Mach-O). "" when nothing is known."""
+    for candidate in (_kernel_image_path(), sys.executable or ""):
+        if not candidate:
+            continue
+        try:
+            return os.path.realpath(candidate)
+        except Exception:
+            continue
+    return ""
+
+
+_APP_BUNDLE_EXECUTABLE = re.compile(r"([^/]+)\.app/Contents/MacOS/")
+
+
+def _tcc_process_name_for_path(path: str) -> str:
+    """The name System Settings → Privacy & Security lists a TCC grant under, from the executable
+    image path. Pure string mapping (unit-tested with both shapes): an executable inside an app
+    bundle is listed as the bundle — ``…/Python.app/Contents/MacOS/Python`` → ``Python`` (Homebrew
+    and python.org framework builds; the innermost bundle when nested) — and a bare Mach-O by file
+    name — ``…/python/bin/python3.12`` → ``python3.12`` (the fleet's python-build-standalone
+    interpreter). "python" when the path is unknown."""
+    bundles = _APP_BUNDLE_EXECUTABLE.findall(path or "")
+    if bundles:
+        return bundles[-1]
+    return os.path.basename(path or "") or "python"
+
+
+def _agent_process_name() -> str:
+    """The name macOS files the TCC grant under: the REAL binary running this agent worker. TCC
+    attributes Screen Recording / Accessibility to the executable image, not to the app that
+    spawned it, so the entry in System Settings, and the "… is requesting to access …" prompt,
+    carry ``python3.12`` on the canary boxes (the venv symlink's target) or ``Python`` on a
+    framework build — never "Lucaryin". Telling the user to look for "Lucaryin" sent them to an
+    entry that does not exist (canary.5 soak, 2026-09-14)."""
+    return _tcc_process_name_for_path(_executable_image_path())
 
 
 def _tcc_help(permission: str, pane: str) -> str:
@@ -110,24 +159,25 @@ def _request_screen_recording() -> None:
         pass
 
 
-def _request_accessibility() -> None:
+def _request_accessibility() -> Optional[bool]:
     """Ask macOS for Accessibility once via ``AXIsProcessTrustedWithOptions`` with the prompt
     option (creates the Settings entry + prompt); falls back to the non-prompting
-    ``AXIsProcessTrusted`` when the option is unavailable. Never raises."""
+    ``AXIsProcessTrusted`` when the option is unavailable. Returns the trust answer of the call it
+    made, None when it made none (already asked this process / no ApplicationServices). Never raises."""
     if "accessibility" in _TCC_PROMPTED:
-        return
+        return None
     _TCC_PROMPTED.add("accessibility")
     try:
         import ApplicationServices as AS  # noqa: WPS433
     except Exception:
-        return
+        return None
     try:
-        AS.AXIsProcessTrustedWithOptions({AS.kAXTrustedCheckOptionPrompt: True})
+        return bool(AS.AXIsProcessTrustedWithOptions({AS.kAXTrustedCheckOptionPrompt: True}))
     except Exception:
         try:
-            AS.AXIsProcessTrusted()
+            return bool(AS.AXIsProcessTrusted())
         except Exception:
-            pass
+            return None
 
 
 def _tcc_status() -> dict:
@@ -304,9 +354,7 @@ def desktop_list_apps(task_id: str = "", **_) -> dict:
     if not _pyobjc():
         return _err("Desktop control isn't provisioned on this machine yet (pyobjc missing).")
     allowed = [a for a in _allowlist() if not _is_financial(a)]
-    permissions = dict(_tcc_status())
-    # The entry the user must flip is the worker binary, not "Lucaryin" (see _agent_process_name).
-    permissions["process"] = _agent_process_name()
+    permissions = dict(_tcc_status())  # carries "process": the worker binary the grant is filed under
     permissions["grant_under"] = (
         f"System Settings → Privacy & Security → Screen Recording / Accessibility list this agent "
         f"worker as \"{permissions['process']}\"; enable that entry, retry, and relaunch Lucaryin if "

@@ -33,7 +33,7 @@
  
  # Platforms supporting a cron/notification home target -> env var used by gateway config.
  _HOME_TARGET_ENV_VARS = {
-@@ -91,6 +103,108 @@ def _resolve_origin(job: dict) -> Optional[dict]:
+@@ -91,6 +103,128 @@ def _resolve_origin(job: dict) -> Optional[dict]:
      return None
  
  
@@ -51,6 +51,19 @@
 +    return target
 +
 +
++def _lucaryin_store_path() -> Optional[Any]:
++    """Lucaryin fold (patch 0023): the ``SessionDB`` default state.db path (a ``pathlib.Path``) when
++    the store exists on this host, else None. Resolved WITHOUT opening a ``SessionDB`` — that would
++    create an empty state.db on a plain hermes-agent host — and shared by the read-only session
++    lookup and the delivery write so neither can conjure a store."""
++    try:
++        from hermes_state import _default_db_path
++        db_path = _default_db_path()
++    except Exception:  # noqa: BLE001 — no store here; not a Lucaryin host
++        return None
++    return db_path if os.path.exists(db_path) else None
++
++
 +def _latest_lucaryin_session() -> str:
 +    """Lucaryin fold (patch 0023): the conversation a human is actually reading on this host, or "".
 +
@@ -61,16 +74,17 @@
 +    open. A conversation with real accumulated history is the signal — hence the message-count
 +    floor, with recency only breaking ties among genuine threads.
 +
++    Recency is the latest HUMAN message (``role = 'user'``), not the latest row: cron's own
++    deliveries land as assistant messages, so ranking by any message would keep an origin-less
++    heartbeat on whichever thread it last wrote to until the human posted elsewhere.
++
 +    Reads the store read-only at the ``SessionDB`` default path without opening a ``SessionDB``
-+    (which would create an empty state.db on a plain hermes-agent host). "" when there is no
-+    store or no such session, which lets the callers fall through / resolve nothing.
++    (which would create an empty state.db on a plain hermes-agent host; see
++    _lucaryin_store_path). "" when there is no store or no such session, which lets the callers
++    fall through / resolve nothing.
 +    """
-+    try:
-+        from hermes_state import _default_db_path
-+        db_path = _default_db_path()
-+    except Exception:  # noqa: BLE001 — no store here; not a Lucaryin host
-+        return ""
-+    if not os.path.exists(db_path):
++    db_path = _lucaryin_store_path()
++    if db_path is None:
 +        return ""
 +    try:
 +        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
@@ -81,7 +95,7 @@
 +            "SELECT s.id FROM sessions s "
 +            "WHERE s.source IN ('web','mobile') AND s.message_count >= 20 "
 +            "ORDER BY (SELECT max(m.timestamp) FROM messages m "
-+            "          WHERE m.session_id = s.id) DESC "
++            "          WHERE m.session_id = s.id AND m.role = 'user') DESC "
 +            "LIMIT 1"
 +        ).fetchone()
 +    except Exception:  # noqa: BLE001 — older schema, no sessions table
@@ -100,7 +114,8 @@
 +    ~/.hermes/state.db. So the run output is appended as an assistant message on that session;
 +    the desktop app shows it when the thread reloads. A session id that is not in the store is an
 +    error (the conversation was deleted, or a hand-edited job): failing loudly beats delivering
-+    to nobody with last_status "ok".
++    to nobody with last_status "ok". A host with no store at all is the same error, decided before
++    a writable ``SessionDB`` is opened (opening one would create an empty state.db).
 +
 +    Mobile is a second surface: it only mirrors state.db via hub_sync, and the node's hub_sync
 +    poller is not always running (a chat turn triggers a fast-flush, but a cron run has no turn).
@@ -113,6 +128,11 @@
 +    session_id = str(session_id or "").strip()
 +    if not session_id:
 +        return "lucaryin delivery has no session id (origin chat_id missing)"
++    if _lucaryin_store_path() is None:
++        logger.warning(
++            "Job '%s': lucaryin delivery target session %s: no state.db on this host",
++            job_id, session_id)
++        return f"lucaryin delivery target session {session_id} not found: no state.db on this host"
 +    try:
 +        from hermes_state import SessionDB
 +        with SessionDB() as db:
@@ -142,7 +162,7 @@
  def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
      """Whether a cron delivery is also mirrored into the target chat's session transcript.
  
-@@ -584,11 +698,34 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
+@@ -584,11 +718,34 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                      job.get("name", job.get("id", "?")), platform_name)
                  # Stands in for the primary conversation (NOT a broadcast): mirror-eligible.
                  return _home_target(platform_name, chat_id, "origin_fallback")
@@ -177,7 +197,7 @@
          from tools.send_message_tool import prepare_send_message_platforms, resolve_send_target
          prepare_send_message_platforms()
          # pass_unresolved_references: no model in the loop to react; an unknown-to-directory target
-@@ -626,6 +763,11 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
+@@ -626,6 +783,11 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
          }
      if not _is_known_delivery_platform(platform_name):
          return None
@@ -189,7 +209,7 @@
      chat_id = _get_home_target_chat_id(platform_name)
      return _home_target(platform_name, chat_id) if chat_id else None
  
-@@ -1685,6 +1827,17 @@ def _deliver_result(
+@@ -1685,6 +1847,17 @@ def _deliver_result(
                  delivery_errors.append(bot_chat_error)
              continue
  

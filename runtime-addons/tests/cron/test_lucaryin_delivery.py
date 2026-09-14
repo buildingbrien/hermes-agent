@@ -15,6 +15,9 @@ a state.db write. Patch 0023 ports the old fork's lane: the platform is known, `
 without an origin and bare ``deliver=lucaryin`` fall back to the conversation a human is
 actually reading, ``lucaryin:<session_id>`` is taken verbatim, and ``_deliver_result`` appends
 the wrapped output to the session (plus the mobile hub-flush hint) before any adapter work.
+Review fix-up: the fallback ranks threads by the latest HUMAN message (cron's own assistant writes
+are not activity), and a host with no state.db gets the not-found error without a store being
+created.
 
 Bare tier: stdlib + the runtime, a real ``SessionDB`` in the hermetic per-test HERMES_HOME.
 """
@@ -126,6 +129,28 @@ class TestResolution:
             "platform": "lucaryin", "chat_id": human_sessions["new"], "thread_id": None,
             "_resolved_from": "origin_fallback"}]
 
+    def test_fallback_follows_the_latest_human_message_not_crons_own_writes(self, human_sessions):
+        """Cron deliveries are assistant messages. Counting them as activity would pin an origin-less
+        heartbeat to whichever thread it last wrote to until the human posted elsewhere."""
+        now = time.time()
+        with SessionDB() as db:
+            for i in range(3):  # three deliveries into the OLD thread, all newer than any human message
+                db.append_message(session_id=human_sessions["old"], role="assistant",
+                                  content=f"Cronjob Response: heartbeat_default #{i}", timestamp=now + 60 + i)
+            # A busy thread with no human message at all never wins either.
+            db.create_session("20260914_120000_botonly", "web")
+            for i in range(25):
+                db.append_message(session_id="20260914_120000_botonly", role="assistant",
+                                  content=f"bot #{i}", timestamp=now + 90 + i)
+        assert _latest_lucaryin_session() == human_sessions["new"]
+        targets = _resolve_delivery_targets(_job(deliver="origin", origin=None))
+        assert [t["chat_id"] for t in targets] == [human_sessions["new"]]
+        # The human replying on the older thread (later than anything on the newer one) moves it there.
+        with SessionDB() as db:
+            db.append_message(session_id=human_sessions["old"], role="user", content="back here",
+                              timestamp=now + 200)
+        assert _latest_lucaryin_session() == human_sessions["old"]
+
     def test_origin_without_origin_resolves_nothing_when_no_human_session_exists(self):
         assert _latest_lucaryin_session() == ""  # no state.db at all
         assert _resolve_delivery_targets(_job(deliver="origin", origin=None)) == []
@@ -229,6 +254,16 @@ class TestDeliverResult:
         assert _deliver_result(_job(deliver="origin", origin=None), "heartbeat findings") is None
         assert "heartbeat findings" in _messages(human_sessions["new"])[-1]["content"]
         assert len(_messages(human_sessions["old"])) == 25
+
+    def test_explicit_session_on_a_host_with_no_store_is_an_error_and_creates_no_store(self):
+        """``lucaryin:<sid>`` never touches state.db to resolve, so on a host with no store the write
+        must decide "not found" BEFORE opening a writable SessionDB (which would create an empty one)."""
+        home = get_hermes_home()
+        assert not (home / "state.db").exists()
+        err = _deliver_result(_job(deliver="lucaryin:20260914_101010_ab12cd"), "x")
+        assert err and "20260914_101010_ab12cd" in err and "not found" in err and "no state.db" in err
+        assert not (home / "state.db").exists()
+        assert not (home / "cron" / ".pending_hub_flush").exists()
 
     def test_unknown_session_id_is_a_delivery_error_not_a_ghost_write(self, human_sessions):
         err = _deliver_result(_job(deliver="lucaryin:20260101_000000_deleted"), "x")
