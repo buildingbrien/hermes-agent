@@ -51,7 +51,7 @@ jobs:
   # package either.
   #
   # On top of that product set, the Linux lane adds the extras upstream's own
-  # CI installs (`all`, `dev`, and the lazy-install SDKs: anthropic, mistral,
+  # CI installs (`all`, `dev`, and the lazy-install SDKs: anthropic,
   # fal, modal, daytona, hindsight, parallel-web). They are test-only:
   # tests/conftest.py sets HERMES_DISABLE_LAZY_INSTALLS=1, so an upstream test
   # that exercises e.g. the Anthropic aux client or the Daytona backend needs
@@ -122,7 +122,7 @@ jobs:
       - name: Install runtime dependencies (product set + upstream's test extras)
         run: |
           python - build/runtime/pyproject.toml \
-              dev all anthropic mistral fal modal daytona hindsight parallel-web \
+              dev all anthropic fal modal daytona hindsight parallel-web \
               > "$RUNNER_TEMP/runtime-deps.txt" <<'EOF'
           import sys, tomllib
           project = tomllib.load(open(sys.argv[1], "rb"))["project"]
