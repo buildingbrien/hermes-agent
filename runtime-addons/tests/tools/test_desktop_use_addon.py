@@ -15,9 +15,26 @@ and honest TCC errors. Canary.5 soak, 2026-09-14:
    ``_NSGetExecutablePath``, resolved), not ``sys.executable`` — on Homebrew / python.org
    framework builds ``bin/python3.13`` is a launcher that execs ``Python.app/Contents/MacOS/Python``
    and System Settings lists the bundle, "Python".
+3. canary.6 verification sweep (2026-09-14): item 2 is right only for a worker with NO app above
+   it. macOS files a TCC grant under the RESPONSIBLE process, and the fleet's bridges are spawned
+   by the Electron app — TCC.db on the canary box carries kTCCServiceScreenCapture +
+   kTCCServiceAccessibility rows for com.lucaryin.lucaryin-ai and no python3.12 row; System
+   Settings lists "Lucaryin AI" — so the "python3.12" hint pointed at an entry that does not
+   exist. The subject is now resolved at runtime (libquarantine responsible pid → that process's
+   image → its .app bundle's display name) with the interpreter image kept for a worker nothing
+   else is responsible for.
+4. Review fix-up: responsibility is held by whatever launchd started and inherited by its
+   children, so a responsible process that is NOT an .app is named too — a LaunchAgent's wrapper
+   script (``bash``), an SSH session (``sshd-keygen-wrapper``) — as subject_kind "process";
+   falling back to the interpreter there pointed at an entry that does not exist. The interpreter
+   is right only when this process is responsible for itself (launchd started it directly) or the
+   lookup failed. Terminal.app is the responsible process for its shell children, so a
+   terminal-launched worker is filed under "Terminal" (kind "app"). App names come from
+   LaunchServices (``NSFileManager.displayNameAtPath_``, the label the pane shows) first, then
+   CFBundleDisplayName, then the .app folder name; CFBundleName is never consulted.
 
 Bare tier: no pyobjc, no macOS — everything platform-specific is monkeypatched so this runs on
-the Linux CI lane too.
+the Linux CI lane too; the darwin-only cases run for real on the ``runtime-tests-macos`` lane.
 """
 
 import importlib
@@ -109,6 +126,46 @@ HOMEBREW_FRAMEWORK_IMAGE = ("/opt/homebrew/Cellar/python@3.13/3.13.15/Frameworks
 PYTHON_ORG_FRAMEWORK_IMAGE = ("/Library/Frameworks/Python.framework/Versions/3.13/Resources/"
                               "Python.app/Contents/MacOS/Python")
 STANDALONE_IMAGE = "/Users/someone/.lucaryin/python/python/bin/python3.12"
+LUCARYIN_APP_EXECUTABLE = "/Applications/Lucaryin AI.app/Contents/MacOS/Lucaryin AI"
+
+# The live lookups, captured before any test pins them (the off-darwin / darwin-only tests
+# exercise these directly).
+_LIVE_RESPONSIBLE_PID = du._responsible_pid
+_LIVE_PID_EXECUTABLE_PATH = du._pid_executable_path
+_LIVE_BUNDLE_DISPLAY_NAME = du._bundle_display_name
+
+
+@pytest.fixture(autouse=True)
+def nothing_above_this_process(monkeypatch):
+    """Bare tier: pin the responsibility lookups to "no process above this one" so every test
+    derives the TCC subject from the pinned image path, and the LaunchServices display-name
+    lookup to "unavailable" so app names come from the injected plist / folder name. On a
+    developer Mac the real lookups name the app running pytest (Terminal, an IDE) — never the
+    fleet's shape."""
+    monkeypatch.setattr(du, "_responsible_pid", lambda pid: 0)
+    monkeypatch.setattr(du, "_pid_executable_path", lambda pid: "")
+    monkeypatch.setattr(du, "_bundle_display_name", lambda bundle_dir: "")
+
+
+@pytest.fixture
+def app_spawned(monkeypatch):
+    """The fleet shape: the Lucaryin app spawned this worker, so macOS holds the app responsible —
+    pid 4242, image inside the .app bundle, no Info.plist on disk here. Returns the pids whose
+    image was looked up."""
+    seen = []
+    monkeypatch.setattr(du, "_responsible_pid", lambda pid: 4242)
+    monkeypatch.setattr(du, "_pid_executable_path",
+                        lambda pid: seen.append(pid) or LUCARYIN_APP_EXECUTABLE)
+    monkeypatch.setattr(du, "_bundle_info", lambda bundle_dir: {})
+    return seen
+
+
+@pytest.fixture
+def wrapper_spawned(monkeypatch):
+    """A LaunchAgent whose program is a shell script that execs the worker: macOS holds ``bash``
+    responsible — pid 4343, image ``/bin/bash``, no app anywhere above."""
+    monkeypatch.setattr(du, "_responsible_pid", lambda pid: 4343)
+    monkeypatch.setattr(du, "_pid_executable_path", lambda pid: "/bin/bash")
 
 
 @pytest.fixture
@@ -140,8 +197,12 @@ def ready_app(monkeypatch):
 
 
 class TestProcessName:
+    """The interpreter case's name chain (``_kernel_image_path`` → ``_executable_image_path`` →
+    ``_tcc_process_name_for_path``) as ``_tcc_subject`` reaches it while nothing else is
+    responsible for this process (the autouse fixture)."""
+
     def test_process_name_is_the_resolved_interpreter_binary(self, worker_binary):
-        assert du._agent_process_name() == worker_binary
+        assert du._tcc_subject()["process"] == worker_binary
 
     def test_kernel_image_wins_over_sys_executable_on_framework_builds(self, monkeypatch):
         """Homebrew / python.org: ``bin/python3.13`` is a launcher that execs
@@ -149,7 +210,7 @@ class TestProcessName:
         the kernel holds the bundle image — the one TCC lists, as "Python"."""
         monkeypatch.setattr(sys, "executable", "/opt/homebrew/opt/python@3.13/bin/python3.13")
         monkeypatch.setattr(du, "_kernel_image_path", lambda: HOMEBREW_FRAMEWORK_IMAGE)
-        assert du._agent_process_name() == "Python"
+        assert du._tcc_subject()["process"] == "Python"
 
     def test_falls_back_to_sys_executable_without_a_kernel_path(self, tmp_path, monkeypatch):
         """Off darwin / dyld failure: ``realpath(sys.executable)`` as before."""
@@ -161,12 +222,12 @@ class TestProcessName:
         os.symlink(real, link)
         monkeypatch.setattr(du, "_kernel_image_path", lambda: "")
         monkeypatch.setattr(sys, "executable", str(link))
-        assert du._agent_process_name() == "python3.12"
+        assert du._tcc_subject()["process"] == "python3.12"
 
     def test_process_name_falls_back_to_python(self, monkeypatch):
         monkeypatch.setattr(du, "_kernel_image_path", lambda: "")
         monkeypatch.setattr(sys, "executable", "")
-        assert du._agent_process_name() == "python"
+        assert du._tcc_subject()["process"] == "python"
 
     @pytest.mark.parametrize("path, expected", [
         (HOMEBREW_FRAMEWORK_IMAGE, "Python"),
@@ -191,7 +252,209 @@ class TestProcessName:
         path = du._kernel_image_path()
         assert os.path.isabs(path) and os.path.exists(path)
         assert du._executable_image_path() == os.path.realpath(path)
-        assert du._agent_process_name() == du._tcc_process_name_for_path(os.path.realpath(path))
+        assert du._tcc_subject()["process"] == du._tcc_process_name_for_path(os.path.realpath(path))
+
+
+class TestTccSubject:
+    """``_tcc_subject_for`` (pure) and the hook-fed ``_tcc_subject`` — no libquarantine, no
+    libproc, no macOS."""
+
+    def test_app_spawned_worker_is_filed_under_the_app(self):
+        out = du._tcc_subject_for(own_pid=100, responsible_pid=4242,
+                                  responsible_path=LUCARYIN_APP_EXECUTABLE,
+                                  image_path=STANDALONE_IMAGE, bundle_info=lambda d: {})
+        assert out == {"process": "Lucaryin AI", "subject_kind": "app", "bundle_id": None}
+
+    def test_bundle_display_name_and_id_come_from_info_plist(self, tmp_path):
+        """The real plist reader (LaunchServices pinned to "unavailable" by the autouse fixture):
+        CFBundleDisplayName wins, then the folder name — CFBundleName is never consulted; the
+        bundle id rides along when the plist is readable."""
+        import plistlib
+        bundle = tmp_path / "Lucaryin AI.app"
+        (bundle / "Contents" / "MacOS").mkdir(parents=True)
+        exe = str(bundle / "Contents" / "MacOS" / "Lucaryin AI")
+        plist = bundle / "Contents" / "Info.plist"
+        common = {"CFBundleIdentifier": "com.lucaryin.lucaryin-ai", "CFBundleName": "lucaryin-ai"}
+        plist.write_bytes(plistlib.dumps({**common, "CFBundleDisplayName": "Lucaryin AI"}))
+        assert du._tcc_subject_for(100, 4242, exe, STANDALONE_IMAGE) == {
+            "process": "Lucaryin AI", "subject_kind": "app", "bundle_id": "com.lucaryin.lucaryin-ai"}
+        plist.write_bytes(plistlib.dumps(common))  # CFBundleName only → the folder, not "lucaryin-ai"
+        assert du._tcc_subject_for(100, 4242, exe, STANDALONE_IMAGE) == {
+            "process": "Lucaryin AI", "subject_kind": "app", "bundle_id": "com.lucaryin.lucaryin-ai"}
+        plist.write_bytes(b"not a plist")
+        assert du._tcc_subject_for(100, 4242, exe, STANDALONE_IMAGE) == {
+            "process": "Lucaryin AI", "subject_kind": "app", "bundle_id": None}
+
+    CLAUDE_APP_EXECUTABLE = ("/Users/dev/Library/Application Support/Claude/claude-code/2.1.260/"
+                             "claude.app/Contents/MacOS/claude")
+
+    @pytest.mark.parametrize("launchservices, info, expected", [
+        # A dev Mac's claude.app: CFBundleName "Claude Code", no CFBundleDisplayName, and the pane
+        # shows LaunchServices' "claude" — CFBundleName would have named a non-existent entry.
+        ("claude", {"CFBundleName": "Claude Code"}, "claude"),
+        ("claude", {"CFBundleName": "Claude Code", "CFBundleDisplayName": "Claude"}, "claude"),
+        ("Foo.app", {}, "Foo.app"),                     # the mapper does not second-guess LaunchServices
+        ("", {"CFBundleDisplayName": "Claude", "CFBundleName": "Claude Code"}, "Claude"),
+        ("  ", {"CFBundleDisplayName": "  Claude  "}, "Claude"),
+        ("", {"CFBundleName": "Claude Code"}, "claude"),  # the folder name; CFBundleName never
+        ("", {}, "claude"),
+    ])
+    def test_app_name_prefers_launchservices_then_plist_display_name_then_folder(
+            self, launchservices, info, expected):
+        """Pure precedence with injected values: LaunchServices display name → CFBundleDisplayName
+        → the .app folder name. The bundle id is independent of the name."""
+        asked = []
+        out = du._tcc_subject_for(
+            100, 4242, self.CLAUDE_APP_EXECUTABLE, STANDALONE_IMAGE,
+            bundle_info=lambda d: {**info, "CFBundleIdentifier": "com.anthropic.claude-code"},
+            display_name=lambda d: asked.append(d) or launchservices)
+        assert out == {"process": expected, "subject_kind": "app",
+                       "bundle_id": "com.anthropic.claude-code"}
+        assert asked == [self.CLAUDE_APP_EXECUTABLE[:-len("/Contents/MacOS/claude")]]
+
+    def test_display_name_reader_is_gated_on_darwin_pyobjc_and_a_bundle_on_disk(self, tmp_path, monkeypatch):
+        """``_bundle_display_name`` (the live reader, not the pinned one): "" off darwin, "" without
+        pyobjc, "" for a bundle that is not on disk — without touching AppKit in any of those
+        cases — and, for a bundle on disk, ``NSFileManager.displayNameAtPath_`` minus any ".app"
+        Finder was told to show."""
+        class _NoTouch:
+            def __getattr__(self, name):
+                raise AssertionError("AppKit consulted")
+        answers = {}
+
+        class _FM:
+            def displayNameAtPath_(self, path):
+                return answers[path]
+
+        class _AppKit:
+            class NSFileManager:
+                @staticmethod
+                def defaultManager():
+                    return _FM()
+        bundle = tmp_path / "Fake Thing.app"
+        bundle.mkdir()
+        on_disk = str(bundle)
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(du, "_pyobjc", lambda: (object(), _NoTouch()))
+        assert _LIVE_BUNDLE_DISPLAY_NAME(on_disk) == ""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        assert _LIVE_BUNDLE_DISPLAY_NAME(str(tmp_path / "Missing.app")) == ""
+        monkeypatch.setattr(du, "_pyobjc", lambda: None)
+        assert _LIVE_BUNDLE_DISPLAY_NAME(on_disk) == ""
+        monkeypatch.setattr(du, "_pyobjc", lambda: (object(), _AppKit()))
+        answers[on_disk] = "Fake Thing"
+        assert _LIVE_BUNDLE_DISPLAY_NAME(on_disk) == "Fake Thing"
+        answers[on_disk] = "Fake Thing.APP"
+        assert _LIVE_BUNDLE_DISPLAY_NAME(on_disk) == "Fake Thing"
+        answers[on_disk] = None
+        assert _LIVE_BUNDLE_DISPLAY_NAME(on_disk) == ""
+        monkeypatch.setattr(du, "_pyobjc", lambda: (object(), _NoTouch()))
+        assert _LIVE_BUNDLE_DISPLAY_NAME(on_disk) == ""  # AppKit raising → ""
+
+    def test_worker_responsible_for_itself_is_filed_under_the_interpreter(self):
+        """launchd started the interpreter itself, or the lookup failed: the responsible pid is
+        our own, or 0. (A terminal-launched worker is NOT this case — Terminal.app is responsible
+        for its shell children, so that one is filed under "Terminal", kind "app".)"""
+        for responsible in (100, 0):
+            out = du._tcc_subject_for(100, responsible, "", STANDALONE_IMAGE, bundle_info=lambda d: {})
+            assert out == {"process": "python3.12", "subject_kind": "interpreter", "bundle_id": None}
+
+    def test_framework_build_under_no_app_is_the_python_bundle(self):
+        out = du._tcc_subject_for(100, 100, "", HOMEBREW_FRAMEWORK_IMAGE, bundle_info=lambda d: {})
+        assert out == {"process": "Python", "subject_kind": "interpreter", "bundle_id": None}
+
+    def test_every_lookup_failing_names_python(self):
+        out = du._tcc_subject_for(100, 0, "", "", bundle_info=lambda d: {})
+        assert out == {"process": "python", "subject_kind": "interpreter", "bundle_id": None}
+
+    @pytest.mark.parametrize("responsible_path, expected", [
+        ("/usr/libexec/sshd-keygen-wrapper", "sshd-keygen-wrapper"),  # an SSH session
+        ("/bin/bash", "bash"),                                        # a LaunchAgent's wrapper script
+        ("/usr/sbin/sshd", "sshd"),
+        ("/opt/homebrew/bin/node/", "node"),
+    ])
+    def test_responsible_process_outside_an_app_is_named_by_its_binary(self, responsible_path, expected):
+        """A responsible process that is not an .app still holds the grant — responsibility is
+        inherited from whatever launchd started — so it is named, never the interpreter (which
+        would point at an entry that does not exist)."""
+        out = du._tcc_subject_for(100, 77, responsible_path, STANDALONE_IMAGE, bundle_info=lambda d: {},
+                                  display_name=lambda d: (_ for _ in ()).throw(AssertionError("not an app")))
+        assert out == {"process": expected, "subject_kind": "process", "bundle_id": None}
+
+    def test_app_and_process_kinds_need_another_process_with_a_known_image(self):
+        """Own pid, pid 0 or an unknown image never yield "app" / "process"."""
+        for own, responsible, path in ((100, 100, "/bin/bash"), (100, 0, "/bin/bash"), (100, 77, "")):
+            out = du._tcc_subject_for(own, responsible, path, STANDALONE_IMAGE, bundle_info=lambda d: {})
+            assert out == {"process": "python3.12", "subject_kind": "interpreter", "bundle_id": None}
+
+    def test_nested_bundle_names_the_innermost_app(self):
+        path = "/Applications/Outer.app/Contents/MacOS/Inner.app/Contents/MacOS/Inner"
+        out = du._tcc_subject_for(100, 77, path, STANDALONE_IMAGE, bundle_info=lambda d: {})
+        assert out["process"] == "Inner" and out["subject_kind"] == "app"
+
+    def test_bundle_info_reader_never_raises(self, tmp_path):
+        assert du._bundle_info(str(tmp_path / "Missing.app")) == {}
+
+    def test_live_subject_is_fed_by_the_hooks(self, worker_binary, app_spawned):
+        """``_tcc_subject`` asks for the responsible pid, then THAT pid's image, then maps."""
+        assert du._tcc_subject() == {"process": "Lucaryin AI", "subject_kind": "app", "bundle_id": None}
+        assert app_spawned == [4242]
+
+    def test_live_subject_names_a_wrapper_script_above_us(self, worker_binary, wrapper_spawned):
+        assert du._tcc_subject() == {"process": "bash", "subject_kind": "process", "bundle_id": None}
+
+    def test_live_subject_skips_the_path_lookup_when_nothing_is_above_us(self, worker_binary, monkeypatch):
+        looked_up = []
+        monkeypatch.setattr(du, "_responsible_pid", lambda pid: pid)  # macOS: "you are responsible"
+        monkeypatch.setattr(du, "_pid_executable_path", lambda pid: looked_up.append(pid) or "/x")
+        assert du._tcc_subject()["process"] == "python3.12"
+        assert looked_up == []
+
+    def test_lookups_are_empty_off_darwin(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert _LIVE_RESPONSIBLE_PID(1) == 0
+        assert _LIVE_PID_EXECUTABLE_PATH(1) == ""
+        assert _LIVE_BUNDLE_DISPLAY_NAME("/Applications/Lucaryin AI.app") == ""
+
+    def test_path_lookup_rejects_a_non_pid(self):
+        assert _LIVE_PID_EXECUTABLE_PATH(0) == "" and _LIVE_PID_EXECUTABLE_PATH(-1) == ""
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="libquarantine / libproc are macOS-only")
+    def test_live_lookups_resolve_this_interpreter_on_darwin(self):
+        """The real libquarantine / libproc calls (runs on the ``runtime-tests-macos`` lane). The
+        API answers > 0 for a live pid — a self-responsible process gets its own pid — so a
+        missing symbol (``_responsible_pid`` maps -1 to 0, which would name every worker as the
+        interpreter, the canary.6 bug) fails here instead of passing quietly."""
+        me = os.getpid()
+        responsible = _LIVE_RESPONSIBLE_PID(me)
+        assert responsible > 0
+        path = _LIVE_PID_EXECUTABLE_PATH(me)
+        assert os.path.isabs(path) and os.path.exists(path)
+        assert os.path.realpath(path) == du._executable_image_path()
+        responsible_path = _LIVE_PID_EXECUTABLE_PATH(responsible)
+        if responsible != me:
+            assert os.path.isabs(responsible_path) and os.path.exists(responsible_path)
+        subject = du._tcc_subject_for(me, responsible, responsible_path, du._executable_image_path(),
+                                      display_name=_LIVE_BUNDLE_DISPLAY_NAME)
+        assert subject["process"] and subject["subject_kind"] in ("app", "process", "interpreter")
+        if responsible == me:
+            assert subject["subject_kind"] == "interpreter"
+        else:
+            assert subject["subject_kind"] != "interpreter"
+
+    @pytest.mark.skipif(sys.platform != "darwin", reason="NSFileManager is macOS-only")
+    def test_live_display_name_is_launchservices_label_on_darwin(self, tmp_path):
+        """The real AppKit call (the darwin lane installs pyobjc): a system app's label, "" for a
+        bundle that is not on disk (never the echoed path component), and a bare folder named
+        like an app is labelled without its ".app"."""
+        if du._pyobjc() is None:
+            pytest.skip("pyobjc not installed in this interpreter")
+        textedit = "/System/Applications/TextEdit.app"
+        if os.path.isdir(textedit):
+            assert _LIVE_BUNDLE_DISPLAY_NAME(textedit) == "TextEdit"
+        assert _LIVE_BUNDLE_DISPLAY_NAME(str(tmp_path / "Missing.app")) == ""
+        (tmp_path / "Fake Thing.app").mkdir()
+        assert _LIVE_BUNDLE_DISPLAY_NAME(str(tmp_path / "Fake Thing.app")) == "Fake Thing"
 
 
 class TestTccErrors:
@@ -206,6 +469,48 @@ class TestTccErrors:
         assert "System Settings → Privacy & Security → Screen Recording" in err
         assert "retry" in err and "relaunch the Lucaryin app" in err
         assert ready_app == ["screen_recording"]  # the prompt was requested, once
+
+    def test_screen_recording_error_names_the_app_when_it_launched_the_worker(
+            self, worker_binary, app_spawned, ready_app, monkeypatch):
+        monkeypatch.setattr(du, "_tcc_status", lambda: {
+            "pyobjc": True, "screen_recording": False, "accessibility": True})
+        err = du.desktop_screenshot(app="TextEdit")["error"]
+        assert '"Lucaryin AI"' in err and "app that launched the worker" in err
+        assert "python3.12" not in err and '(not "Lucaryin")' not in err
+        assert "System Settings → Privacy & Security → Screen Recording" in err
+        assert "retry" in err and "relaunch the Lucaryin app" in err
+        assert ready_app == ["screen_recording"]
+
+    def test_screen_recording_error_names_the_launching_process_when_it_is_not_an_app(
+            self, worker_binary, wrapper_spawned, ready_app, monkeypatch):
+        monkeypatch.setattr(du, "_tcc_status", lambda: {
+            "pyobjc": True, "screen_recording": False, "accessibility": True})
+        err = du.desktop_screenshot(app="TextEdit")["error"]
+        assert '"bash"' in err and "process that launched the worker" in err
+        assert '(not "Lucaryin")' in err
+        assert "python3.12" not in err and "app that launched" not in err
+        assert "System Settings → Privacy & Security → Screen Recording" in err
+        assert 'Switch "bash" on there' in err
+        assert "retry" in err and "relaunch the Lucaryin app" in err
+        assert ready_app == ["screen_recording"]
+
+    def test_tcc_help_uses_the_status_subject_instead_of_a_second_lookup(self, monkeypatch):
+        """``_require_ready`` hands ``_tcc_help`` the ``_tcc_status()`` result so the subject is
+        resolved once per check; a status without a subject falls back to the live lookup."""
+        monkeypatch.setattr(du, "_tcc_subject",
+                            lambda: (_ for _ in ()).throw(AssertionError("looked up again")))
+        err = du._tcc_help("Accessibility", "Accessibility", subject={
+            "process": "Lucaryin AI", "subject_kind": "app", "bundle_id": "com.lucaryin.lucaryin-ai"})
+        assert '"Lucaryin AI"' in err and "Privacy & Security → Accessibility" in err
+        monkeypatch.setattr(du, "_tcc_subject", lambda: {
+            "process": "python3.12", "subject_kind": "interpreter", "bundle_id": None})
+        err = du._tcc_help("Accessibility", "Accessibility", subject={"pyobjc": True})
+        assert '"python3.12" (not "Lucaryin")' in err
+        err = du._tcc_help("Accessibility", "Accessibility", subject={
+            "process": "sshd-keygen-wrapper", "subject_kind": "process", "bundle_id": None})
+        assert ('under the process that launched the worker, the "sshd-keygen-wrapper" binary, so '
+                'it appears as "sshd-keygen-wrapper" (not "Lucaryin") in System Settings → Privacy & '
+                'Security → Accessibility') in err
 
     def test_accessibility_error_names_the_binary_and_pane(self, worker_binary, ready_app, monkeypatch):
         monkeypatch.setattr(du, "_tcc_status", lambda: {
@@ -259,22 +564,62 @@ class TestTccErrors:
 
     def test_list_apps_permissions_name_the_process_to_enable(self, monkeypatch):
         """``permissions`` is ``_tcc_status()`` (which carries "process") plus the grant_under line —
-        the process name is not re-derived here."""
+        the subject is not looked up a second time here."""
         monkeypatch.setattr(du, "_pyobjc", lambda: (object(), object()))
         monkeypatch.setattr(du, "_allowlist", lambda: ["TextEdit", "Quicken"])
         monkeypatch.setattr(du, "_tcc_status", lambda: {
-            "pyobjc": True, "screen_recording": False, "accessibility": None, "process": "python3.12"})
-        monkeypatch.setattr(du, "_agent_process_name", lambda: "not-the-source")
+            "pyobjc": True, "screen_recording": False, "accessibility": None,
+            "process": "python3.12", "subject_kind": "interpreter", "bundle_id": None})
+        monkeypatch.setattr(du, "_tcc_subject", lambda: {"process": "not-the-source"})
         out = du.desktop_list_apps()
         assert out["ok"] is True
         assert out["operable_apps"] == ["TextEdit"]  # financial app filtered
         perms = out["permissions"]
         assert perms["screen_recording"] is False
-        assert perms["process"] == "python3.12"
-        assert '"python3.12"' in perms["grant_under"]
+        assert perms["process"] == "python3.12" and perms["subject_kind"] == "interpreter"
+        assert '"python3.12"' in perms["grant_under"] and "no app launched it" in perms["grant_under"]
+        assert "Screen Recording" in perms["grant_under"] and "Accessibility" in perms["grant_under"]
+
+    def test_list_apps_grant_under_names_the_app_when_it_launched_the_worker(self, monkeypatch):
+        monkeypatch.setattr(du, "_pyobjc", lambda: (object(), object()))
+        monkeypatch.setattr(du, "_allowlist", lambda: ["TextEdit"])
+        monkeypatch.setattr(du, "_tcc_status", lambda: {
+            "pyobjc": True, "screen_recording": False, "accessibility": False,
+            "process": "Lucaryin AI", "subject_kind": "app", "bundle_id": "com.lucaryin.lucaryin-ai"})
+        perms = du.desktop_list_apps()["permissions"]
+        assert perms["subject_kind"] == "app" and perms["bundle_id"] == "com.lucaryin.lucaryin-ai"
+        assert '"Lucaryin AI"' in perms["grant_under"] and "app that launched it" in perms["grant_under"]
+        assert "python" not in perms["grant_under"]
+        assert "Screen Recording" in perms["grant_under"] and "Accessibility" in perms["grant_under"]
+
+    def test_list_apps_grant_under_names_the_launching_process_when_it_is_not_an_app(self, monkeypatch):
+        monkeypatch.setattr(du, "_pyobjc", lambda: (object(), object()))
+        monkeypatch.setattr(du, "_allowlist", lambda: ["TextEdit"])
+        monkeypatch.setattr(du, "_tcc_status", lambda: {
+            "pyobjc": True, "screen_recording": False, "accessibility": False,
+            "process": "bash", "subject_kind": "process", "bundle_id": None})
+        perms = du.desktop_list_apps()["permissions"]
+        assert perms["subject_kind"] == "process" and perms["bundle_id"] is None
+        assert 'process that launched it, the "bash" binary' in perms["grant_under"]
+        assert "python" not in perms["grant_under"] and "app that launched" not in perms["grant_under"]
         assert "Screen Recording" in perms["grant_under"] and "Accessibility" in perms["grant_under"]
 
     def test_tcc_status_carries_the_process_name(self, worker_binary, monkeypatch):
         monkeypatch.setattr(du, "_pyobjc", lambda: None)
         status = du._tcc_status()
         assert status["pyobjc"] is False and status["process"] == "python3.12"
+        assert status["subject_kind"] == "interpreter" and status["bundle_id"] is None
+
+    def test_tcc_status_carries_the_app_subject_when_the_app_launched_the_worker(
+            self, worker_binary, app_spawned, monkeypatch):
+        monkeypatch.setattr(du, "_pyobjc", lambda: None)
+        status = du._tcc_status()
+        assert status["process"] == "Lucaryin AI" and status["subject_kind"] == "app"
+        assert status["bundle_id"] is None  # no Info.plist on disk in this fixture
+
+    def test_tcc_status_carries_the_process_subject_under_a_wrapper_script(
+            self, worker_binary, wrapper_spawned, monkeypatch):
+        monkeypatch.setattr(du, "_pyobjc", lambda: None)
+        status = du._tcc_status()
+        assert status["process"] == "bash" and status["subject_kind"] == "process"
+        assert status["bundle_id"] is None
