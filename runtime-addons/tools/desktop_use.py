@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from typing import Optional
 
@@ -59,9 +60,80 @@ def _pyobjc():
         return None
 
 
+def _agent_process_name() -> str:
+    """The name macOS files the TCC grant under: the REAL interpreter binary running this
+    agent worker. TCC attributes Screen Recording / Accessibility to the executable, not to
+    the app that spawned it — ``sys.executable`` is the venv symlink
+    (``~/.lucaryin/venvs/hermes/bin/python``) but the entry in System Settings, and the
+    "… is requesting to access …" prompt, carry the symlink's target (``python3.12`` on the
+    canary boxes), never "Lucaryin". Telling the user to look for "Lucaryin" sent them to an
+    entry that does not exist (canary.5 soak, 2026-09-14)."""
+    exe = sys.executable or ""
+    try:
+        name = os.path.basename(os.path.realpath(exe)) if exe else ""
+    except Exception:
+        name = ""
+    return name or "python"
+
+
+def _tcc_help(permission: str, pane: str) -> str:
+    """Honest, actionable TCC error: names the process the user must enable and the pane."""
+    proc = _agent_process_name()
+    return (
+        f"{permission} permission is off for the agent worker. macOS files this permission under "
+        f"the Python binary running the agent, so it appears as \"{proc}\" (not \"Lucaryin\") in "
+        f"System Settings → Privacy & Security → {pane}. Switch \"{proc}\" on there (macOS may have "
+        f"just prompted for it), then retry this action; if it still fails after enabling, "
+        f"relaunch the Lucaryin app so the worker picks up the grant."
+    )
+
+
+# TCC pane → whether this process already asked macOS for it (the OS pops the prompt / creates
+# the Settings entry on the first request only and returns False silently afterwards; asking
+# once per process keeps the log quiet and the intent explicit).
+_TCC_PROMPTED: set = set()
+
+
+def _request_screen_recording() -> None:
+    """Ask macOS for Screen Recording once: pops the system prompt and creates the Settings
+    entry the first time; a no-op (False) afterwards. Never raises."""
+    if "screen_recording" in _TCC_PROMPTED:
+        return
+    _TCC_PROMPTED.add("screen_recording")
+    mods = _pyobjc()
+    if not mods:
+        return
+    Quartz, _ = mods
+    try:
+        Quartz.CGRequestScreenCaptureAccess()
+    except Exception:
+        pass
+
+
+def _request_accessibility() -> None:
+    """Ask macOS for Accessibility once via ``AXIsProcessTrustedWithOptions`` with the prompt
+    option (creates the Settings entry + prompt); falls back to the non-prompting
+    ``AXIsProcessTrusted`` when the option is unavailable. Never raises."""
+    if "accessibility" in _TCC_PROMPTED:
+        return
+    _TCC_PROMPTED.add("accessibility")
+    try:
+        import ApplicationServices as AS  # noqa: WPS433
+    except Exception:
+        return
+    try:
+        AS.AXIsProcessTrustedWithOptions({AS.kAXTrustedCheckOptionPrompt: True})
+    except Exception:
+        try:
+            AS.AXIsProcessTrusted()
+        except Exception:
+            pass
+
+
 def _tcc_status() -> dict:
     mods = _pyobjc()
-    out = {"pyobjc": bool(mods), "screen_recording": None, "accessibility": None}
+    out = {"pyobjc": bool(mods), "screen_recording": None, "accessibility": None,
+           "process": _agent_process_name()}
     if not mods:
         return out
     Quartz, _ = mods
@@ -199,11 +271,11 @@ def _require_ready(app: str, *, need_input: bool) -> Optional[dict]:
         return _err(reason)
     tcc = _tcc_status()
     if tcc.get("screen_recording") is False:
-        return _err("Screen Recording permission is off for Lucaryin "
-                    "(System Settings → Privacy & Security → Screen Recording).")
+        _request_screen_recording()  # first refusal: pop the prompt / create the entry
+        return _err(_tcc_help("Screen Recording", "Screen Recording"))
     if need_input and tcc.get("accessibility") is False:
-        return _err("Accessibility permission is off for Lucaryin "
-                    "(System Settings → Privacy & Security → Accessibility).")
+        _request_accessibility()
+        return _err(_tcc_help("Accessibility", "Accessibility"))
     return None
 
 
@@ -232,7 +304,14 @@ def desktop_list_apps(task_id: str = "", **_) -> dict:
     if not _pyobjc():
         return _err("Desktop control isn't provisioned on this machine yet (pyobjc missing).")
     allowed = [a for a in _allowlist() if not _is_financial(a)]
-    return {"ok": True, "operable_apps": allowed, "permissions": _tcc_status()}
+    permissions = dict(_tcc_status())
+    # The entry the user must flip is the worker binary, not "Lucaryin" (see _agent_process_name).
+    permissions["process"] = _agent_process_name()
+    permissions["grant_under"] = (
+        f"System Settings → Privacy & Security → Screen Recording / Accessibility list this agent "
+        f"worker as \"{permissions['process']}\"; enable that entry, retry, and relaunch Lucaryin if "
+        "it still fails.")
+    return {"ok": True, "operable_apps": allowed, "permissions": permissions}
 
 
 def desktop_screenshot(app: str = "", task_id: str = "", **_) -> dict:
