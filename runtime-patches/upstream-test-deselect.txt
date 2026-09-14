@@ -49,3 +49,14 @@ tests/tools/test_delegate.py::TestStripBlockedTools::test_removes_blocked_toolse
 # (durable "what did I start, and did it finish?" reconcile); upstream's
 # schema-diet test asserts the action enum is exactly its own verb set.
 tests/tools/test_process_schema_diet.py::TestProcessSchemaDiet::test_enum_is_the_verb_source
+
+# ── ENVIRONMENTAL ON GITHUB RUNNERS (not divergences; re-check on a runner change) ──
+# Fakes sys.platform="darwin" and runs a REAL search on Linux: patch 0020's
+# darwin-only `find -flags +dataless` prune then reaches GNU find, which has
+# no -flags. The real macOS lane (runtime-tests-macos) runs this test for real
+# and passes; on Linux it can only exercise a platform that isn't there.
+tests/tools/test_macos_protected_search.py::test_grep_pruned_search_still_finds_nested_protected_names
+# Asserts a just-closed child is no longer "running" with no wait; races the
+# 4-core runner (passes on upstream's 96-core runner and locally). Timing, not
+# behaviour — failed identically on the retry.
+tests/agent/test_owned_process_cleanup.py::test_child_close_kills_only_its_processes

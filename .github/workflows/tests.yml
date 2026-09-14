@@ -70,9 +70,12 @@ jobs:
       fail-fast: false
       matrix:
         slice: [1, 2, 3]
+    # No job-level PYTHONPATH: every test step runs from build/runtime (rootdir
+    # conftest resolves imports), exactly like upstream's CI. A job-level
+    # PYTHONPATH leaked into tests/tools/test_local_env_blocklist, which asserts
+    # about PYTHONPATH stripping (7 false failures on the first run).
     env:
       SLICES: "3"
-      PYTHONPATH: ${{ github.workspace }}/build/runtime
       # Same deterministic-runtime knobs as upstream's scripts/run_tests.sh.
       TZ: UTC
       LANG: C.UTF-8
@@ -221,7 +224,6 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     env:
-      PYTHONPATH: ${{ github.workspace }}/build/runtime
       TZ: UTC
       LANG: C.UTF-8
       LC_ALL: C.UTF-8
