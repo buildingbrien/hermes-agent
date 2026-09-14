@@ -24,23 +24,18 @@ on:
     # branch never tested — and on 2026-08-02 a delegation fix landed on main,
     # passed CI, and shipped in nothing.  Test what we ship.
     branches: [main, prod-hardening/base]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
   pull_request:
     branches: [main, prod-hardening/base]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# Cancel in-progress runs for the same PR/branch
+# Cancel in-progress runs for the same PR only — a quick follow-up push to the
+# mainline must not leave the earlier mainline commit without a completed run.
 concurrency:
   group: tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ── Shipping runtime: build/runtime ────────────────────────────────────────

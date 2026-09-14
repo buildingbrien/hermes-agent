@@ -49,12 +49,3 @@ tests/tools/test_delegate.py::TestStripBlockedTools::test_removes_blocked_toolse
 # (durable "what did I start, and did it finish?" reconcile); upstream's
 # schema-diet test asserts the action enum is exactly its own verb set.
 tests/tools/test_process_schema_diet.py::TestProcessSchemaDiet::test_enum_is_the_verb_source
-
-# ── KNOWN FINDINGS (not divergences — fix, then delete the line) ──────────
-# runtime-addons/tools/desktop_use.py: upstream's source guard requires every
-# subprocess call under tools/ to pass stdin= (a child that inherits the
-# TUI's stdin hijacks the operator's keyboard). Four calls in the addon
-# omit it — the `open -a` / `osascript … activate` pair (~L125/127), the
-# screencapture run (~L154) and the osascript key/script run (~L328). Fix:
-# add stdin=subprocess.DEVNULL to each, then remove this line.
-tests/tools/test_subprocess_stdin_guard.py::test_all_tui_subprocess_calls_have_stdin
