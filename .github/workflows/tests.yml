@@ -144,6 +144,8 @@ jobs:
           echo "::group::resolved requirement set"
           cat "$RUNNER_TEMP/runtime-deps.txt"
           echo "::endgroup::"
+          # The venv ships pip 25.0; the runs that resolved this set used 26.x. Same resolver everywhere.
+          python -m pip install --upgrade pip
           python -m pip install --prefer-binary -r "$RUNNER_TEMP/runtime-deps.txt"
 
       - name: Addon import smoke (every runtime-addons module loads on Linux)
@@ -293,6 +295,8 @@ jobs:
           echo "::group::resolved requirement set"
           cat "$RUNNER_TEMP/runtime-deps.txt"
           echo "::endgroup::"
+          # The venv ships pip 25.0; the runs that resolved this set used 26.x. Same resolver everywhere.
+          python -m pip install --upgrade pip
           python -m pip install --prefer-binary -r "$RUNNER_TEMP/runtime-deps.txt"
 
       - name: Darwin-lane tests
