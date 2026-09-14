@@ -1,0 +1,223 @@
+--- a/cron/scheduler_delivery.py
++++ b/cron/scheduler_delivery.py
+@@ -15,6 +15,7 @@ import contextvars
+ import logging
+ import os
+ import shutil
++import sqlite3
+ import subprocess
+ import sys
+ from dataclasses import dataclass
+@@ -26,12 +27,23 @@ from hermes_cli._subprocess_compat import windows_hide_flags
+ logger = logging.getLogger("cron.scheduler")
+ 
+ 
++# Lucaryin fold (patch 0023): pseudo-platform served by the state.db lane, never a gateway
++# adapter. The Lucaryin desktop app stamps ``origin.platform = "lucaryin"`` with ``chat_id`` =
++# the ``hermes_state`` session id of the chat a job was created in, and its own provisioned
++# jobs say ``deliver: lucaryin``; delivery appends the run output to that session and the app
++# renders it (see _deliver_to_lucaryin_session). The v2026.9.7 rebase dropped the old fork's
++# support, so every scheduled job on a Lucaryin box failed with "unknown platform 'lucaryin'".
++LUCARYIN_PLATFORM = "lucaryin"
++
+ # Validates user-supplied delivery platform names, preventing env-var enumeration via crafted names.
+ _KNOWN_DELIVERY_PLATFORMS = frozenset({
+     "telegram", "discord", "slack", "whatsapp", "signal",
+     "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
+     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
+-    "qqbot", "yuanbao"})
++    "qqbot", "yuanbao",
++    # "lucaryin" is not a messenger (see LUCARYIN_PLATFORM): listed so deliver=origin from a
++    # Lucaryin chat and an explicit ``deliver=lucaryin[:<session>]`` validate.
++    LUCARYIN_PLATFORM})
+ 
+ # Platforms supporting a cron/notification home target -> env var used by gateway config.
+ _HOME_TARGET_ENV_VARS = {
+@@ -91,6 +103,108 @@ def _resolve_origin(job: dict) -> Optional[dict]:
+     return None
+ 
+ 
++def is_lucaryin_deliver_token(part: str) -> bool:
++    """Lucaryin fold (patch 0023): ``lucaryin`` / ``lucaryin:<session_id>`` (case-insensitive) — a
++    deliver element the state.db lane serves; preflight must not demand a connected gateway for it."""
++    return str(part or "").strip().split(":", 1)[0].strip().lower() == LUCARYIN_PLATFORM
++
++
++def _lucaryin_target(session_id: str, resolved_from: Optional[str] = None) -> dict:
++    """Delivery target for a Lucaryin chat session (``chat_id`` IS the ``hermes_state`` session id)."""
++    target = {"platform": LUCARYIN_PLATFORM, "chat_id": str(session_id), "thread_id": None}
++    if resolved_from:
++        target["_resolved_from"] = resolved_from
++    return target
++
++
++def _latest_lucaryin_session() -> str:
++    """Lucaryin fold (patch 0023): the conversation a human is actually reading on this host, or "".
++
++    Last-resort target for ``deliver=origin`` without an origin and for bare ``deliver=lucaryin``.
++    "Most recent session" is the obvious rule and the wrong one: every /api/chat/sync call (fleet
++    ask_agent, delegation, verification) opens a fresh source='web' session indistinguishable by
++    id or source from a real chat, so the newest session is usually a one-shot nobody will ever
++    open. A conversation with real accumulated history is the signal — hence the message-count
++    floor, with recency only breaking ties among genuine threads.
++
++    Reads the store read-only at the ``SessionDB`` default path without opening a ``SessionDB``
++    (which would create an empty state.db on a plain hermes-agent host). "" when there is no
++    store or no such session, which lets the callers fall through / resolve nothing.
++    """
++    try:
++        from hermes_state import _default_db_path
++        db_path = _default_db_path()
++    except Exception:  # noqa: BLE001 — no store here; not a Lucaryin host
++        return ""
++    if not os.path.exists(db_path):
++        return ""
++    try:
++        conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
++    except Exception:  # noqa: BLE001
++        return ""
++    try:
++        row = conn.execute(
++            "SELECT s.id FROM sessions s "
++            "WHERE s.source IN ('web','mobile') AND s.message_count >= 20 "
++            "ORDER BY (SELECT max(m.timestamp) FROM messages m "
++            "          WHERE m.session_id = s.id) DESC "
++            "LIMIT 1"
++        ).fetchone()
++    except Exception:  # noqa: BLE001 — older schema, no sessions table
++        return ""
++    finally:
++        conn.close()
++    return str(row[0]) if row and row[0] else ""
++
++
++def _deliver_to_lucaryin_session(job: dict, session_id: str, content: str) -> Optional[str]:
++    """Lucaryin fold (patch 0023): deliver cron output into a Lucaryin chat thread by writing it
++    to state.db.
++
++    The "lucaryin" platform is not a messenger — the target ``chat_id`` IS a
++    ``hermes_state.SessionDB`` session id, and the Lucaryin app renders that session from
++    ~/.hermes/state.db. So the run output is appended as an assistant message on that session;
++    the desktop app shows it when the thread reloads. A session id that is not in the store is an
++    error (the conversation was deleted, or a hand-edited job): failing loudly beats delivering
++    to nobody with last_status "ok".
++
++    Mobile is a second surface: it only mirrors state.db via hub_sync, and the node's hub_sync
++    poller is not always running (a chat turn triggers a fast-flush, but a cron run has no turn).
++    So a best-effort flush hint is dropped — ``<HERMES_HOME>/cron/.pending_hub_flush``, one
++    session id per line — which the Lucaryin bridge's cron ticker drains and flushes. On a plain
++    hermes-agent host no lucaryin target ever resolves, so the hint is never written. Returns
++    None on success, or an error string.
++    """
++    job_id = job.get("id", "?")
++    session_id = str(session_id or "").strip()
++    if not session_id:
++        return "lucaryin delivery has no session id (origin chat_id missing)"
++    try:
++        from hermes_state import SessionDB
++        with SessionDB() as db:
++            if db.get_session(session_id) is None:
++                logger.warning(
++                    "Job '%s': lucaryin delivery target session %s is not in state.db",
++                    job_id, session_id)
++                return f"lucaryin delivery target session {session_id} not found in state.db"
++            db.append_message(session_id=session_id, role="assistant", content=content)
++    except Exception as e:  # pragma: no cover — defensive
++        logger.error("Job '%s': lucaryin state.db write failed: %s", job_id, e)
++        return f"lucaryin delivery failed: {e}"
++    logger.info("Job '%s': delivered into Lucaryin session %s", job_id, session_id)
++
++    # Best-effort flush hint (see docstring). Never fails the delivery.
++    try:
++        from hermes_constants import get_hermes_home  # same helper SessionDB uses
++        hint_dir = get_hermes_home() / "cron"
++        hint_dir.mkdir(parents=True, exist_ok=True)
++        with open(hint_dir / ".pending_hub_flush", "a", encoding="utf-8") as fh:
++            fh.write(f"{session_id}\n")
++    except Exception:  # pragma: no cover — hint is optional
++        logger.debug("Job '%s': could not write the lucaryin hub-flush hint", job_id, exc_info=True)
++    return None
++
++
+ def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
+     """Whether a cron delivery is also mirrored into the target chat's session transcript.
+ 
+@@ -584,11 +698,34 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
+                     job.get("name", job.get("id", "?")), platform_name)
+                 # Stands in for the primary conversation (NOT a broadcast): mirror-eligible.
+                 return _home_target(platform_name, chat_id, "origin_fallback")
++        # Lucaryin fold (patch 0023) — last resort: this host's own chat. None of the home env
++        # vars above are ever set on a Lucaryin machine, where the app itself IS the delivery
++        # surface, so the loop found nothing and the run was silently dropped ("skipping
++        # delivery (output saved in last_output)"). Not theoretical: the app auto-provisions its
++        # Heartbeat with deliver=origin and origin=null, and the GBrain Health Guard — the
++        # watchdog whose whole job is reporting degradation — was mute the same way.
++        home_session = _latest_lucaryin_session()
++        if home_session:
++            logger.info(
++                "Job '%s' has deliver=origin but no origin; falling back to the most recent "
++                "Lucaryin conversation (%s)", job.get("name", job.get("id", "?")), home_session)
++            return _lucaryin_target(home_session, "origin_fallback")
+         return None
+ 
+     if ":" in deliver_value:
+         platform_name, rest = deliver_value.split(":", 1)
+         platform_key = platform_name.lower()
++        if platform_key == LUCARYIN_PLATFORM:
++            # Lucaryin fold (patch 0023): the target IS a hermes_state session id, not a channel
++            # reference — resolve_send_target has no parser or directory entry for it and would
++            # reject "lucaryin" as an unregistered plugin platform. Take it verbatim (this is
++            # also what _resolve_cron_context_deliver writes for jobs created FROM a cron run).
++            session_id = rest.strip()
++            if not session_id:
++                logger.warning(
++                    "Invalid cron delivery target '%s': lucaryin needs a session id", deliver_value)
++                return None
++            return _lucaryin_target(session_id, "explicit")
+         from tools.send_message_tool import prepare_send_message_platforms, resolve_send_target
+         prepare_send_message_platforms()
+         # pass_unresolved_references: no model in the loop to react; an unknown-to-directory target
+@@ -626,6 +763,11 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
+         }
+     if not _is_known_delivery_platform(platform_name):
+         return None
++    if platform_name.lower() == LUCARYIN_PLATFORM:
++        # Lucaryin fold (patch 0023): no home env var exists for the app's own chat — the
++        # conversation a human is reading IS the home target.
++        home_session = _latest_lucaryin_session()
++        return _lucaryin_target(home_session) if home_session else None
+     chat_id = _get_home_target_chat_id(platform_name)
+     return _home_target(platform_name, chat_id) if chat_id else None
+ 
+@@ -1685,6 +1827,17 @@ def _deliver_result(
+                 delivery_errors.append(bot_chat_error)
+             continue
+ 
++        # Lucaryin fold (patch 0023): not a messenger — write the output into the chat session
++        # in state.db (chat_id IS the session id), the same wrapped content messengers get with
++        # MEDIA: tags stripped. Must precede _prepare_target_delivery: Platform() has no such
++        # member and no adapter (live, relay or standalone) can serve a state.db write.
++        if str(target["platform"]).lower() == LUCARYIN_PLATFORM:
++            lucaryin_error = _deliver_to_lucaryin_session(
++                job, str(target["chat_id"]), cleaned_delivery_content)
++            if lucaryin_error:
++                delivery_errors.append(lucaryin_error)
++            continue
++
+         t = _prepare_target_delivery(
+             job, target, adapters=adapters, loop=loop, config=config,
+             notify_delivery=notify_delivery,
+--- a/cron/scheduler_preflight.py
++++ b/cron/scheduler_preflight.py
+@@ -235,6 +235,11 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
+             # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
+             if _delivery.parse_bot_chat_deliver_token(part) is not None:
+                 continue
++            # Lucaryin fold (patch 0023): lucaryin targets write to state.db, never through a
++            # gateway adapter — there is no credential to be "connected"; a bad session id
++            # surfaces as last_delivery_error at fire time instead.
++            if _delivery.is_lucaryin_deliver_token(part):
++                continue
+             platform_parts.append(part.split(":", 1)[0].strip())
+     if not platform_parts:
+         return None
