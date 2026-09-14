@@ -202,7 +202,7 @@ GBRAIN_SEARCH_SCHEMA = {
         "it is far faster and more accurate than re-deriving them from raw "
         "documents."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "query": {"type": "string",
@@ -220,7 +220,7 @@ GBRAIN_READ_SCHEMA = {
         "Read one compiled memory page in full, by the slug returned from "
         "gbrain_search. Use when the search snippet is not enough detail."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "slug": {"type": "string",

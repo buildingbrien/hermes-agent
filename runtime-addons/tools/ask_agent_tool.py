@@ -121,7 +121,7 @@ ASK_AGENT_SCHEMA = {
         "role, persona or context the answer depends on. "
         "Valid agents: thoth, neith, ptah, set."
     ),
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {
             "agent": {"type": "string",
