@@ -33,3 +33,5 @@ sandbox_routing.py
 #   (multi-model, violates DeepSeek-lock), matrix.py, browser_providers/base.py (superseded).
 
 0021-pyobjc-desktop-addon-deps.patch — pyproject: pyobjc-framework-{Quartz,Cocoa,ApplicationServices} (darwin) for the desktop_use.py addon; the deps-only runtime install (app #45) reads [project].dependencies, so addon deps must live here.
+
+0022-deepseek-vision-default.patch — agent/auxiliary_client.py: restore "deepseek": "deepseek-v4-flash-vision-exp" in _PROVIDER_VISION_MODELS (the v2026.9.7 rebase dropped it; upstream ships only xiaomi/zai). Without it a DeepSeek main provider — or auxiliary.vision.provider: deepseek with no model — resolves vision to the image-less chat model, so check_vision_requirements() is False and vision_analyze/video_analyze/browser_vision are never advertised. Pairs with the app-side auxiliary.vision pin (lucaryin-ai electron/provisioning/runtime-config-pins.ts) for fleet boxes that name no main provider.
