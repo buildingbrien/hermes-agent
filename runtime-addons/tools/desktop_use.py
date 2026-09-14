@@ -122,10 +122,10 @@ def _frontmost_name() -> Optional[str]:
 def _focus(app: str, tries: int = 4) -> bool:
     """Bring app frontmost and CONFIRM it (NSWorkspace) before returning True."""
     for _ in range(tries):
-        subprocess.run(["open", "-a", app], check=False,
+        subprocess.run(["open", "-a", app], check=False, stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["osascript", "-e", f'tell application "{app}" to activate'],
-                       check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.9)
         if (_frontmost_name() or "").lower() == app.strip().lower():
             return True
@@ -151,7 +151,7 @@ def _capture(app: str) -> Optional[str]:
     out = os.path.join(_SHOT_DIR, f"{int(time.time() * 1000)}.png")
     wid = _window_id(app)
     cmd = ["screencapture", "-x", "-o"] + (["-l", str(wid)] if wid else []) + [out]
-    r = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    r = subprocess.run(cmd, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return out if (r.returncode == 0 and os.path.exists(out)) else None
 
 
@@ -325,7 +325,7 @@ def desktop_key(app: str = "", keys: str = "", description: str = "",
     else:
         using = (" using {" + ", ".join(mods) + "}") if mods else ""
         script = f'tell application "System Events" to keystroke "{key}"{using}'
-    r = subprocess.run(["osascript", "-e", script], check=False,
+    r = subprocess.run(["osascript", "-e", script], check=False, stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     _audit({"app": app, "action": "key", "keys": keys, "description": description,
             "rc": r.returncode})

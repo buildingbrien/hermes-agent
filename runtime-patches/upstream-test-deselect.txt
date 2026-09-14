@@ -1,0 +1,62 @@
+# Upstream tests that assert behaviour a fold patch INTENTIONALLY changes.
+#
+# .github/workflows/tests.yml (runtime-tests) turns every non-comment line
+# into a `--deselect=<node id>` for the upstream suite it runs against
+# build/runtime. Each entry names the patch that owns the divergence; a
+# deselect without a patch to justify it is a bug, and an upstream test
+# failing that is NOT listed here is a regression to fix, not to add here.
+#
+# Verified 2026-09-13 against upstream v2026.9.7: every node id below passes
+# on the pristine vendor/hermes-upstream tree and fails only after the named
+# patch is applied. When a patch is dropped from runtime-patches/series,
+# drop its lines.
+#
+# The one exception is the KNOWN FINDINGS section at the bottom: real
+# defects the gate surfaced on the day it was switched on, parked with the
+# fix spelled out so the gate could be made required immediately. Those
+# lines are debt — fix the addon, delete the line.
+
+# 0004-local-path-prepend: the local environment always puts the Homebrew
+# bin dirs on the child PATH, even when the inherited PATH already looks
+# sane; upstream only appends them to fill gaps and asserts that exact
+# ordering.
+tests/tools/test_local_env_blocklist.py::TestSanePathIncludesHomebrew::test_make_run_env_appends_homebrew_on_minimal_path
+tests/tools/test_local_env_blocklist.py::TestSanePathIncludesHomebrew::test_make_run_env_real_launchd_path_gains_homebrew
+
+# 0005-default-soul-identity: the seeded global SOUL.md carries the Lucaryin
+# identity ("Never refer to yourself by internal runtime or model codenames")
+# and no longer introduces itself as "Hermes Agent".
+tests/agent/test_prompt_builder.py::TestBuildContextFilesPrompt::test_empty_dir_loads_seeded_global_soul
+
+# 0010-browser-tool-uiaccess: browser_type probes the target box (`get`)
+# before `fill` so UI-access session material is never typed into a page
+# the operator did not point at; upstream asserts exactly one browser
+# command per type call.
+tests/tools/test_browser_type_redaction.py::test_browser_type_redacts_api_key_in_output
+tests/tools/test_browser_type_redaction.py::test_browser_type_keeps_normal_text_in_output
+tests/tools/test_browser_type_redaction.py::test_browser_type_failure_redacts_api_key_in_error
+
+# 0011-toolsets-lucaryin: the "memory" toolset also carries gbrain_search /
+# gbrain_read / action_items and the core/coding composites drop
+# fleet_send / delegate_to_neith, so upstream's blocked-toolset subtraction
+# tests no longer see the exact composite membership they assert.
+tests/tools/test_delegate_toolset_scope.py::TestToolsetIntersection::test_strip_blocked_removes_delegation
+tests/tools/test_delegate.py::TestStripBlockedTools::test_mixed_composite_is_subtracted_at_child_assembly
+tests/tools/test_delegate.py::TestStripBlockedTools::test_orchestrator_composite_regains_only_delegate_task
+tests/tools/test_delegate.py::TestStripBlockedTools::test_removes_blocked_toolsets
+
+# 0015-process-registry-reconcile: the process tool gains a `report` verb
+# (durable "what did I start, and did it finish?" reconcile); upstream's
+# schema-diet test asserts the action enum is exactly its own verb set.
+tests/tools/test_process_schema_diet.py::TestProcessSchemaDiet::test_enum_is_the_verb_source
+
+# ── ENVIRONMENTAL ON GITHUB RUNNERS (not divergences; re-check on a runner change) ──
+# Fakes sys.platform="darwin" and runs a REAL search on Linux: patch 0020's
+# darwin-only `find -flags +dataless` prune then reaches GNU find, which has
+# no -flags. The real macOS lane (runtime-tests-macos) runs this test for real
+# and passes; on Linux it can only exercise a platform that isn't there.
+tests/tools/test_macos_protected_search.py::test_grep_pruned_search_still_finds_nested_protected_names
+# Asserts a just-closed child is no longer "running" with no wait; races the
+# 4-core runner (passes on upstream's 96-core runner and locally). Timing, not
+# behaviour — failed identically on the retry.
+tests/agent/test_owned_process_cleanup.py::test_child_close_kills_only_its_processes
