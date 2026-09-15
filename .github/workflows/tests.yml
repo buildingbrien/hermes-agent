@@ -9,9 +9,9 @@ name: Tests
 #     `runtime-tests` / `runtime-tests-macos` jobs below.
 #
 #   * the repo ROOT (tools/, agent/, tests/ …) — the pre-rebase v0.10.0
-#     content-fork. It no longer ships (Phase B4 cleanup pending) but the
-#     `test` / `e2e` jobs still run against it. `test` is advisory
-#     (continue-on-error) until B4 deletes the tree.
+#     content-fork. Phase B4 deleted that tree (it lived redundantly in
+#     vendor/ + the overlay; the shipping runtime is build/runtime), so the
+#     `test` / `e2e` jobs that ran against it have been retired along with it.
 #
 # Before 2026-09-13 only the root tree was tested here: runtime patches
 # 0018–0021 and their addon tests were verified by hand on a soak box, never
@@ -320,73 +320,15 @@ jobs:
             -q -p no:cacheprovider
 
   # ── Pre-rebase root tree (does NOT ship) ───────────────────────────────────
-  test:
-    # ADVISORY. This job tests the OLD flat runtime at the repo root (the
-    # pre-rebase v0.10.0 tree: tools/, agent/, tests/ …), which the app no
-    # longer bundles — release.yml points bundle-runtimes.sh at build/runtime.
-    # It has been red on prod-hardening/base since 2026-09-07 for reasons
-    # unrelated to any current change. Kept (not deleted) so the root tree
-    # still gets a signal until the Phase B4 cleanup removes it; then delete
-    # this job along with the tree. Do not add new tests here.
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    continue-on-error: true
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Install dependencies
-        run: |
-          uv venv .venv --python 3.11
-          source .venv/bin/activate
-          uv pip install -e ".[all,dev]"
-
-      - name: Run tests
-        run: |
-          source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --ignore=tests/e2e --tb=short -n auto
-        env:
-          # Ensure tests don't accidentally call real APIs
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
-
-  e2e:
-    # Also runs against the pre-rebase root tree (tests/e2e/ at the repo
-    # root). Still green, so left as a required check; retire with `test`
-    # when Phase B4 removes the root tree.
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
-
-      - name: Set up Python 3.11
-        run: uv python install 3.11
-
-      - name: Install dependencies
-        run: |
-          uv venv .venv --python 3.11
-          source .venv/bin/activate
-          uv pip install -e ".[all,dev]"
-
-      - name: Run e2e tests
-        run: |
-          source .venv/bin/activate
-          python -m pytest tests/e2e/ -v --tb=short
-        env:
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
+  #
+  # The `test` and `e2e` jobs that lived here tested the OLD flat runtime at
+  # the repo root (the pre-rebase v0.10.0 tree: tools/, agent/, gateway/,
+  # tests/ …). Phase B4 deleted that tree — it duplicated what now lives in
+  # vendor/ + the overlay, and the app bundles build/runtime, not the root —
+  # so both jobs were retired with it (they could only fail once their tree
+  # was gone; `e2e`'s import closure gateway → hermes_cli → agent/tools spanned
+  # the whole fork runtime). The shipping runtime is gated by the
+  # `runtime-tests` / `runtime-tests-macos` jobs above; the upstream test tree
+  # that used to back these jobs now lives at build/runtime/tests and is
+  # exercised there. Rollback: revert the B4 commit to restore the tree and
+  # these jobs.
