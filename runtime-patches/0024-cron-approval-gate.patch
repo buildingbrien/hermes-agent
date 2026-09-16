@@ -1,0 +1,113 @@
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2308,6 +2308,75 @@
+             jobs[i]["grants"] = job.get("grants", [])
+             save_jobs(jobs)
+             return
++
++
++def _install_cron_approval_gate(job: dict) -> None:
++    """Arm the Lucaryin cron approval gate for this job's agent.
++
++    WHY THIS EXISTS: cron builds an AIAgent directly (see ``run_job`` ->
++    ``_construct_cron_agent``) instead of routing through the bridge, so nothing
++    registers the pre_tool_call approval hook the interactive worker installs.
++    Without this call every scheduled/unattended job runs UNGATED at any trust
++    level, and the Phase C beacon (``approval_gate.installed``) is never stamped
++    by cron. The pre-rebase fork installed the gate here; the rebase onto
++    upstream v2026.9.7 dropped it (no cron_gate reference survived into
++    runtime-patches / runtime-addons / vendor) -- this restores it.
++
++    ``cron_gate.install()`` locates the live plugin manager via the
++    process-global ``get_manager()`` singleton, so it arms the hook without
++    being handed the agent object; it only needs to run AFTER the agent is
++    constructed and BEFORE the first tool call. cron_gate ships in
++    hermes-bridge (the app bundle), NOT in this runtime tree, so its directory
++    must reach sys.path before the import -- the locator below is copied
++    verbatim from the old fork.
++
++    Never let gate wiring break job execution: any failure only logs a warning.
++    cron_gate itself logs "CRON UNGATED" loudly when it cannot arm.
++    """
++    try:
++        import sys as _sys
++        for _cand in (
++            os.environ.get("LUCARYIN_BRIDGE_DIR", ""),
++            "/Applications/Lucaryin AI.app/Contents/Resources/"
++            "app.asar.unpacked/hermes-bridge",
++            os.path.expanduser("~/.lucaryin/hermes-bridge"),
++        ):
++            if _cand and os.path.exists(os.path.join(_cand, "cron_gate.py")):
++                if _cand not in _sys.path:
++                    _sys.path.insert(0, _cand)
++                break
++        import cron_gate
++        _agent_key = job.get("agent")
++        if not _agent_key:
++            try:
++                from hermes_cli.profiles import get_active_profile_name
++                _agent_key = get_active_profile_name() or "thoth"
++            except Exception:
++                _agent_key = "thoth"
++        # The unnamed/"default" profile is Thoth -- same convention the bridge
++        # and hub_sync use (``_BRIDGE_PROFILE or "thoth"``). Without this the
++        # gate would look up ask_before config for an agent named "default".
++        if str(_agent_key).lower() in ("", "default", "none"):
++            _agent_key = "thoth"
++        cron_gate.install(
++            agent_key=str(_agent_key).lower(),
++            trust_level=(job.get("trust_level") or "cautious"),
++            grants=(job.get("grants") or []),
++            # A read-only job (e.g. the heartbeat: "look and report, not act")
++            # blocks write-class actions WITHOUT filing an approval card -- an
++            # unattended run never waits, so such a card is only noise to reject.
++            read_only=bool(job.get("read_only", False)),
++            # Per-job gate policy overrides read_only when set: "escalate" lets a
++            # curated outward action file a capped card while off-mission
++            # improvisation still blocks silent; "block"/"card-all" are the
++            # legacy read_only behaviors. Absent -> cron_gate derives from
++            # read_only, so nothing else changes.
++            policy=job.get("cron_action_policy"),
++        )
++    except Exception:
++        # Never let gate wiring break job execution -- but cron_gate itself logs
++        # CRON UNGATED loudly when it cannot arm, so this stays visible.
++        logger.warning("cron approval gate could not be installed", exc_info=True)
+ 
+ 
+ def run_job(
+@@ -2368,6 +2437,12 @@
+             session_db=_session_db)
+         _audit = _FireAudit(job, job_id, model)
+ 
++        # Arm the Lucaryin approval gate now that the agent exists and before it
++        # runs its first tool. See _install_cron_approval_gate: cron must do this
++        # itself because it builds the AIAgent directly, and the upstream
++        # v2026.9.7 rebase dropped the pre-rebase fork's install.
++        _install_cron_approval_gate(job)
++
+         result = _run_agent_with_watchdog(
+             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
+             worker_state=_worker_state)
+@@ -2377,6 +2452,21 @@
+         output = _run_doc_header(job, job_name, job_id, prompt) + f"## Response\n\n{logged_response}\n"
+         logger.info("Job '%s' completed successfully", job_name)
+         _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
++        # A run whose gated actions were BLOCKED did not do its job, and a green
++        # "ok" would say it did (the Google Ads monitor wore a green light
++        # through four blocked mornings). Flip to an honest failure that names
++        # the fix -- grant the action to this job. Defensive: never raise here.
++        try:
++            import cron_gate
++            _blocked = cron_gate.blocked_actions()
++            if _blocked:
++                return False, output, final_response, (
++                    "needs_grant: the gate blocked " +
++                    ", ".join(sorted(set(_blocked))) +
++                    " — grant it to this job (one approval) "
++                    "or expect a card per run")
++        except Exception:
++            pass
+         return True, output, final_response, None
+ 
+     except Exception as e:
