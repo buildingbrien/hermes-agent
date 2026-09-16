@@ -53,6 +53,12 @@ jobs:
       - name: Extract skill metadata for dashboard
         run: python3 website/scripts/extract-skills.py
 
+      - name: Materialize the runtime (skills-hub sources live in build/runtime)
+        # build_skills_index.py imports the skills-hub source adapters from the
+        # shipping runtime (build/runtime), not the repo root — Phase B4 removed
+        # the flat-root fork tree. Pure bash + git apply; no extra deps.
+        run: ./build-runtime.sh --check
+
       - name: Build skills index (if not already present)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

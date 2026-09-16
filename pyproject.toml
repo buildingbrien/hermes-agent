@@ -122,22 +122,21 @@ all = [
 ]
 
 [project.scripts]
-hermes = "hermes_cli.main:main"
-hermes-agent = "run_agent:main"
+# `hermes` (hermes_cli.main) and `hermes-agent` (run_agent) were dropped in Phase B4
+# with the redundant flat-root fork tree. The shipping runtime is build/runtime and
+# nothing installs this root package (tests.yml installs from build/runtime/pyproject).
+# `hermes-acp` targets the surviving root acp_adapter/ (a redundant vendored duplicate).
 hermes-acp = "acp_adapter.entry:main"
 
 [tool.setuptools]
-py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "rl_cli", "utils"]
-
-[tool.setuptools.package-data]
-hermes_cli = ["web_dist/**/*"]
+# Every other pre-B4 flat-root runtime module (run_agent, cli, model_tools,
+# hermes_constants, ...) was removed with the fork tree; only rl_cli.py survives.
+py-modules = ["rl_cli"]
 
 [tool.setuptools.packages.find]
-include = ["agent", "tools", "tools.*", "hermes_cli", "gateway", "gateway.*", "tui_gateway", "tui_gateway.*", "cron", "acp_adapter", "plugins", "plugins.*"]
+# Dropped the packages B4 removed (agent, tools, hermes_cli, gateway, cron). The
+# remaining dirs are redundant vendored duplicates that survived the B4 prune.
+include = ["tui_gateway", "tui_gateway.*", "acp_adapter", "plugins", "plugins.*"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-markers = [
-    "integration: marks tests requiring external services (API keys, Modal, etc.)",
-]
-addopts = "-m 'not integration' -n auto"
+# [tool.pytest.ini_options] removed with the root tests/ tree (deleted in B4). CI runs
+# pytest inside build/runtime, which carries its own [tool.pytest.ini_options].

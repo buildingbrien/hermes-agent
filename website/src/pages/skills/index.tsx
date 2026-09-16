@@ -83,16 +83,9 @@ const SOURCE_CONFIG: Record<
     border: "rgba(96, 165, 250, 0.2)",
     icon: "\u{25CB}",
   },
-  "Claude Marketplace": {
-    label: "Marketplace",
-    color: "#a78bfa",
-    bg: "rgba(167, 139, 250, 0.08)",
-    border: "rgba(167, 139, 250, 0.2)",
-    icon: "\u{25A0}",
-  },
 };
 
-const SOURCE_ORDER = ["all", "built-in", "optional", "Anthropic", "LobeHub", "Claude Marketplace"];
+const SOURCE_ORDER = ["all", "built-in", "optional", "Anthropic", "LobeHub"];
 
 function highlightMatch(text: string, query: string): React.ReactNode {
   if (!query || !text) return text;

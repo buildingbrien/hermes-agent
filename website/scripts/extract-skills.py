@@ -52,7 +52,6 @@ CATEGORY_LABELS = {
 SOURCE_LABELS = {
     "anthropics_skills": "Anthropic",
     "openai_skills": "OpenAI",
-    "claude_marketplace": "Claude Marketplace",
     "lobehub": "LobeHub",
 }
 

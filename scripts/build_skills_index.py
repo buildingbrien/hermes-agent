@@ -2,7 +2,7 @@
 """Build the Hermes Skills Index — a centralized JSON catalog of all skills.
 
 This script crawls every skill source (skills.sh, GitHub taps, official,
-clawhub, lobehub, claude-marketplace) and writes a JSON index with resolved
+clawhub, lobehub) and writes a JSON index with resolved
 GitHub paths. The index is served as a static file on the docs site so that
 `hermes skills search/install` can use it without hitting the GitHub API.
 
@@ -24,24 +24,37 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-# Allow importing from repo root
+# The output lands under the repo (website/static/api/skills-index.json), but the
+# skills-hub source adapters live in the SHIPPING runtime, not at the repo root:
+# Phase B4 removed the redundant pre-rebase flat-root tree (tools/, agent/, ...).
+# The runtime is materialized by ./build-runtime.sh into build/runtime
+# (vendor/hermes-upstream + runtime-patches/ + runtime-addons/). CI runs
+# `./build-runtime.sh --check` before this script (see skills-index.yml); run it
+# yourself for a local build.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, REPO_ROOT)
+RUNTIME_ROOT = os.path.join(REPO_ROOT, "build", "runtime")
+if not os.path.isdir(os.path.join(RUNTIME_ROOT, "tools")):
+    sys.exit(
+        f"skills-hub sources not found under {RUNTIME_ROOT} — run "
+        "./build-runtime.sh first (CI does this in the 'Materialize runtime' step)."
+    )
+sys.path.insert(0, RUNTIME_ROOT)
 
-# Ensure HERMES_HOME is set (needed by tools/skills_hub.py imports)
+# Ensure HERMES_HOME is set (needed by tools/skills_hub*.py imports)
 os.environ.setdefault("HERMES_HOME", os.path.join(os.path.expanduser("~"), ".hermes"))
 
-from tools.skills_hub import (
-    GitHubAuth,
-    GitHubSource,
-    SkillsShSource,
-    OptionalSkillSource,
-    WellKnownSkillSource,
-    ClawHubSource,
-    ClaudeMarketplaceSource,
-    LobeHubSource,
-    SkillMeta,
-)
+# Import each adapter from its defining module. Upstream decomposed the old
+# monolithic tools/skills_hub.py into tools/skills_hub_* siblings (Sep 2026); a
+# revert-scheduled compat shim still re-exports the old names from
+# tools.skills_hub, but that path is deprecation-warned and internal-only, so we
+# import from the defining modules directly. (ClaudeMarketplaceSource, a fork-only
+# adapter, no longer exists upstream and has been dropped.)
+from tools.skills_hub_models import SkillMeta
+from tools.skills_hub_github import GitHubAuth, GitHubSource
+from tools.skills_hub_skillssh import SkillsShSource
+from tools.skills_hub_official import OptionalSkillSource
+from tools.skills_hub_sources import WellKnownSkillSource, LobeHubSource
+from tools.skills_hub_clawhub import ClawHubSource
 import httpx
 
 OUTPUT_PATH = os.path.join(REPO_ROOT, "website", "static", "api", "skills-index.json")
@@ -258,7 +271,6 @@ def main():
         "well-known": WellKnownSkillSource(),
         "github": GitHubSource(auth=auth),
         "clawhub": ClawHubSource(),
-        "claude-marketplace": ClaudeMarketplaceSource(auth=auth),
         "lobehub": LobeHubSource(),
     }
 
@@ -292,7 +304,7 @@ def main():
     # Sort
     source_order = {"official": 0, "skills-sh": 1, "skills.sh": 1,
                     "github": 2, "well-known": 3, "clawhub": 4,
-                    "claude-marketplace": 5, "lobehub": 6}
+                    "lobehub": 6}
     deduped.sort(key=lambda s: (source_order.get(s["source"], 99), s["name"]))
 
     # Build index
