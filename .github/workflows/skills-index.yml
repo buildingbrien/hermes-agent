@@ -29,6 +29,13 @@ jobs:
       - name: Install dependencies
         run: pip install httpx==0.28.1 pyyaml==6.0.2
 
+      - name: Materialize the runtime (skills-hub sources live in build/runtime)
+        # build_skills_index.py imports the skills-hub source adapters from the
+        # shipping runtime (build/runtime), not the repo root — Phase B4 removed
+        # the flat-root fork tree. --check also fails if any patch no longer
+        # applies. Pure bash + git apply, so no extra deps beyond the checkout.
+        run: ./build-runtime.sh --check
+
       - name: Build skills index
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
