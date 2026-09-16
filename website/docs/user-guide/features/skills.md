@@ -293,7 +293,7 @@ hermes skills tap add myorg/skills-repo           # Add a custom GitHub source
 | `skills-sh` | `skills-sh/vercel-labs/agent-skills/vercel-react-best-practices` | Searchable via `hermes skills search <query> --source skills-sh`. Hermes resolves alias-style skills when the skills.sh slug differs from the repo folder. |
 | `well-known` | `well-known:https://mintlify.com/docs/.well-known/skills/mintlify` | Skills served directly from `/.well-known/skills/index.json` on a website. Search using the site or docs URL. |
 | `github` | `openai/skills/k8s` | Direct GitHub repo/path installs and custom taps. |
-| `clawhub`, `lobehub`, `claude-marketplace` | Source-specific identifiers | Community or marketplace integrations. |
+| `clawhub`, `lobehub` | Source-specific identifiers | Community or marketplace integrations. |
 
 ### Integrated hubs and registries
 
@@ -365,17 +365,7 @@ A third-party skills marketplace integrated as a community source.
 - Site: [clawhub.ai](https://clawhub.ai/)
 - Hermes source id: `clawhub`
 
-#### 6. Claude marketplace-style repos (`claude-marketplace`)
-
-Hermes supports marketplace repos that publish Claude-compatible plugin/marketplace manifests.
-
-Known integrated sources include:
-- [anthropics/skills](https://github.com/anthropics/skills)
-- [aiskillstore/marketplace](https://github.com/aiskillstore/marketplace)
-
-Hermes source id: `claude-marketplace`
-
-#### 7. LobeHub (`lobehub`)
+#### 6. LobeHub (`lobehub`)
 
 Hermes can search and convert agent entries from LobeHub's public catalog into installable Hermes skills.
 
