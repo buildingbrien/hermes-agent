@@ -1,37 +1,37 @@
 --- a/hermes_cli/model_normalize.py
 +++ b/hermes_cli/model_normalize.py
-@@ -93,7 +93,11 @@
-     "deepseek-chat", "deepseek-reasoner"})
+@@ -92,12 +92,22 @@ _LOWERCASE_MODEL_PROVIDERS: frozenset[str] = frozenset({
+ # a shape-based allow-list swallowed the vendor's own ``deepseek-flash`` the day it shipped (#107206),
+ # and any new id without a ``v<N>`` marker would have met the same fate.
+ _DEEPSEEK_RETIRED_ALIASES: dict[str, str] = {
+-    "deepseek-chat": "deepseek-flash", "deepseek-reasoner": "deepseek-flash"}
++    # Lucaryin override (patch 0006): fold the retired aliases onto OUR canonical Flash id
++    # ``deepseek-v4-flash`` rather than upstream's ``deepseek-flash`` rename — the fleet's
++    # configs, model_metadata context map, and hermes-bridge all name ``deepseek-v4-flash``.
++    "deepseek-chat": "deepseek-v4-flash", "deepseek-reasoner": "deepseek-v4-flash"}
  
- _DEEPSEEK_CANONICAL_MODELS: frozenset[str] = frozenset({
--    "deepseek-v4-pro", "deepseek-v4-flash"})
-+    "deepseek-v4-pro", "deepseek-v4-flash",
-+    # Vision-capable flash (image input; released 2026-08-21) — a DISTINCT id.
-+    # Plain v4-flash does NOT accept images; kept canonical so it passes through
-+    # untouched rather than being rewritten to the vision-less flash.
-+    "deepseek-v4-flash-vision-exp"})
  
- # First-class V-series IDs incl. future ``deepseek-v5-*`` and dated variants
- # (``deepseek-v4-flash-20260423``): verified real model ids, NOT aliases of ``deepseek-chat``.
-@@ -107,6 +111,11 @@
+ def _normalize_for_deepseek(model_name: str) -> str:
+-    """Fold retired DeepSeek aliases onto their replacement; pass everything else through."""
++    """Fold retired DeepSeek aliases onto their replacement; pass everything else through.
++
++    Lucaryin override (patch 0006): canonicalize any vision request onto the image-capable
++    ``deepseek-v4-flash-vision-exp`` (plain flash rejects images), so a deepseek main/aux
++    provider routes images correctly instead of 400-ing on the vision-less chat model.
++    """
      bare = _strip_vendor_prefix(model_name).lower()
-     if bare in _DEEPSEEK_CANONICAL_MODELS or _DEEPSEEK_V_SERIES_RE.match(bare):
-         return bare
-+    # Vision intent maps to the only DeepSeek model that accepts images
-+    # ("deepseek-vision", "flash-vision", etc.). Must beat the flash fallback,
-+    # which would otherwise pick the vision-less model and 400 every image call.
 +    if "vision" in bare:
 +        return "deepseek-v4-flash-vision-exp"
-     return "deepseek-v4-flash"
+     return _DEEPSEEK_RETIRED_ALIASES.get(bare, bare)
  
  
 --- a/hermes_cli/models_catalog_static.py
 +++ b/hermes_cli/models_catalog_static.py
-@@ -204,7 +204,7 @@
+@@ -205,7 +205,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
          "claude-sonnet-4-6", "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929",
          "claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-haiku-4-5-20251001",
      ],
--    "deepseek": ["deepseek-v4-pro", "deepseek-v4-flash"],
+-    "deepseek": ["deepseek-v4-pro", "deepseek-flash"],
 +    "deepseek": ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"],
      "xiaomi": ["mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2-flash"],
      "tencent-tokenhub": list(_TENCENT_MODELS),

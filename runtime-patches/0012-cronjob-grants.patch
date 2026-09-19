@@ -1,6 +1,6 @@
 --- a/tools/cronjob_tools.py
 +++ b/tools/cronjob_tools.py
-@@ -506,6 +506,45 @@
+@@ -508,6 +508,45 @@ def _try_dispatch_background_run(
      return result
  
  
@@ -46,7 +46,7 @@
  # ---------------------------------------------------------------------------
  # Tool actions. Each takes the cronjob() argument dict `a` (and the resolved
  # job record for job-bound actions) and returns the JSON result string.
-@@ -550,7 +589,10 @@
+@@ -552,7 +591,10 @@ def _action_create(a: Dict[str, Any]) -> str:
          # failure_deliver shares deliver's grammar and validators.
          or _validate_bot_chat_deliver(_normalize_deliver_param(a["failure_deliver"]))
          or (a["context_from"] and _validate_context_from_refs(
@@ -58,7 +58,7 @@
      if error:
          return tool_error(error, success=False)
  
-@@ -566,6 +608,7 @@
+@@ -568,6 +610,7 @@ def _action_create(a: Dict[str, Any]) -> str:
              model=_normalize_optional_job_value(a["model"]), provider=_normalize_optional_job_value(a["provider"]),
              base_url=_normalize_optional_job_value(a["base_url"], strip_trailing_slash=True),
              script=_normalize_optional_job_value(script), context_from=context_from,
@@ -66,7 +66,7 @@
              enabled_toolsets=a["enabled_toolsets"] or None, workdir=_normalize_optional_job_value(a["workdir"]),
              no_agent=_no_agent, attach_to_session=a["attach_to_session"],
              monitor_script=_normalize_optional_job_value(a["monitor_script"]),
-@@ -776,6 +819,13 @@
+@@ -778,6 +821,13 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
      if a["workdir"] is not None:
          # Empty string clears; otherwise update_job() validates/normalizes.
          updates["workdir"] = _normalize_optional_job_value(a["workdir"]) or None
@@ -80,7 +80,7 @@
      if a["no_agent"] is not None:
          # Flipping to True needs a script on the job or in this same update.
          target_no_agent = bool(a["no_agent"])
-@@ -875,6 +925,7 @@
+@@ -877,6 +927,7 @@ def cronjob(
      monitor_url: Optional[str] = None,
      reasoning_effort: Optional[str] = None,
      failure_deliver: Optional[Union[str, List[str]]] = None,
@@ -88,7 +88,7 @@
      task_id: str = None,
      session_id: Optional[str] = None,
      paused: bool = False,
-@@ -906,7 +957,9 @@
+@@ -908,7 +959,9 @@ CRONJOB_SCHEMA = {
      "name": "cronjob_manage",
      "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
  
@@ -99,11 +99,10 @@
      "parameters": {
          "type": "object",
          "properties": {
-@@ -984,6 +1037,24 @@
-             "attach_to_session": {
+@@ -987,6 +1040,24 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                  "type": "boolean",
-                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
-+            },
+                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), a user-written bare platform target (deliver='slack' — that platform's home channel), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
+             },
 +            "grants": {
 +                "type": "array",
 +                "items": {"type": "object"},
@@ -121,6 +120,7 @@
 +                    "unattended:true. Actions outside the grants still gate "
 +                    "normally at run time."
 +                ),
-             },
++            },
          },
          "required": ["action"]
+     }
