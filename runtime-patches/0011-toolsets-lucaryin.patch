@@ -127,7 +127,7 @@
      ),
      "hermes-cli": _bundle("Full interactive CLI toolset - all default tools plus cronjob management"),
  
-@@ -361,6 +424,11 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
+@@ -363,6 +426,11 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
      """
      external_call = visited is None
      if external_call:
@@ -136,10 +136,10 @@
 +        # operator. Self-latches after the first run; find_unexposed_tools()
 +        # passes an explicit visited set so it never re-triggers this.
 +        _audit_tool_exposure_once()
-         memo_key = (name, include_registry, *_registry_generation())
+         memo_key = (name, include_registry, *_registry_generation(), _registry_call("current_scope_key", ""))
          cached = _resolve_toolset_memo.get(memo_key)
          if cached is not None:
-@@ -395,6 +463,168 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
+@@ -397,6 +465,168 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
      return result
  
  
