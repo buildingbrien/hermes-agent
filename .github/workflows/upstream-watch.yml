@@ -1,0 +1,225 @@
+name: Upstream Watch
+
+# Phase D — the front of the auto-rollout pipeline. Detects a new upstream tag,
+# advances the vendored subtree by ONE hop, reapplies the overlay, and opens a
+# gated bump PR against prod-hardening/base. Downstream (tests.yml gate,
+# canary/soak/promote) already exists. See PHASE_D_PLAN.md.
+#
+# ⚠ PREREQUISITES (or the driver is inert / ungated):
+#   1. This file must live on the repo DEFAULT branch (currently `main`) — a
+#      `schedule`/`workflow_dispatch` trigger only fires from the default branch.
+#      The job still checks out and targets prod-hardening/base (BASE_BRANCH).
+#   2. Secret `UPSTREAM_WATCH_TOKEN` — a fine-grained PAT (or GitHub App token)
+#      with contents:write + pull-requests:write on this repo. The default
+#      GITHUB_TOKEN cannot open a PR that re-triggers tests.yml (anti-recursion),
+#      so without this secret the bump PR opens but its GATE never runs.
+
+on:
+  schedule:
+    - cron: '17 9 * * *'   # daily ~09:17 UTC
+  workflow_dispatch:
+    inputs:
+      target_tag:
+        description: 'Force a specific upstream tag (must be a real vYYYY.M.D[.N] release; default: next hop)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write            # gh label create is governed by the Issues API
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/NousResearch/hermes-agent.git
+  BASE_BRANCH: prod-hardening/base
+  # Strict allowlist for a valid upstream release tag: vYYYY.M.D with an optional
+  # .N (e.g. v2026.9.7, v2026.8.16.2). This both filters pre-release/moving tags
+  # (rc/beta/nightly/latest) AND blocks shell-injection via a hostile tag name.
+  TAG_RE: '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$'
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout prod-hardening/base (full history — subtree needs it)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: prod-hardening/base
+          # A re-triggering token so the eventual PR runs tests.yml. Falls back
+          # to GITHUB_TOKEN (PR opens but is NOT gated — see prereq #2).
+          token: ${{ secrets.UPSTREAM_WATCH_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Preflight — git subtree present
+        run: git subtree --help >/dev/null 2>&1 || { echo "::error::git subtree missing on runner"; exit 1; }
+
+      - name: Detect the next upstream tag (one hop)
+        id: detect
+        env:
+          FORCE_TAG: ${{ github.event.inputs.target_tag }}
+        run: |
+          set -euo pipefail
+          CUR="$(tr -d '[:space:]' < UPSTREAM_TAG)"
+          echo "current pin: $CUR"
+          # Release tags only (drops ^{} derefs, refs/tags/ prefix, and anything
+          # not matching TAG_RE — pre-releases + moving/hostile names).
+          git ls-remote --tags "$UPSTREAM_REPO" \
+            | awk '{print $2}' | sed 's#refs/tags/##; /\^{}/d' \
+            | grep -E "$TAG_RE" | sort -V -u > /tmp/uptags.txt
+          if [ -n "$FORCE_TAG" ]; then
+            echo "$FORCE_TAG" | grep -Eq "$TAG_RE" || { echo "::error::forced target_tag '$FORCE_TAG' is not a valid release tag"; exit 1; }
+            grep -qxF "$FORCE_TAG" /tmp/uptags.txt || { echo "::error::forced target_tag '$FORCE_TAG' is not a published upstream release"; exit 1; }
+            NEXT="$FORCE_TAG"
+          else
+            echo "$CUR" | grep -Eq "$TAG_RE" || { echo "::error::current UPSTREAM_TAG '$CUR' is not a valid release tag"; exit 1; }
+            # the entry immediately after our pin in version order = the next hop.
+            NEXT="$( (cat /tmp/uptags.txt; echo "$CUR") | sort -V -u \
+                     | awk -v c="$CUR" 'p==1{print;exit} $0==c{p=1}' )"
+          fi
+          if [ -z "$NEXT" ] || [ "$NEXT" = "$CUR" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::No upstream release newer than $CUR — nothing to do."
+            exit 0
+          fi
+          # NEXT is now guaranteed to match TAG_RE (from the allowlisted list or the
+          # validated force) — safe to pass onward.
+          echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          echo "cur=$CUR"   >> "$GITHUB_OUTPUT"
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "branch=upstream-bump/$NEXT" >> "$GITHUB_OUTPUT"
+          echo "::notice::Next hop: $CUR -> $NEXT"
+
+      - name: Skip if an open bump PR already exists
+        id: guard
+        if: steps.detect.outputs.up_to_date == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_WATCH_TOKEN || secrets.GITHUB_TOKEN }}
+          BR: ${{ steps.detect.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # An OPEN PR (not merely a stale branch) means a bump is in flight.
+          COUNT="$(gh pr list --head "$BR" --state open --json number --jq 'length')"
+          if [ "$COUNT" -gt 0 ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::An open bump PR for $BR already exists — skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ingest — subtree pull to the next tag + bump UPSTREAM_TAG
+        id: ingest
+        if: steps.detect.outputs.up_to_date == 'false' && steps.guard.outputs.exists == 'false'
+        env:
+          NEXT: ${{ steps.detect.outputs.next }}
+          CUR: ${{ steps.detect.outputs.cur }}
+          BR: ${{ steps.detect.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name  "upstream-watch[bot]"
+          git config user.email "upstream-watch@users.noreply.github.com"
+          git checkout -b "$BR"
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || true
+          # vendor/hermes-upstream is pristine (our delta is runtime-patches/ +
+          # runtime-addons/), so the subtree pull applies cleanly; a vendor-level
+          # subtree conflict here aborts the job loudly (surfaced by the notify step).
+          git subtree pull --prefix=vendor/hermes-upstream upstream "refs/tags/$NEXT" --squash \
+            -m "vendor: bump upstream $CUR -> $NEXT"
+          printf '%s\n' "$NEXT" > UPSTREAM_TAG
+          git commit -am "chore(upstream): pin UPSTREAM_TAG -> $NEXT"
+
+      - name: Materialize + reapply overlay (build-runtime.sh --check)
+        id: materialize
+        if: steps.detect.outputs.up_to_date == 'false' && steps.guard.outputs.exists == 'false'
+        run: |
+          set +e
+          ./build-runtime.sh --check > /tmp/build.log 2>&1
+          RC=$?
+          set -e
+          tail -60 /tmp/build.log
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          if [ "$RC" -eq 0 ]; then
+            echo "clean=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "clean=false" >> "$GITHUB_OUTPUT"
+          # Exit taxonomy from build-runtime.sh: 3 = a patch would not apply;
+          # 4 = a key serving file is missing (upstream restructured); 2 = no
+          # vendored tree (should not happen post-ingest).
+          case "$RC" in
+            3) FP="$(grep -oE 'PATCH FAILED to apply: .*' /tmp/build.log | sed 's/PATCH FAILED to apply: //' | head -1)"
+               echo "failed_patch=$FP" >> "$GITHUB_OUTPUT"
+               echo "reason=patch \`$FP\` did not reapply — re-fit runtime-patches/$FP" >> "$GITHUB_OUTPUT"
+               echo "::warning::overlay patch '$FP' did not reapply on $NEXT — manual re-fit needed" ;;
+            4) echo "reason=upstream restructured a key serving file (build-runtime.sh --check shape failure) — the overlay/adapter needs updating" >> "$GITHUB_OUTPUT" ;;
+            *) echo "reason=build-runtime.sh failed (exit $RC) — see the build log in this job" >> "$GITHUB_OUTPUT" ;;
+          esac
+        env:
+          NEXT: ${{ steps.detect.outputs.next }}
+
+      - name: Build the PR body
+        id: body
+        if: steps.detect.outputs.up_to_date == 'false' && steps.guard.outputs.exists == 'false'
+        env:
+          CUR: ${{ steps.detect.outputs.cur }}
+          NEXT: ${{ steps.detect.outputs.next }}
+          CLEAN: ${{ steps.materialize.outputs.clean }}
+          REASON: ${{ steps.materialize.outputs.reason }}
+        run: |
+          set -euo pipefail
+          VFILES="$(git diff --name-only "origin/${BASE_BRANCH}"...HEAD -- vendor/hermes-upstream | wc -l | tr -d ' ')"
+          MODELS="$(git diff --name-only "origin/${BASE_BRANCH}"...HEAD -- vendor/hermes-upstream \
+                     | grep -iE 'model|catalog|provider|/aux' || true)"
+          {
+            echo "Automated upstream bump — **$CUR → $NEXT** (one hop)."
+            echo
+            echo "- **Upstream changes:** https://github.com/NousResearch/hermes-agent/compare/${CUR}...${NEXT}"
+            echo "- **Vendored files changed:** $VFILES"
+            if [ "$CLEAN" = "true" ]; then
+              echo "- **Overlay:** ✅ all patches reapplied clean (\`build-runtime.sh --check\` passed)."
+            else
+              echo "- **Overlay:** ⚠️ **needs manual re-fit** — $REASON. Pull this branch, run \`./build-runtime.sh\`, fix, push. CI stays red until it applies."
+            fi
+            if [ -n "$MODELS" ]; then
+              echo "- **⚠️ Model/catalog files touched** (verify against the \"model changes only via founder updates\" rule — D3 makes this a blocking gate):"
+              echo "$MODELS" | sed 's/^/    - /'
+            else
+              echo "- **Model/catalog:** no model-selection files changed by this bump."
+            fi
+            echo
+            echo "**Gate:** \`tests.yml\` runs on this PR (materializes the runtime + reapplies the overlay + the upstream/addon suites). The bridge contract + smoke-boot vs the *materialized* runtime lands in D2. **HUMAN #1 merges** after behavioral-equivalence + the model-rule check; then the canary auto-cuts (decision C) and the ring soaks."
+            echo
+            echo "🤖 opened by \`upstream-watch.yml\`"
+          } > /tmp/pr_body.md
+          if [ "$CLEAN" = "true" ]; then echo "labels=upstream-bump" >> "$GITHUB_OUTPUT"; else echo "labels=upstream-bump,needs-refit" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Push branch + open the bump PR
+        if: steps.detect.outputs.up_to_date == 'false' && steps.guard.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_WATCH_TOKEN || secrets.GITHUB_TOKEN }}
+          BR: ${{ steps.detect.outputs.branch }}
+          CUR: ${{ steps.detect.outputs.cur }}
+          NEXT: ${{ steps.detect.outputs.next }}
+          CLEAN: ${{ steps.materialize.outputs.clean }}
+          LABELS: ${{ steps.body.outputs.labels }}
+        run: |
+          set -euo pipefail
+          gh label create upstream-bump --color 1D76DB --description "Automated upstream vendored-subtree bump" --force >/dev/null 2>&1 || true
+          gh label create needs-refit   --color B60205 --description "A runtime-patch did not reapply; manual re-fit needed" --force >/dev/null 2>&1 || true
+          git push origin HEAD
+          TITLE="chore(upstream): bump $CUR -> $NEXT"
+          [ "$CLEAN" = "true" ] || TITLE="⚠ $TITLE (needs re-fit)"
+          # Create from the pushed branch; if labels don't exist the create still
+          # succeeds (we add them separately, tolerating absence).
+          gh pr create --base "$BASE_BRANCH" --head "$BR" --title "$TITLE" --body-file /tmp/pr_body.md
+          gh pr edit "$BR" --add-label "$LABELS" >/dev/null 2>&1 || true
+
+      - name: Notify on a hard abort (subtree/vendor-level failure)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_WATCH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::error::upstream-watch aborted before opening a PR (likely a subtree/vendor-level failure or missing prereq). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
