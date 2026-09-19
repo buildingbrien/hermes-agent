@@ -1,0 +1,117 @@
+name: Model-change guard (D3)
+
+# D3 of the upstream pipeline. A driver bump PR (upstream-bump/*) whose
+# MATERIALIZED runtime changes the model-selection surface (the catalog, the
+# default, or normalization/routing) is BLOCKED until a maintainer reviews the
+# change and applies the `model-change-ack` label — enforcing the standing rule
+# "model changes only via founder-pushed updates."
+#
+# Why materialized, not the raw subtree: Lucaryin runtime-patches modify these
+# files (e.g. 0006-deepseek-vision, 0022-deepseek-vision-default), so the config
+# that actually ships is the post-patch build/runtime copy. We diff that.
+#
+# The job ALWAYS runs (green for non-bump PRs) so it is safe to list as a
+# required status check on prod-hardening/base. Only bump PRs get the real diff.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  ACK_LABEL: model-change-ack
+  # The model-selection surface, relative to the materialized runtime root.
+  MODEL_FILES: "hermes_cli/models_catalog_static.py hermes_cli/model_normalize.py hermes_cli/moa_config.py"
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Is this a driver bump PR?
+        id: gate
+        run: |
+          if [[ "${{ github.event.pull_request.head.ref }}" == upstream-bump/* ]]; then
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            echo "Not a bump PR — model-change guard is a no-op (pass)."
+          fi
+
+      - name: Checkout the bump (PR head)
+        if: steps.gate.outputs.bump == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Materialize the bump runtime
+        if: steps.gate.outputs.bump == 'true'
+        run: ./build-runtime.sh --check          # -> ./build/runtime
+
+      - name: Materialize the base runtime
+        if: steps.gate.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ github.base_ref }}" \
+            "https://github.com/${{ github.repository }}.git" "$RUNNER_TEMP/base"
+          ( cd "$RUNNER_TEMP/base" && ./build-runtime.sh --check )   # -> $RUNNER_TEMP/base/build/runtime
+
+      - name: Diff the materialized model config
+        id: diff
+        if: steps.gate.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          BUMP="build/runtime"
+          BASE="$RUNNER_TEMP/base/build/runtime"
+          changed=""
+          : > /tmp/model.diff
+          # Normalize away comments + blank lines so cosmetic edits don't trip the guard.
+          norm() { grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$1" 2>/dev/null || true; }
+          for f in $MODEL_FILES; do
+            if ! diff <(norm "$BASE/$f") <(norm "$BUMP/$f") > /tmp/f.diff 2>/dev/null; then
+              changed="$changed $f"
+              { echo "### $f"; echo '```diff'; head -c 6000 /tmp/f.diff; echo; echo '```'; echo; } >> /tmp/model.diff
+            fi
+          done
+          if [ -n "$changed" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "files=$changed" >> "$GITHUB_OUTPUT"
+            echo "::warning::model config changed by this bump:$changed"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Model config unchanged by this bump."
+          fi
+
+      - name: Comment + enforce founder ack
+        if: steps.gate.outputs.bump == 'true' && steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PR="${{ github.event.pull_request.number }}"
+          SHA="${{ github.event.pull_request.head.sha }}"
+          ACKED="$(gh pr view "$PR" --json labels --jq "[.labels[].name] | index(\"${ACK_LABEL}\") != null")"
+          MARK="<!-- model-change-guard:${SHA} -->"
+          {
+            echo "## ⚠️ Model-change guard — this bump changes the model config"
+            echo
+            echo "The **materialized** runtime's model-selection surface changed in:${{ steps.diff.outputs.files }}"
+            echo
+            echo "Standing policy is **model changes only via founder-pushed updates**, so this bump is **blocked** until a maintainer reviews the diff below and applies the \`${ACK_LABEL}\` label."
+            echo
+            cat /tmp/model.diff
+            echo "$MARK"
+          } > /tmp/comment.md
+          # Comment once per head SHA (don't spam on re-runs of the same commit).
+          if ! gh pr view "$PR" --json comments --jq '.comments[].body' | grep -qF "$MARK"; then
+            gh pr comment "$PR" --body-file /tmp/comment.md
+          fi
+          if [ "$ACKED" = "true" ]; then
+            echo "✅ Model change acknowledged via the '${ACK_LABEL}' label — allowing the bump."
+          else
+            echo "::error::Model config changed and not acknowledged. Apply the '${ACK_LABEL}' label after review to proceed."
+            exit 1
+          fi
