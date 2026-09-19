@@ -10,9 +10,13 @@ name: Upstream Watch
 #      `schedule`/`workflow_dispatch` trigger only fires from the default branch.
 #      The job still checks out and targets prod-hardening/base (BASE_BRANCH).
 #   2. Secret `UPSTREAM_WATCH_TOKEN` — a fine-grained PAT (or GitHub App token)
-#      with contents:write + pull-requests:write on this repo. The default
-#      GITHUB_TOKEN cannot open a PR that re-triggers tests.yml (anti-recursion),
-#      so without this secret the bump PR opens but its GATE never runs.
+#      with contents:write + pull-requests:write + issues:write (labels) on this
+#      repo. The default GITHUB_TOKEN cannot open a PR that re-triggers tests.yml
+#      (anti-recursion), so without this secret the bump PR opens but its GATE
+#      never runs. NOTE: the PR is created via the REST /pulls endpoint below,
+#      NOT `gh pr create` — a fine-grained PAT cannot call the GraphQL
+#      createPullRequest mutation (it returns "Resource not accessible by
+#      personal access token" even with full write scopes). REST works.
 
 on:
   schedule:
@@ -212,10 +216,23 @@ jobs:
           git push origin HEAD
           TITLE="chore(upstream): bump $CUR -> $NEXT"
           [ "$CLEAN" = "true" ] || TITLE="⚠ $TITLE (needs re-fit)"
-          # Create from the pushed branch; if labels don't exist the create still
-          # succeeds (we add them separately, tolerating absence).
-          gh pr create --base "$BASE_BRANCH" --head "$BR" --title "$TITLE" --body-file /tmp/pr_body.md
-          gh pr edit "$BR" --add-label "$LABELS" >/dev/null 2>&1 || true
+          # Create the PR via the REST /pulls endpoint. `gh pr create` uses the
+          # GraphQL createPullRequest mutation, which a fine-grained PAT cannot
+          # call — it returns "Resource not accessible by personal access token"
+          # even with contents+pull-requests+workflows write and a successful
+          # push. The REST endpoint works with the same token. jq --rawfile keeps
+          # the markdown body intact.
+          jq -n --arg t "$TITLE" --arg h "$BR" --arg b "$BASE_BRANCH" \
+            --rawfile body /tmp/pr_body.md '{title:$t, head:$h, base:$b, body:$body}' > /tmp/pr_payload.json
+          PR_NUM="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" --input /tmp/pr_payload.json --jq '.number')"
+          echo "Opened bump PR #${PR_NUM}: ${TITLE}"
+          # Labels via the REST Issues API (tolerate a label that doesn't exist).
+          LABEL_ARGS=()
+          IFS=',' read -ra _LBLS <<< "$LABELS"
+          for l in "${_LBLS[@]}"; do [ -n "$l" ] && LABEL_ARGS+=(-f "labels[]=$l"); done
+          if [ "${#LABEL_ARGS[@]}" -gt 0 ]; then
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUM}/labels" "${LABEL_ARGS[@]}" >/dev/null 2>&1 || true
+          fi
 
       - name: Notify on a hard abort (subtree/vendor-level failure)
         if: failure()
