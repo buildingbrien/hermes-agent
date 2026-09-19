@@ -72,4 +72,7 @@ tests/agent/test_owned_process_cleanup.py::test_child_close_kills_only_its_proce
 # asserts that a deepseek main with no aggregator credentials builds NO client
 # on the auto route. Verified 2026-09-13 against v2026.9.7: the file is 8/8 on
 # the tree without 0022 and exactly this one fails with it (the other 7 pass).
-tests/agent/test_vision_routing_31179.py::TestTextOnlyMainSkippedForVision::test_text_only_main_skipped_when_no_aggregator
+# v2026.9.14 (hop-2) RENAMED this file test_vision_routing_31179.py ->
+# test_vision_routing.py (same class + test); re-verified only this one test
+# of the 9 fails with 0022 applied (the other 8 pass). Node id updated to match.
+tests/agent/test_vision_routing.py::TestTextOnlyMainSkippedForVision::test_text_only_main_skipped_when_no_aggregator
