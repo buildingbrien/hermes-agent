@@ -162,7 +162,7 @@
  def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
      """Whether a cron delivery is also mirrored into the target chat's session transcript.
  
-@@ -584,11 +718,34 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
+@@ -593,11 +727,34 @@ def _resolve_single_delivery_target(
                      job.get("name", job.get("id", "?")), platform_name)
                  # Stands in for the primary conversation (NOT a broadcast): mirror-eligible.
                  return _home_target(platform_name, chat_id, "origin_fallback")
@@ -197,7 +197,7 @@
          from tools.send_message_tool import prepare_send_message_platforms, resolve_send_target
          prepare_send_message_platforms()
          # pass_unresolved_references: no model in the loop to react; an unknown-to-directory target
-@@ -626,6 +783,11 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
+@@ -638,6 +795,11 @@ def _resolve_single_delivery_target(
          }
      if not _is_known_delivery_platform(platform_name):
          return None
@@ -207,10 +207,10 @@
 +        home_session = _latest_lucaryin_session()
 +        return _lucaryin_target(home_session) if home_session else None
      chat_id = _get_home_target_chat_id(platform_name)
-     return _home_target(platform_name, chat_id) if chat_id else None
+     return _home_target(platform_name, chat_id, home_provenance) if chat_id else None
  
-@@ -1685,6 +1847,17 @@ def _deliver_result(
-                 delivery_errors.append(bot_chat_error)
+@@ -1765,6 +1927,17 @@ def _deliver_result(
+                     unverified_targets.append(bot_chat_error)
              continue
  
 +        # Lucaryin fold (patch 0023): not a messenger — write the output into the chat session
@@ -229,7 +229,7 @@
              notify_delivery=notify_delivery,
 --- a/cron/scheduler_preflight.py
 +++ b/cron/scheduler_preflight.py
-@@ -235,6 +235,11 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
+@@ -229,6 +229,11 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
              # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
              if _delivery.parse_bot_chat_deliver_token(part) is not None:
                  continue
