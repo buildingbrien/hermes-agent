@@ -50,6 +50,24 @@ tests/tools/test_delegate.py::TestStripBlockedTools::test_removes_blocked_toolse
 # schema-diet test asserts the action enum is exactly its own verb set.
 tests/tools/test_process_schema_diet.py::TestProcessSchemaDiet::test_enum_is_the_verb_source
 
+# 0006-deepseek-vision (retired-ID safety net): DeepSeek retired the whole
+# deepseek-v4-flash family on 2026-09-10 (news260910), so 0006 folds every
+# ``deepseek-v4-flash*`` id — including dated snapshots like -0731 — onto
+# deepseek-flash; upstream lists the dated snapshot as an unknown id that must
+# pass through. Only the -0731 parametrization diverges: v4.1-flash, r1,
+# next-preview and custom slugs still pass through untouched. (tests/hermes_cli
+# is not in the CI slices below; that line keeps a local full-suite run accurate.)
+# Re-aligning 0006 onto upstream's deepseek-flash targets also FIXED
+# test_provider_path_rewrites_reasoner, which the previous 0006 silently broke.
+tests/hermes_cli/test_model_normalize.py::TestDeepseekRetiredAliasesAndCustomSlugs::test_unknown_ids_pass_through_untouched[deepseek-v4-flash-0731]
+# Same fold, seen through the fallback chain (tests/agent IS a CI slice): a
+# fallback_providers entry naming the retired deepseek-v4-flash is now sent —
+# and announced — as deepseek-flash, which is the safety net working as
+# intended for hand-typed fallbacks; upstream asserts the notice echoes the
+# retired id verbatim. Verified 2026-09-22: passes on the tree with the
+# previous 0006, fails only with the re-fitted one.
+tests/agent/test_provider_fallback.py::TestFallbackChainAdvancement::test_records_sequential_switches_in_order
+
 # ── ENVIRONMENTAL ON GITHUB RUNNERS (not divergences; re-check on a runner change) ──
 # Fakes sys.platform="darwin" and runs a REAL search on Linux: patch 0020's
 # darwin-only `find -flags +dataless` prune then reaches GNU find, which has
@@ -66,8 +84,9 @@ tests/agent/test_owned_process_cleanup.py::test_child_close_kills_only_its_proce
 # fold-patch section (ahead of the ENVIRONMENTAL / KNOWN FINDINGS tails).
 
 # 0022 — deepseek is now a first-class vision provider
-# _PROVIDER_VISION_MODELS gains "deepseek": "deepseek-v4-flash-vision-exp", so
-# a DeepSeek main provider resolves vision to that image-input model (the same
+# _PROVIDER_VISION_MODELS gains "deepseek": "deepseek-flash" (natively
+# multimodal; it replaced the retired deepseek-v4-flash-vision-exp on
+# 2026-09-10), so a DeepSeek main provider resolves vision to it (the same
 # way xiaomi / zai already do) instead of being skipped as text-only; upstream
 # asserts that a deepseek main with no aggregator credentials builds NO client
 # on the auto route. Verified 2026-09-13 against v2026.9.7: the file is 8/8 on

@@ -1,38 +1,74 @@
 --- a/hermes_cli/model_normalize.py
 +++ b/hermes_cli/model_normalize.py
-@@ -92,12 +92,22 @@ _LOWERCASE_MODEL_PROVIDERS: frozenset[str] = frozenset({
+@@ -92,12 +92,25 @@
  # a shape-based allow-list swallowed the vendor's own ``deepseek-flash`` the day it shipped (#107206),
  # and any new id without a ``v<N>`` marker would have met the same fate.
  _DEEPSEEK_RETIRED_ALIASES: dict[str, str] = {
 -    "deepseek-chat": "deepseek-flash", "deepseek-reasoner": "deepseek-flash"}
-+    # Lucaryin override (patch 0006): fold the retired aliases onto OUR canonical Flash id
-+    # ``deepseek-v4-flash`` rather than upstream's ``deepseek-flash`` rename — the fleet's
-+    # configs, model_metadata context map, and hermes-bridge all name ``deepseek-v4-flash``.
-+    "deepseek-chat": "deepseek-v4-flash", "deepseek-reasoner": "deepseek-v4-flash"}
++    "deepseek-chat": "deepseek-flash", "deepseek-reasoner": "deepseek-flash",
++    # Lucaryin fold (patch 0006, retired-ID safety net): DeepSeek retired these on 2026-09-10
++    # (api-docs.deepseek.com/news/news260910); they only "temporarily" route to V4.1-Flash.
++    # deepseek-flash is the replacement AND natively multimodal, so folding here keeps
++    # un-healed customer configs (model.default, auxiliary.vision.model, fallbacks) working the
++    # day the temporary routing ends. Precedent: 2026-07-26 deepseek-chat 400'd and every bot on
++    # every box answered empty. deepseek-v4-pro is NOT retired and stays unmapped.
++    "deepseek-v4-flash": "deepseek-flash", "deepseek-v4-flash-vision-exp": "deepseek-flash"}
  
  
  def _normalize_for_deepseek(model_name: str) -> str:
--    """Fold retired DeepSeek aliases onto their replacement; pass everything else through."""
-+    """Fold retired DeepSeek aliases onto their replacement; pass everything else through.
-+
-+    Lucaryin override (patch 0006): canonicalize any vision request onto the image-capable
-+    ``deepseek-v4-flash-vision-exp`` (plain flash rejects images), so a deepseek main/aux
-+    provider routes images correctly instead of 400-ing on the vision-less chat model.
-+    """
+     """Fold retired DeepSeek aliases onto their replacement; pass everything else through."""
      bare = _strip_vendor_prefix(model_name).lower()
-+    if "vision" in bare:
-+        return "deepseek-v4-flash-vision-exp"
++    # Lucaryin fold (patch 0006): any DeepSeek *vision* id and every retired ``deepseek-v4-flash*``
++    # variant (dated ``-0731`` snapshots, ``:free``-style suffixes) folds onto the natively
++    # multimodal ``deepseek-flash``. deepseek-v4-pro, deepseek-v4.1-flash and unknown ids still
++    # pass through untouched (upstream #107206).
++    if "vision" in bare or bare.startswith("deepseek-v4-flash"):
++        return "deepseek-flash"
      return _DEEPSEEK_RETIRED_ALIASES.get(bare, bare)
  
  
---- a/hermes_cli/models_catalog_static.py
-+++ b/hermes_cli/models_catalog_static.py
-@@ -205,7 +205,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
-         "claude-sonnet-4-6", "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929",
-         "claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-haiku-4-5-20251001",
-     ],
--    "deepseek": ["deepseek-v4-pro", "deepseek-flash"],
-+    "deepseek": ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"],
-     "xiaomi": ["mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2-flash"],
-     "tencent-tokenhub": list(_TENCENT_MODELS),
-     "tencent-tokenplan": list(_TENCENT_MODELS),
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -5547,6 +5547,23 @@
+         if not accepts_slash:
+             return cached_default
+     return model or cached_default
++
++
++def _fold_retired_deepseek_model(client: Any, model: Optional[str]) -> Optional[str]:
++    """Lucaryin fold (patch 0006, retired-ID safety net). ``_compat_model()`` hands back the
++    caller's RAW ``model`` over resolve_provider_client()'s normalized default, so an explicit
++    ``auxiliary.<task>.model`` naming a retired DeepSeek id (an un-healed
++    ``auxiliary.vision.model: deepseek-v4-flash-vision-exp``, a hand-set ``deepseek-v4-flash``)
++    would reach api.deepseek.com verbatim and fail the day DeepSeek ends its temporary
++    routing (news260910). Fold it for clients that actually talk to DeepSeek's own endpoint —
++    keyed on the resolved host, so ``auto`` / custom routes to DeepSeek are covered and no other
++    vendor's ``*flash*`` id is ever touched."""
++    if not model:
++        return model
++    for obj in (client, getattr(client, "_client", None), getattr(client, "client", None)):
++        if obj is not None and base_url_host_matches(str(getattr(obj, "base_url", "") or ""), "api.deepseek.com"):
++            return _normalize_resolved_model(model, "deepseek")
++    return model
+ 
+ 
+ def _get_cached_client(
+@@ -5576,7 +5593,8 @@
+                 cached_loop is not None and cached_loop is current_loop and not cached_loop.is_closed()
+             )
+             if loop_ok:
+-                return cached_client, _compat_model(cached_client, model, cached_default)
++                return cached_client, _fold_retired_deepseek_model(
++                    cached_client, _compat_model(cached_client, model, cached_default))
+             # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
+             # foreign loop stays force-neutered.
+             _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
+@@ -5613,7 +5631,7 @@
+                 client, default_model, _ = _client_cache[cache_key]
+                 # Race loser was never exposed to a caller — safe to close now.
+                 _close_cached_client(built_client, close_async=async_mode)
+-    return client, _compat_model(client, model, default_model)
++    return client, _fold_retired_deepseek_model(client, _compat_model(client, model, default_model))
+ 
+ 
+ # Aliases for direct REST APIs not modeled in PROVIDER_REGISTRY, so ``auxiliary.<task>.provider:

@@ -1,7 +1,7 @@
 # Fork-owned overlay on vendor/hermes-upstream (v2026.9.7). See PHASE_B_OVERLAY.md.
 # PATCHES (fold re-fits, in runtime-patches/series):
 #   0001 deepseek prefix-cache · 0002 aux flash-guard · 0003 prompt_builder ·
-#   0004 local PATH · 0005 default_soul identity · 0006 deepseek-vision ·
+#   0004 local PATH · 0005 default_soul identity · 0006 deepseek retired-ID safety net (v4-flash/vision-exp/*vision* -> deepseek-flash, in model_normalize AND on explicit aux models via auxiliary_client._fold_retired_deepseek_model) ·
 #   0007 cron meeting · 0008 file_safety #53 denies · 0009 browser_cdp session-material ·
 #   0010 browser_tool UI-access · 0011 toolsets (#54 desktop/board/fleet) ·
 #   0012 cronjob grants · 0014 registry unavailable_out · 0015 process_registry reconcile ·
@@ -34,4 +34,4 @@ sandbox_routing.py
 
 0021-pyobjc-desktop-addon-deps.patch — pyproject: pyobjc-framework-{Quartz,Cocoa,ApplicationServices} (darwin) for the desktop_use.py addon; the deps-only runtime install (app #45) reads [project].dependencies, so addon deps must live here.
 
-0022-deepseek-vision-default.patch — agent/auxiliary_client.py: restore "deepseek": "deepseek-v4-flash-vision-exp" in _PROVIDER_VISION_MODELS (the v2026.9.7 rebase dropped it; upstream ships only xiaomi/zai). Without it a DeepSeek main provider — or auxiliary.vision.provider: deepseek with no model — resolves vision to the image-less chat model, so check_vision_requirements() is False and vision_analyze/video_analyze/browser_vision are never advertised. Pairs with the app-side auxiliary.vision pin (lucaryin-ai electron/provisioning/runtime-config-pins.ts) for fleet boxes that name no main provider.
+0022-deepseek-vision-default.patch — agent/auxiliary_client.py: add "deepseek": "deepseek-flash" (natively multimodal V4.1-Flash; replaced the retired deepseek-v4-flash-vision-exp on 2026-09-10) to _PROVIDER_VISION_MODELS (upstream ships only xiaomi/zai and DeepSeekProfile has no default_vision_model()). Without it a DeepSeek main provider — or auxiliary.vision.provider: deepseek with no model — resolves vision to the image-less chat model, so check_vision_requirements() is False and vision_analyze/video_analyze/browser_vision are never advertised. Pairs with the app-side auxiliary.vision pin (lucaryin-ai electron/provisioning/runtime-config-pins.ts) for fleet boxes that name no main provider.
