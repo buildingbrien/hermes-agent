@@ -27,6 +27,8 @@ import mimetypes
 import os
 import re
 import subprocess
+from email import message_from_bytes
+from email import policy as email_policy
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
 from typing import Any, Dict, List, Optional
@@ -52,7 +54,7 @@ def _himalaya() -> Optional[str]:
 
 
 def _as_list(v: Any) -> List[str]:
-    """Accept either a list or a comma-separated string for address fields."""
+    """Accept either a list or a comma-separated string (attachment paths)."""
     if not v:
         return []
     if isinstance(v, str):
@@ -60,9 +62,112 @@ def _as_list(v: Any) -> List[str]:
     return [str(p).strip() for p in v if str(p).strip()]
 
 
-def _valid(addr: str) -> bool:
-    _, email = parseaddr(addr)
-    return "@" in email and "." in email.split("@")[-1]
+# ── Recipients: exactly the set the approval gate checked ───────────────────
+# A standing grant ("may email these people") is checked by the bridge gate
+# (hermes-bridge approval_gate._recipients_of) against EVERY recipient it reads
+# out of to/cc/bcc. What this tool mails must be that same set, so:
+#   * address fields are split exactly where the gate splits them: ',', ';'
+#     and line breaks (approval_gate._RECIPIENT_SEP_RE), inside a string AND
+#     inside every list item;
+#   * the To/Cc/Bcc headers carry the BARE addresses only. The gate reads the
+#     address inside "Name <addr>", but a display name is parsed by whatever
+#     reads the header next: EmailMessage decodes an RFC 2047 encoded-word name
+#     and writes it back unquoted, so
+#     "=?utf-8?q?Owner_=3Cz=40evil.com=3E=2C?= <owner@x.com>" went out as
+#     "Owner <z@evil.com>, <owner@x.com>", a second, real recipient. Dropping
+#     the name removes that whole class.
+_RECIPIENT_SEP_RE = re.compile(r"[,;\r\n]")
+
+# An RFC 5322 dot-atom addr-spec, ASCII only: no quoted local part, no
+# comments, no whitespace, and a dotted domain. Nothing in it can split into a
+# second address.
+_ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]"
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+_ADDR_SPEC_RE = re.compile(rf"{_ATEXT}+(?:\.{_ATEXT}+)*@{_LABEL}(?:\.{_LABEL})+")
+# "anything <addr>": the name is dropped, so it is not inspected.
+_NAMED_ADDR_RE = re.compile(r"([^<>]*)<([^<>]*)>")
+# An explicit From: plain ASCII name (letters, digits, spaces, . ' _ -),
+# optionally in plain double quotes. No commas or group syntax (more than one
+# From mailbox), and no = ? (an encoded word, which EmailMessage decodes).
+_FROM_NAME_ADDR_RE = re.compile(r"""(?:[A-Za-z0-9 .'_-]*|"[A-Za-z0-9 .'_-]*") *<([^<>]*)>""")
+
+
+def _is_addr_spec(s: str) -> bool:
+    # "=?" starts an encoded word, which EmailMessage decodes even inside an
+    # address: "=?utf-8?q?z=40evil.com?=@x.com" serialises as "z@evil.com@x.com".
+    return bool(_ADDR_SPEC_RE.fullmatch(s)) and "=?" not in s
+
+
+def _bare_address(piece: Any) -> Optional[str]:
+    """'bob@x.com' or 'Any Name <bob@x.com>' → 'bob@x.com'; anything else → None."""
+    if not isinstance(piece, str):
+        return None
+    s = piece.strip()
+    m = _NAMED_ADDR_RE.fullmatch(s)
+    if m:
+        s = m.group(2).strip()
+    return s if _is_addr_spec(s) else None
+
+
+def _address_pieces(v: Any) -> Optional[List[str]]:
+    """Every raw recipient in an address field ([] when absent), split the way
+    the gate splits it. None when the field is not a string or a list of
+    strings: a dict would be read by its keys, a number would crash."""
+    if v is None or (isinstance(v, (str, list, tuple)) and not v):
+        return []
+    items = [v] if isinstance(v, str) else v
+    if not isinstance(items, (list, tuple)) or not all(isinstance(x, str) for x in items):
+        return None
+    return [p.strip() for item in items for p in _RECIPIENT_SEP_RE.split(item) if p.strip()]
+
+
+def _wire_addresses(header: str, value: str) -> List[str]:
+    """The addresses a header value carries once serialised and parsed back —
+    what the MTA reads, not what we meant."""
+    probe = EmailMessage()
+    probe[header] = value
+    wire = message_from_bytes(probe.as_bytes(), policy=email_policy.default)
+    return [a.addr_spec for a in wire[header].addresses]
+
+
+def _address_header(header: str, addrs: List[str]) -> str:
+    """A To/Cc/Bcc value of bare addresses only. Raises ValueError unless it
+    serialises to exactly those addresses (a differential check behind the
+    addr-spec pattern, in case some parser quirk still reinterprets one)."""
+    bare = []
+    for a in addrs:
+        b = _bare_address(a)
+        if b is None:
+            raise ValueError(f"not an email address: {a!r}")
+        bare.append(b)
+    value = ", ".join(bare)
+    try:
+        exact = _wire_addresses(header, value) == bare
+    except Exception:  # noqa: BLE001 - the caller only turns ValueError into an error reply
+        exact = False
+    if not exact:
+        raise ValueError(f"{header} would not reach exactly {value}")
+    return value
+
+
+def _explicit_from(value: Any) -> Optional[str]:
+    """The 'from' argument as the From header will carry it: a bare address,
+    or a plain ASCII 'Name <address>'. None for anything else, including any
+    line break (which can start a new header such as Bcc)."""
+    if not isinstance(value, str) or not value.isascii() or not value.isprintable():
+        return None
+    s = value.strip()
+    if _is_addr_spec(s):
+        addr = s
+    else:
+        m = _FROM_NAME_ADDR_RE.fullmatch(s)
+        addr = m.group(1).strip() if m else ""
+        if not _is_addr_spec(addr):
+            return None
+    try:
+        return s if _wire_addresses("From", s) == [addr] else None
+    except Exception:  # noqa: BLE001 - an unparseable From is simply not accepted
+        return None
 
 
 def _org_signature() -> tuple:
@@ -220,11 +325,12 @@ def _build_message(
 ) -> EmailMessage:
     msg = EmailMessage()
     msg["From"] = sender
-    msg["To"] = ", ".join(to)
+    # Bare addresses only, whatever the caller passed: see _address_header.
+    msg["To"] = _address_header("To", to)
     if cc:
-        msg["Cc"] = ", ".join(cc)
+        msg["Cc"] = _address_header("Cc", cc)
     if bcc:
-        msg["Bcc"] = ", ".join(bcc)
+        msg["Bcc"] = _address_header("Bcc", bcc)
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
@@ -300,9 +406,12 @@ def _account_from(account: str) -> str:
 def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     args = args if isinstance(args, dict) else {}
 
-    to = _as_list(args.get("to"))
-    cc = _as_list(args.get("cc"))
-    bcc = _as_list(args.get("bcc"))
+    fields = {}
+    for key in ("to", "cc", "bcc"):
+        pieces = _address_pieces(args.get(key))
+        if pieces is None:
+            return {"error": f"'{key}' must be an address or a list of addresses."}
+        fields[key] = pieces
     subject = (args.get("subject") or "").strip()
     body = args.get("body") or ""
     html = args.get("html") or ""
@@ -310,13 +419,33 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     account = (args.get("account") or "fleet").strip()
     draft = bool(args.get("draft"))
 
-    if not to:
+    if not fields["to"]:
         return {"error": "No recipient. Pass 'to' as an address or list of addresses."}
-    bad = [a for a in (to + cc + bcc) if not _valid(a)]
+    bad = [a for key in ("to", "cc", "bcc") for a in fields[key] if _bare_address(a) is None]
     if bad:
-        return {"error": f"These do not look like email addresses: {', '.join(bad)}"}
+        return {"error": (
+            f"These do not look like email addresses: {', '.join(bad)}. Pass "
+            "plain addresses such as person@example.com."
+        )}
+    # From here on every recipient is its bare address: that is what the
+    # headers carry, and what the result and summary report.
+    to, cc, bcc = ([_bare_address(a) for a in fields[key]] for key in ("to", "cc", "bcc"))
     if not subject:
         return {"error": "No subject. An email without one reads as spam."}
+
+    # An explicit `from` comes from the model, so it is held to a bare address
+    # or a plain ASCII "Name <address>" on one line (see _explicit_from).
+    sender = ""
+    raw_from = args.get("from")
+    if not (raw_from is None or (isinstance(raw_from, str) and not raw_from.strip())):
+        sender = _explicit_from(raw_from) or ""
+        if not sender:
+            return {"error": (
+                "'from' must be a bare address (fleet-001@lucaryin.com) or a "
+                "plain ASCII name and address (Lucaryin Fleet "
+                "<fleet-001@lucaryin.com>) with no line breaks. Omit it to "
+                "send as the account's own identity."
+            )}
 
     binary = _himalaya()
     if not binary:
@@ -330,7 +459,6 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     # wins; otherwise read the account's own identity out of the himalaya config
     # (works for gmail/zoho/any account, not just fleet). Fleet keeps a hardcoded
     # fallback so it still sends if the config couldn't be read.
-    sender = (args.get("from") or "").strip()
     if not sender:
         sender = _account_from(account)
     if not sender and account == "fleet":
@@ -479,7 +607,11 @@ EMAIL_SEND_SCHEMA = {
             "to": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Recipient address(es). A comma-separated string is also accepted.",
+                "description": (
+                    "Recipient address(es). A string separated by commas, "
+                    "semicolons or line breaks is also accepted. Headers carry "
+                    "the bare addresses only; display names are dropped."
+                ),
             },
             "subject": {"type": "string", "description": "Subject line."},
             "body": {"type": "string", "description": "Plain-text body of the message."},
@@ -514,7 +646,11 @@ EMAIL_SEND_SCHEMA = {
             },
             "from": {
                 "type": "string",
-                "description": "Optional explicit From header, e.g. 'Lucaryin Fleet <fleet-001@lucaryin.com>'.",
+                "description": (
+                    "Optional explicit From header: a bare address or a plain "
+                    "ASCII name and address, e.g. 'Lucaryin Fleet "
+                    "<fleet-001@lucaryin.com>'. Omit to use the account's identity."
+                ),
             },
             "draft": {
                 "type": "boolean",
