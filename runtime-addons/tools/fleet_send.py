@@ -2,9 +2,10 @@
 """Fleet Send Tool — send a message to another Lucaryin fleet agent via the bus.
 
 Now with delivery confirmation: after publishing via Supabase, the tool polls
-the recipient's bridge to confirm delivery. If the message isn't confirmed
-within 5 seconds, it falls back to a direct HTTP POST to the recipient's
-bridge /api/bus/send, bypassing the pub/sub layer entirely.
+the recipient's bridge to confirm delivery (draining its pub/sub buffer with a
+POST — see _drain_recipient_inbox). If the message isn't confirmed within 5
+seconds, it falls back to a direct HTTP POST to the recipient's bridge
+/api/bus/send, bypassing the pub/sub layer entirely.
 """
 
 from __future__ import annotations
@@ -103,6 +104,39 @@ def _post_json(url: str, payload: dict, timeout: int = 10) -> dict:
         return json.loads(resp.read().decode())
 
 
+# Statuses meaning "this bridge predates the POST drain" (no such route /
+# method): only these earn the one legacy-GET retry. Anything else (401/403
+# auth, 5xx) would fail the same way on a GET, so it is not retried.
+_DRAIN_GET_FALLBACK_CODES = frozenset({404, 405, 501})
+
+
+def _drain_recipient_inbox(recipient_port: int) -> dict:
+    """Drain the recipient bridge's pub/sub buffer once; return its JSON body.
+
+    Draining is a write, so the bridge (lucaryin-ai#85) drains on POST, which
+    goes through its Origin/bearer guard; a GET drains only with a valid
+    bearer, and a token-less bridge answers the GET with 405. An older bridge
+    on the same box (dev machines) has no POST drain yet, so on 404/405/501 —
+    and only then — retry once with the legacy bearer GET. Every other error
+    propagates to the caller's poll loop, exactly as before.
+
+    The route literal and both requests stay in this one function: the
+    bridge's test_pubsub_drain_runtime_contract.py locates drain callers by
+    the function that names the route and needs a literal method on each.
+    """
+    url = f"http://127.0.0.1:{recipient_port}/api/pubsub/messages"
+    req = urllib.request.Request(url, data=b"", headers=_auth_headers(), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code not in _DRAIN_GET_FALLBACK_CODES:
+            raise
+    legacy = urllib.request.Request(url, headers=_auth_headers(), method="GET")
+    with urllib.request.urlopen(legacy, timeout=3) as resp:
+        return json.loads(resp.read().decode())
+
+
 def _check_recipient_inbox(recipient: str, task_id: str, timeout: int = 5) -> bool:
     """Poll recipient's bridge to confirm our message arrived."""
     recipient_port = AGENT_PORTS.get(recipient)
@@ -112,10 +146,7 @@ def _check_recipient_inbox(recipient: str, task_id: str, timeout: int = 5) -> bo
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            url = f"http://127.0.0.1:{recipient_port}/api/pubsub/messages"
-            req = urllib.request.Request(url, headers=_auth_headers(), method="GET")
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                data = json.loads(resp.read().decode())
+            data = _drain_recipient_inbox(recipient_port)
             messages = data.get("messages", [])
             for msg in messages:
                 if msg.get("task_id") == task_id:
