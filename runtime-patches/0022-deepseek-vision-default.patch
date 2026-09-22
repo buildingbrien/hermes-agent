@@ -1,6 +1,6 @@
 --- a/agent/auxiliary_client.py
 +++ b/agent/auxiliary_client.py
-@@ -793,7 +793,21 @@
+@@ -793,7 +793,24 @@
  
  
  # Dedicated vision models for direct providers whose main chat model differs.
@@ -8,17 +8,20 @@
 +_PROVIDER_VISION_MODELS: Dict[str, str] = {
 +    "xiaomi": "mimo-v2.5",
 +    "zai": "glm-5v-turbo",
-+    # Lucaryin fold (patch 0022; the old fork carried this, the v2026.9.7 rebase
-+    # dropped it): DeepSeek's only image-input model (released 2026-08-21). The
-+    # main chat models (v4-pro / v4-flash) reject images, so a deepseek-main
-+    # user MUST route vision to this id — same endpoint, same DEEPSEEK_API_KEY,
-+    # priced like v4-flash. Without it a deepseek main provider, or an explicit
-+    # `auxiliary.vision.provider: deepseek` with no model, resolves vision to
-+    # the image-less chat model. Fleet boxes name no main provider at all, so
-+    # the app also pins auxiliary.vision explicitly (lucaryin-ai
-+    # electron/provisioning/runtime-config-pins.ts). Same id patch 0006 keeps
-+    # canonical in model_normalize and hermes-bridge/driver_vision.py uses.
-+    "deepseek": "deepseek-v4-flash-vision-exp",
++    # Lucaryin fold (patch 0022; upstream DeepSeekProfile has no
++    # default_vision_model()): deepseek-flash (V4.1-Flash) is natively
++    # multimodal, while the main model deepseek-v4-pro rejects images, so a
++    # deepseek-main user MUST route vision here — same endpoint, same
++    # DEEPSEEK_API_KEY. It replaces deepseek-v4-flash-vision-exp, which DeepSeek
++    # retired on 2026-09-10 (news260910). This literal never passes through the
++    # normalizer (the static dict wins in _resolve_provider_vision_default), so
++    # it must itself be a live id. Without it a deepseek main provider, or an
++    # explicit `auxiliary.vision.provider: deepseek` with no model, has no
++    # vision route. Fleet boxes name no main provider at all, so the app also
++    # pins auxiliary.vision explicitly (lucaryin-ai
++    # electron/provisioning/runtime-config-pins.ts); patch 0006 folds any
++    # retired vision id left in an un-healed config onto the same id.
++    "deepseek": "deepseek-flash",
 +}
  
  
