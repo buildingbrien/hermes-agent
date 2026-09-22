@@ -124,3 +124,17 @@
          },
          "required": ["action"]
      }
+@@ -1111,7 +1182,12 @@ def check_cronjob_requirements() -> bool:
+ _HANDLER_FORWARDED_ARGS = (
+     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
+     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
+-    "paused_reason", "all")
++    "paused_reason", "all",
++    # Lucaryin (0012): standing grants the model requests. Without this the handler drops
++    # them and the job is stored with grants=[] — every unattended run then re-asks. The
++    # approval gate classifies cronjob_manage+grants as a standing_grant card, so the
++    # user still approves the grant itself once.
++    "grants")
+ 
+ 
+ def _cronjob_handler(args, **kw):
