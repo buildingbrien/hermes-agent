@@ -29,9 +29,23 @@ tools/email_send_tool.py
 cron/p7_task_hook.py
 sandbox_executor.py
 sandbox_routing.py
+tools/bridge_auth.py
+tools/fleet_budget.py
+tools/session_material_policy.py
+tools/lucaryin_filelock.py
 # DROPPED: environments/tool_call_parsers/* (RL-training-only), gemini_cloudcode_adapter
 #   (multi-model, violates DeepSeek-lock), matrix.py, browser_providers/base.py (superseded).
 
 0021-pyobjc-desktop-addon-deps.patch — pyproject: pyobjc-framework-{Quartz,Cocoa,ApplicationServices} (darwin) for the desktop_use.py addon; the deps-only runtime install (app #45) reads [project].dependencies, so addon deps must live here.
 
 0022-deepseek-vision-default.patch — agent/auxiliary_client.py: add "deepseek": "deepseek-flash" (natively multimodal V4.1-Flash; replaced the retired deepseek-v4-flash-vision-exp on 2026-09-10) to _PROVIDER_VISION_MODELS (upstream ships only xiaomi/zai and DeepSeekProfile has no default_vision_model()). Without it a DeepSeek main provider — or auxiliary.vision.provider: deepseek with no model — resolves vision to the image-less chat model, so check_vision_requirements() is False and vision_analyze/video_analyze/browser_vision are never advertised. Pairs with the app-side auxiliary.vision pin (lucaryin-ai electron/provisioning/runtime-config-pins.ts) for fleet boxes that name no main provider.
+
+0025-lucaryin-child-env-strip.patch — tools/environments/local_env_policy.py: _is_hermes_internal_secret also covers the bridge worker's own credentials (BRIDGE_AUTH_TOKEN, LUCARYIN_API_KEY, VOICE_JWT_SECRET, IMESSAGE_PASSWORD, ASSEMBLYAI_API_KEY, FLEET_TOKEN, FLEET_EMAIL_PASSWORD, PLAID_ACCESS_TOKENS — exact names), so no terminal/background/PTY/execute_code child sees them (R2-1-03, HA3); tools/browser_tool.py reads the bridge bearer file-then-env through tools/bridge_auth.py. Pairs with lucaryin-ai B1 (bridge.token publisher).
+
+0026-cron-oneshot-late-fire-window.patch — cron/jobs.py: one-shot late-fire window (30 min default, meeting_join until the meeting ends, late_fire_window_seconds override) instead of the 120 s grace, and a one-shot past its window is kept only for a LIVE claim; cron/scheduler.py: tick() submits one-shots before recurring jobs (R2-1-43, HA4). Pairs with lucaryin-ai B5 (serial ticks, cron_tick_support.py).
+
+0009 now also touches tools/browser_tool_eval_policy.py (browser_console), tools/browser_use_cli.py (browser_exec) and tools/browser_extension_router.py (the extension route); the shared session-material contract is tools/session_material_policy.py (verbatim copy of lucaryin-ai ui_access_policy + approval_gate). 0008 denies are case/normalization-folded on macOS/Windows, fold the /System/Volumes/Data firmlink prefix (macOS) and the \\?\ / \\?\UNC\ prefixes (Windows), and ALSO compare by file identity (st_dev, st_ino of the checked path's existing ancestors vs each deny base, base stats cached 2 s) so firmlink, hardlink, admin-share and 8.3 spellings hit the same denies; they cover ~/.lucaryin/auth (bridge.token) and a sibling profile's config.yaml / state.db / sessions.
+
+tools/email_send_tool.py dedup results follow the EMAIL_SEND RESULT CONTRACT shared with lucaryin-ai (the bridge worker/server read it): identical message = {sent:true, already_sent:true, deduplicated:true, match:"message", idempotent_skip:true, summary}; cron thread hold = {sent:false, held:true, deduplicated:true, match:"thread", reason, summary}. Change both repos together.
+
+TESTS: runtime-addons/tests/conftest.py is the addon suite's hermetic guard (tmp HOME/HERMES_HOME/LUCARYIN_AUTH_DIR per test; an audit hook refuses and fails any access to the real ~/.hermes / ~/.lucaryin). build-runtime.sh installs it as build/runtime/conftest.py (never over upstream's tests/conftest.py) with build/runtime/.lucaryin-addon-tests listing the addon test files it applies to, and fails the build if any other addon file would replace an upstream or patched file.

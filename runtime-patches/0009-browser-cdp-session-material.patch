@@ -1,41 +1,49 @@
 --- a/tools/browser_cdp_tool.py
 +++ b/tools/browser_cdp_tool.py
-@@ -263,6 +263,34 @@
+@@ -255,6 +255,28 @@
+                        "result": result_msg.get("result", {})}, ensure_ascii=False)
+ 
+ 
++# ── Session material (Lucaryin fold, 0009; R2-2-05 / HA3) ────────────────────
++# The agent may USE a signed-in browser session; it may never EXTRACT it.
++# Reading or writing cookies / storage / IndexedDB / the Cache API / request
++# bodies turns a non-portable local capability into a portable secret, so it is
++# refused structurally, before any CDP connection, with no approval path (the
++# bridge gate cards the same calls as credential_read; this is the floor under
++# the card). The definition — the session-material domains by method PREFIX, and
++# session-material JS anywhere in ANY method's params — is the shared contract
++# in tools/session_material_policy.py (a verbatim copy of lucaryin-ai's
++# ui_access_policy / approval_gate). See lucaryin-ai/docs/ui-access-scope-2026-08-14.md
++# (hard condition 1).
++from tools import session_material_policy as _session_material  # noqa: E402
++
++
++def _session_material_refusal(method: Any, params: Any) -> Optional[str]:
++    """The tool's JSON refusal for a session-material call, or None."""
++    reason = _session_material.cdp_refusal(method, params)
++    if reason is None:
++        return None
++    return json.dumps({"error": reason, "blocked": "session_material"})
++
++
+ def browser_cdp(method: str, params: Optional[Dict[str, Any]] = None, target_id: Optional[str] = None,
+                 frame_id: Optional[str] = None, timeout: float = 30.0, task_id: Optional[str] = None) -> str:
+     """Send a raw CDP command (see ``CDP_DOCS_URL``). ``target_id`` attaches a fresh stateless connection
+@@ -264,6 +286,13 @@
      ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
      effective_task_id = task_id or "default"
  
-+    # ── Session-material denylist (Lucaryin UI-access doctrine, 2026-08-15) ──
-+    # The agent may USE a signed-in browser session; it may never EXTRACT it.
-+    # Reading/writing cookies or storage would turn a non-portable local
-+    # capability into a portable secret — denied structurally, before any CDP
-+    # connection (both the frame_id supervisor path and the direct path), with
-+    # no approval path. See lucaryin-ai/docs/ui-access-scope-2026-08-14.md
-+    # (hard condition 1). Applied ahead of upstream's private-page/SSRF guard,
-+    # which stays intact for everything else.
-+    _m = method.strip().lower() if isinstance(method, str) else ""
-+    _SESSION_MATERIAL = (
-+        "network.getcookies", "network.getallcookies", "network.setcookie",
-+        "network.setcookies", "network.clearbrowsercookies",
-+        "page.getcookies", "page.deletecookie",
-+        "storage.getcookies", "storage.setcookies", "storage.clearcookies",
-+        "storage.getstorageitems", "domstorage.getdomstorageitems",
-+        "domstorage.enable",
-+    )
-+    if _m in _SESSION_MATERIAL:
-+        return json.dumps({
-+            "error": (
-+                f"CDP method '{method}' is blocked: browser session material "
-+                "(cookies/storage) is structurally unreachable to agents. "
-+                "You can USE the signed-in session by driving pages; you can "
-+                "never read or export its credentials."
-+            ),
-+            "blocked": "session_material",
-+        })
++    # Lucaryin fold (0009): session material is refused before any connection —
++    # both the frame_id supervisor path and the direct path — ahead of
++    # upstream's private-page/SSRF guard, which stays intact for everything else.
++    refused = _session_material_refusal(method, params)
++    if refused:
++        return refused
 +
      if frame_id:
          blocked = _browser_cdp_private_guard(task_id=effective_task_id, method=method, params=params or {})
          if blocked:
-@@ -334,7 +362,6 @@
+@@ -335,7 +364,6 @@
          "- List tabs: method='Target.getTargets', params={}\n"
          "- Handle a native JS dialog: method='Page.handleJavaScriptDialog', "
          "params={'accept': true, 'promptText': ''}, target_id=<tabId>\n"
@@ -43,3 +51,87 @@
          "- Eval in a specific tab: method='Runtime.evaluate', params={'expression': '...', 'returnByValue': true}, "
          "target_id=<tabId>\n"
          "- Set viewport for a tab: method='Emulation.setDeviceMetricsOverride', "
+--- a/tools/browser_tool_eval_policy.py
++++ b/tools/browser_tool_eval_policy.py
+@@ -139,6 +139,17 @@
+ def _enforce_browser_eval_policy(expression: str) -> Optional[str]:
+     """Block sensitive browser JS evaluation when the opt-in denylist is on (opt-in because it gates on
+     primitive *names*; private-address egress is enforced separately in ``_browser_eval``)."""
++    # Lucaryin fold (0009, R2-2-05): session-material JS (document.cookie, Web
++    # Storage, IndexedDB, the Cache API, stored credentials) is refused at EVERY
++    # setting, before the opt-in denylist below — the floor under the bridge
++    # gate's credential_read card (tools/session_material_policy.py).
++    try:
++        from tools.session_material_policy import js_refusal as _lucaryin_js_refusal
++    except Exception:  # noqa: BLE001 - ships with the runtime; fail closed without it
++        return "Blocked: the browser session-material policy is unavailable."
++    refused = _lucaryin_js_refusal(expression)
++    if refused:
++        return refused
+     if not _restrict_browser_evaluate() or _allow_unsafe_browser_evaluate():
+         return None
+     reason = _risky_browser_eval_reason(expression)
+--- a/tools/browser_use_cli.py
++++ b/tools/browser_use_cli.py
+@@ -608,6 +608,17 @@
+     if not code or not code.strip():
+         return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
+ 
++    # Lucaryin fold (0009, R2-2-05): a script whose js()/cdp() strings reach
++    # browser session material is refused outright — the floor under the bridge
++    # gate's credential_read card (tools/session_material_policy.py).
++    try:
++        from tools.session_material_policy import script_refusal as _lucaryin_script_refusal
++    except Exception:  # noqa: BLE001 - ships with the runtime; fail closed without it
++        return tool_error("Blocked: the browser session-material policy is unavailable.")
++    refused = _lucaryin_script_refusal(code)
++    if refused:
++        return tool_error(refused)
++
+     blocked = _blocked_url_in_code(code)
+     if blocked:
+         return tool_error(blocked)
+--- a/tools/browser_extension_router.py
++++ b/tools/browser_extension_router.py
+@@ -109,6 +109,28 @@
+         return ""
+ 
+ 
++def _lucaryin_session_material_refusal(action: str, args: Any) -> Optional[str]:
++    """Lucaryin fold (0009): the JSON refusal for a browser_cdp / browser_console
++    call that reaches browser session material (tools/session_material_policy.py),
++    else None. The policy module ships with the runtime; if it cannot load, those
++    two actions fail closed."""
++    if action not in ("browser_cdp", "browser_console"):
++        return None
++    a = args if isinstance(args, dict) else {}
++    if action == "browser_console" and a.get("expression") is None:
++        return None
++    try:
++        from tools import session_material_policy as smp
++    except Exception:  # noqa: BLE001
++        reason = "Blocked: the browser session-material policy is unavailable."
++    else:
++        reason = (smp.cdp_refusal(a.get("method", ""), a.get("params")) if action == "browser_cdp"
++                  else smp.js_refusal(a.get("expression")))
++    if reason is None:
++        return None
++    return json.dumps({"success": False, "error": reason, "blocked": "session_material"})
++
++
+ def routed_browser_handler(
+     action: str, args: Dict[str, Any], *, fallback: Callable[[], Any], task_id: Optional[str] = None,
+     session_id: Optional[str] = None, principal_id: Optional[str] = None,
+@@ -123,6 +145,12 @@
+         return fallback()
+     if not browser_control_enabled():
+         return fallback()
++    # Lucaryin fold (0009, R2-2-05): once a controller is bound the legacy tool
++    # function never runs, so the session-material refusal inside browser_cdp()
++    # and browser_console() would not either — apply it here first.
++    refused = _lucaryin_session_material_refusal(action, args)
++    if refused is not None:
++        return refused
+ 
+     try:
+         env_session, env_principal, env_transport = _bound_identity()

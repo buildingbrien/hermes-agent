@@ -21,6 +21,16 @@ BRIDGE_PORT = int(os.getenv("HERMES_BRIDGE_PORT", 9002))  # hermes-bridge defaul
 TIMEOUT = 2  # seconds
 
 
+def _bridge_bearer() -> str:
+    """Bridge bearer, file first then BRIDGE_AUTH_TOKEN (tools/bridge_auth.py, HA3);
+    lazy so a scheduler tick never fails to import this hook."""
+    try:
+        from tools.bridge_auth import bridge_bearer
+        return bridge_bearer()
+    except Exception:  # noqa: BLE001
+        return os.environ.get("BRIDGE_AUTH_TOKEN", "")
+
+
 def _post(endpoint: str, payload: dict) -> bool:
     """Fire-and-forget POST to the bridge. Returns True on success."""
     try:
@@ -28,7 +38,7 @@ def _post(endpoint: str, payload: dict) -> bool:
         # Bearer so task-ledger writes survive the BRIDGE_AUTH_ENFORCE flip
         # (Chunk 1 Phase B); token is in the cron subprocess env.
         _hdrs = {"Content-Type": "application/json"}
-        _tok = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+        _tok = _bridge_bearer()  # file-then-env (tools/bridge_auth.py, HA3)
         if _tok:
             _hdrs["Authorization"] = f"Bearer {_tok}"
         req = urllib.request.Request(

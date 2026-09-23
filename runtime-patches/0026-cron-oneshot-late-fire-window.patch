@@ -1,0 +1,132 @@
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -97,6 +97,55 @@
+ OUTPUT_DIR = CRON_DIR / "output"
+ ONESHOT_GRACE_SECONDS = 120
+ 
++# ── Lucaryin fold (HA4 / R2-1-43, bug hunt round 2, 2026-09-22) ─────────────
++# The due scan retires a one-shot scanned more than ONESHOT_GRACE_SECONDS past
++# its run time without firing it. On a Lucaryin Mac the bridge ticker runs the
++# due set SERIALLY (HERMES_CRON_MAX_PARALLEL=1, the R2-1-15 stopgap), so one
++# long job makes the tick last the sum of its predecessors' durations and every
++# meeting auto-join or reminder that came due meanwhile was deleted unfired —
++# the user learns the agent never joined when nobody shows up. So a one-shot
++# here gets a late-fire WINDOW instead of the 120 s grace:
++#   * every one-shot: 30 minutes. Nothing marks a "reminder" — the cronjob tool
++#     creates plain prompt one-shots ("remind me at 9:05"), and no writer in the
++#     runtime or the bridge sets type="reminder" — so the window cannot hang off
++#     a type; it is the one-shot default (review, 2026-09-23);
++#   * a meeting_join: until the meeting is over (``meeting.end_iso``, else
++#     start + 30 min), when that is later;
++#   * any writer may pin ``late_fire_window_seconds`` on the record.
++# Clamped to [ONESHOT_GRACE_SECONDS, 6 h]. The create/update/resume checks that
++# reject a schedule already 120 s in the past keep ONESHOT_GRACE_SECONDS. The
++# bridge (hermes-bridge/cron_tick_support.py, B5) alerts in chat on any one-shot
++# a tick retires without a run, and treats 30 min as the widest default window.
++_LATE_FIRE_WINDOW_FIELD = "late_fire_window_seconds"
++_DEFAULT_LATE_FIRE_WINDOW_SECONDS = 30 * 60
++_MAX_LATE_FIRE_WINDOW_SECONDS = 6 * 3600
++
++
++def _oneshot_late_fire_window_seconds(job: Dict[str, Any], next_run_dt: Optional[datetime] = None) -> int:
++    """How late ``job`` (a one-shot) may still fire, in seconds — see the note above."""
++    if not isinstance(job, dict):
++        return _DEFAULT_LATE_FIRE_WINDOW_SECONDS
++    explicit = job.get(_LATE_FIRE_WINDOW_FIELD)
++    if explicit is not None:
++        try:
++            return max(ONESHOT_GRACE_SECONDS, min(int(explicit), _MAX_LATE_FIRE_WINDOW_SECONDS))
++        except (TypeError, ValueError, OverflowError):
++            pass
++    window = _DEFAULT_LATE_FIRE_WINDOW_SECONDS
++    if job.get("type") == "meeting_join":
++        meeting = job.get("meeting") if isinstance(job.get("meeting"), dict) else {}
++        end_dt = _parse_aware(str(meeting.get("end_iso") or "")) if meeting.get("end_iso") else None
++        if end_dt is None and meeting.get("start_iso"):
++            start_dt = _parse_aware(str(meeting.get("start_iso") or ""))
++            if start_dt is not None:
++                end_dt = start_dt + timedelta(seconds=_DEFAULT_LATE_FIRE_WINDOW_SECONDS)
++        if end_dt is not None and next_run_dt is not None:
++            try:
++                window = max(window, int((end_dt - next_run_dt).total_seconds()))
++            except (TypeError, OverflowError):
++                pass
++    return max(ONESHOT_GRACE_SECONDS, min(window, _MAX_LATE_FIRE_WINDOW_SECONDS))
++
+ 
+ @dataclass(frozen=True)
+ class _CronStorePaths:
+@@ -2508,8 +2557,11 @@
+             job.get("name", job.get("id", "?")))
+ 
+ 
+-def _write_missed_oneshot_diagnostic(job: Dict[str, Any], next_run: str) -> None:
++def _write_missed_oneshot_diagnostic(
++    job: Dict[str, Any], next_run: str, *, window_seconds: Optional[int] = None,
++) -> None:
+     """Trace for a never-ran one-shot retired outside the grace window (else it would just vanish).
++    ``window_seconds`` (Lucaryin fold) is the job's own late-fire window when it differs.
+     """
+     _write_oneshot_diagnostic(
+         job,
+@@ -2517,7 +2569,7 @@
+         f"- job id: {job.get('id')}\n"
+         f"- name: {job.get('name')}\n"
+         f"- scheduled run time: {next_run}\n"
+-        f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
++        f"- grace window: {window_seconds if window_seconds is not None else ONESHOT_GRACE_SECONDS}s\n"
+         f"- removed at: {_hermes_now().isoformat()}\n\n"
+         "This one-shot's run time is more than the grace window in the "
+         "past (scheduler down past the window, host asleep, or jobs.json "
+@@ -3061,11 +3113,27 @@
+     and recovery never revives them; only the due scan used to dispatch them hours late). With no
+     claim stamped, retire it with a diagnostic (never silently delete). A claim may mean a run is
+     still in flight elsewhere — skip but keep the record so its mark_job_run can land."""
+-    if (d.scan.now - d.next_run_dt).total_seconds() <= ONESHOT_GRACE_SECONDS:
++    # Lucaryin fold (R2-1-43): the window is per job (see
++    # _oneshot_late_fire_window_seconds) instead of the flat 120 s grace.
++    window = _oneshot_late_fire_window_seconds(d.job, d.next_run_dt)
++    if (d.scan.now - d.next_run_dt).total_seconds() <= window:
+         return False
+-    if not (d.job.get("run_claim") or d.job.get("fire_claim")):
+-        _write_missed_oneshot_diagnostic(d.job, d.next_run)
+-        d.scan.retire(d.job["id"])
++    # Lucaryin fold (B5 pair contract, hermes-bridge/cron_tick_support.py): keep
++    # the record only for a claim that is still LIVE. A claim that is merely
++    # present — stamped by a tick that was killed while the one-shot sat queued
++    # behind a serial worker, or by a run that died — has no run behind it (a
++    # live run heartbeats its claim), so keeping the record stranded the job
++    # forever: never run, never retired, never diagnosed.
++    run_claim, fire_claim = d.job.get("run_claim"), d.job.get("fire_claim")
++    if (_claim_is_live(run_claim, d.scan.now, _oneshot_run_claim_ttl_seconds())
++            or _claim_is_live(fire_claim, d.scan.now, FIRE_CLAIM_TTL_SECONDS)
++            or _job_running_in_this_process(str(d.job.get("id", "")))):
++        return True
++    if run_claim or fire_claim:
++        _write_wedged_oneshot_diagnostic(d.job)  # a claimed run that never completed
++    else:
++        _write_missed_oneshot_diagnostic(d.job, d.next_run, window_seconds=window)
++    d.scan.retire(d.job["id"])
+     return True
+ 
+ 
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -3917,6 +3917,17 @@
+         if verbose:
+             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
+ 
++        # Lucaryin fold (0026; B5 pair contract, hermes-bridge/cron_tick_support.py):
++        # one-shots first. Under the bridge's serial ticks (HERMES_CRON_MAX_PARALLEL=1)
++        # the due set runs in submission order, and create_job APPENDS — so a
++        # meeting auto-join or reminder created last started only after every
++        # recurring job due in the same minute had finished. Stable: each group
++        # keeps its jobs.json order; a record without a dict schedule sorts with
++        # the recurring group.
++        due_jobs = sorted(due_jobs, key=lambda j: not (
++            isinstance(j, dict) and isinstance(j.get("schedule"), dict)
++            and j["schedule"].get("kind") == "once"))
++
+         # Advance next_run_at for recurring jobs FIRST, under the lock, before any execution
+         # (at-most-once). Re-advancing running jobs keeps the grace window alive; mark_job_run
+         # overwrites it on completion. Composes with the claim-time advance in claim_job_for_fire.

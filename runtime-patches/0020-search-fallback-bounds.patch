@@ -1,6 +1,6 @@
 --- a/tools/file_operations_search.py
 +++ b/tools/file_operations_search.py
-@@ -23,7 +23,21 @@
+@@ -23,6 +23,33 @@
      "Desktop", "Documents", "Downloads", "Library", "Movies", "Music", "Pictures",
  )
  
@@ -17,17 +17,27 @@
 +_MACOS_CLOUD_SYNCED_HOME_DIRS = (
 +    "Desktop", "Documents", "Library/Mobile Documents", "Library/CloudStorage",
 +)
- 
++# Lucaryin fold (R2-3-35, bug hunt round 2): ``SEARCH_PRUNE_DIR_NAMES`` is a policy
++# for broad CODE-tree probes, so it also names plain-English folders that are
++# generated output in a repo but ordinary content in a person's files — a
++# "backup" of tax returns, a designer's "out" folder, "vendor" contracts, the
++# "build" photos of a house. The find/grep content lane applied the whole set
++# and silently omitted those documents from every user search (the note said
++# "dependency/build/cache/backup directories" and nothing else). The content
++# lane now prunes only what is never a document: VCS internals, dependency
++# trees and caches. The rg zero-match probes keep upstream's full set.
++_USER_CONTENT_DIR_NAMES = frozenset({
++    "backup", "backups", "build", "coverage", "dist", "out", "target", "vendor",
++})
++_CONTENT_SEARCH_PRUNE_DIR_NAMES = frozenset(SEARCH_PRUNE_DIR_NAMES - _USER_CONTENT_DIR_NAMES)
 +
+ 
  def _macos_protected_search_exclusions(
      path: str, *, cwd: Optional[str] = None, home: Optional[str] = None, platform: Optional[str] = None,
- ) -> List[str]:
-@@ -116,6 +130,64 @@
-     if result.exit_code == 124:
-         return _SEARCH_TIMEOUT_MARKER_RE.sub("", result.stdout), "search_timeout"
+@@ -118,27 +145,94 @@
      return result.stdout, None
-+
-+
+ 
+ 
 +def _cap_output_columns(output: str, width: int) -> str:
 +    """Lucaryin fold: the ``cut -c1-<width>`` of the shell grep pipeline, applied
 +    in-process when that pipeline runs natively (giant single-line containment)."""
@@ -84,10 +94,11 @@
 +                pass
 +        except OSError:
 +            pass
- 
- 
++
++
  # A real rg/grep output line is a whitespace-free path token followed by ``:``
-@@ -124,21 +196,30 @@
+ # (match/count), ``-`` (context), or nothing (files_only); tool diagnostics
+ # ("rg: ...", indented carets) never match.
  _SEARCH_OUTPUT_RE = re.compile(r'^([A-Za-z]:)?[^\s:][^\n]*?[:\-]\d|^[^\s:][^\s]*$')
  
  
@@ -121,7 +132,7 @@
          else:
              diagnostics.append(line)
      return '\n'.join(diagnostics), '\n'.join(payload)
-@@ -180,11 +261,14 @@
+@@ -180,11 +274,14 @@
      if result.error and not _is_line_oriented_newline_error(result.error):
          return result
      result.error = None
@@ -137,7 +148,7 @@
      return result
  
  
-@@ -197,13 +281,15 @@
+@@ -197,13 +294,15 @@
  
  
  def _parse_search_output(result, output_mode: str, limit: int, offset: int,
@@ -156,7 +167,7 @@
      if result.exit_code == 2 and not payload.strip():
          error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
          return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
-@@ -322,7 +408,7 @@
+@@ -322,7 +421,7 @@
      # --- native rg transport (local POSIX) --------------------------------------
  
      def _run_rg_native(self, argv: List[str], fetch_limit: int, timeout: int,
@@ -165,7 +176,7 @@
          """Run ``argv`` (shell-quoted rg words) natively and stop reading after
          ``fetch_limit`` lines — the ``| head -n`` of the shell pipeline without the
          two bash spawns. ``shlex.split`` undoes the escaping the builders apply for
-@@ -333,8 +419,10 @@
+@@ -333,8 +432,10 @@
          ``merge_stderr`` mirrors the shell path's stderr handling: merged for content
          search (diagnostics feed the error message), discarded (``2>/dev/null``) for
          file lists and probes."""
@@ -178,7 +189,7 @@
          args = shlex.split(" ".join(argv))
          try:
              proc = subprocess.Popen(
-@@ -350,9 +438,20 @@
+@@ -350,9 +451,20 @@
          bounded = threading.Event()
  
          def _drain() -> None:
@@ -200,7 +211,7 @@
                      bounded.set()
                      break
  
-@@ -371,7 +470,8 @@
+@@ -371,7 +483,8 @@
                  exit_code = 124
                  break
          if proc.poll() is None:
@@ -210,7 +221,7 @@
          proc.wait()
          drainer.join()
          proc.stdout.close()
-@@ -386,15 +486,17 @@
+@@ -386,15 +499,17 @@
  
      def _run_rg_bounded(self, words: List[str], fetch_limit: int, timeout: int, *,
                          merge_stderr: bool = False, native_ok: bool = True,
@@ -232,11 +243,10 @@
  
      def _quote_executable(self, executable: str) -> str:
          """Quote an executable without leaking controller path semantics."""
-@@ -470,7 +572,105 @@
-         for item in self._macos_search_exclusions(path):
+@@ -471,6 +586,109 @@
              out.extend(["--glob", self._escape_shell_arg(f"!{item}/**")])
          return out
-+
+ 
 +    # --- Lucaryin fold (0020): local-macOS content-search bounds -------------------
 +
 +    def _local_darwin_env(self) -> bool:
@@ -278,8 +288,12 @@
 +        if not self._local_darwin_env():
 +            return False
 +        from tools import file_operations as _fo  # lazy: _HOME is monkeypatched there
-+        root = self._absolute_root(path).lower()
-+        home = os.path.normpath(_fo._HOME).lower()
++        # Lucaryin fold (R2-3-26): compared as REAL paths. A symlinked root such as
++        # ~/iCloud -> ~/Library/Mobile Documents/com~apple~CloudDocs (or a home
++        # spelled through a symlink) looked like an ordinary folder here, so rg
++        # walked straight into iCloud Drive and materialised every placeholder.
++        root = os.path.realpath(self._absolute_root(path)).lower()
++        home = os.path.realpath(os.path.normpath(_fo._HOME)).lower()
 +        excluded = [os.path.normpath(os.path.join(root, item.lower()))
 +                    for item in self._macos_search_exclusions(path)]
 +
@@ -303,15 +317,16 @@
 +        root_name = os.path.basename(
 +            getattr(self.env, "cwd", None) or self.cwd) if normalized == "." else os.path.basename(normalized)
 +        return [f"--exclude-dir={self._escape_shell_arg(name)}"
-+                for name in sorted(SEARCH_PRUNE_DIR_NAMES) if name != root_name]
++                for name in sorted(_CONTENT_SEARCH_PRUNE_DIR_NAMES) if name != root_name]
 +
 +    def _prune_name_expr(self, root: str) -> str:
 +        """find ``\\( -type d \\( -name A -o -name B ... \\) ! -path <root> \\) -prune``
 +        for the shared prune policy; the root itself is exempt even when it carries a
 +        pruned name (an explicit ``.../build`` search must still search it)."""
-+        names = " -o ".join(f"-name {self._escape_shell_arg(name)}" for name in sorted(SEARCH_PRUNE_DIR_NAMES))
++        names = " -o ".join(
++            f"-name {self._escape_shell_arg(name)}" for name in sorted(_CONTENT_SEARCH_PRUNE_DIR_NAMES))
 +        return f"\\( -type d \\( {names} \\) ! -path {root} \\) -prune"
- 
++
 +    @staticmethod
 +    def _grep_lane_skip_note(cloud: bool, partials_lost: bool = False) -> str:
 +        """What the find/grep lane never reads. Attached when a search timed out (so
@@ -323,7 +338,7 @@
 +        skipped = [
 +            "binary files",
 +            f"files over {_CONTENT_SEARCH_MAX_FILE_MB} MB",
-+            "hidden and dependency/build/cache/backup directories (node_modules, venv, .git, ...)",
++            "hidden and dependency/cache directories (node_modules, venv, .git, ...)",
 +        ]
 +        if cloud:
 +            skipped.append("cloud files not downloaded to this Mac (iCloud/File Provider "
@@ -338,7 +353,7 @@
      def _path_exists_probe(self, path: str) -> str:
          """Stdout of the existence probe: contains "exists" or "not_found"."""
          if self._native_read_enabled():
-@@ -522,10 +722,17 @@
+@@ -522,10 +740,17 @@
              (existing if "exists" in self._path_exists_probe(expanded) else missing).append(expanded)
          if not existing:
              return None
@@ -356,7 +371,7 @@
          else:
              merged = SearchResult()
              for root in existing:
-@@ -537,6 +744,9 @@
+@@ -537,6 +762,9 @@
                  merged.counts.update(sub.counts)
                  merged.total_count += sub.total_count
                  merged.truncated = merged.truncated or sub.truncated
@@ -366,7 +381,7 @@
              merged.matches = merged.matches[:limit]
              merged.files = merged.files[:limit]
          note = f"path contained {len(parts)} entries; searched {len(existing)} that exist"
-@@ -549,6 +759,7 @@
+@@ -549,6 +777,7 @@
              protected_paths = [absolute for _r, _rel, absolute in self._effective_macos_search_exclusions(existing)]
              if protected_paths:
                  warning_parts.append(self._macos_protected_search_warning(protected_paths))
@@ -374,7 +389,7 @@
          merged.warning = " ".join(warning_parts)
          return merged
  
-@@ -586,6 +797,12 @@
+@@ -586,6 +815,12 @@
          rg = self._quote_executable(rg_executable)
          has_meta = bool(re.search(r"[.\[\](){}?*+^$\\|]", pattern))
          glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
@@ -387,7 +402,7 @@
          for flags, template in self._ZERO_MATCH_PROBES:
              if flags == "-F" and not has_meta:
                  continue
-@@ -595,9 +812,9 @@
+@@ -595,9 +830,9 @@
                  glob_expr_probe = f"{glob_expr} {self._search_prune_glob_args()}"
              else:
                  glob_expr_probe = glob_expr
@@ -400,7 +415,7 @@
              total, per_file = 0, []
              for line in (probe.stdout or "").strip().splitlines():
                  p, _sep, n = line.rpartition(":")
-@@ -772,13 +989,19 @@
+@@ -772,13 +1007,19 @@
                  return SearchResult(error=capability_error)
          rg = self._quote_executable(rg_executable)
          sort_arg = " --sortr=modified" if order == "modified" else ""
@@ -421,7 +436,7 @@
          stdout, limit_reason = _search_stdout_and_limit(result)
          all_files = [f for f in stdout.splitlines() if f]
          if scoped_common:
-@@ -799,7 +1022,13 @@
+@@ -799,7 +1040,13 @@
      def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
                          limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
          """Content search: rg, else grep; attaches zero-match steering hints."""
@@ -436,7 +451,7 @@
          if used_rg:
              result = self._search_with_rg(pattern, path, file_glob, limit, offset, output_mode, context,
                                            rg_executable=self._resolve_command("rg") or "rg")
-@@ -810,7 +1039,8 @@
+@@ -810,7 +1057,8 @@
                  error="Content search requires ripgrep (rg) or grep. "
                        "Install ripgrep: https://github.com/BurntSushi/ripgrep#installation")
          if (not result.error and result.total_count == 0
@@ -446,7 +461,7 @@
              try:
                  hint = self._zero_match_probe(pattern, path, file_glob)
              except Exception:
-@@ -825,24 +1055,53 @@
+@@ -825,24 +1073,53 @@
  
      def _run_search_pipeline(self, cmd_parts: List[str], output_mode: str, limit: int,
                               offset: int, context: int, warning: Optional[str] = None,
@@ -510,7 +525,7 @@
  
      def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
                          limit: int, offset: int, output_mode: str, context: int,
-@@ -865,24 +1124,32 @@
+@@ -865,24 +1142,32 @@
              cmd_parts.append("--multiline")
          if context > 0:
              cmd_parts.extend(["-C", str(context)])
@@ -546,7 +561,7 @@
          if context > 0:
              parts.extend(["-C", str(context)])
          if file_glob:
-@@ -898,24 +1165,35 @@
+@@ -898,24 +1183,35 @@
          # grep's --exclude-dir matches BASENAMES anywhere, so it can't express "only
          # the home-level Downloads"; route pruning through find's path-scoped -prune.
          protected_paths = self._protected_prune_paths(path)
@@ -585,7 +600,7 @@
  
      def _search_with_grep_pruned(self, pattern: str, path: str, file_glob: Optional[str],
                                   limit: int, offset: int, output_mode: str, context: int,
-@@ -923,16 +1201,46 @@
+@@ -923,16 +1219,46 @@
          """grep fallback with PATH-scoped protected-dir pruning: ``find ... -prune``
          enumerates files (traversal never enters protected dirs) and hands them to
          grep via ``-exec {} +``; hidden dirs pruned to mirror ``--exclude-dir='.*'``.
@@ -644,7 +659,7 @@
 +        return result
 --- a/tools/file_operations.py
 +++ b/tools/file_operations.py
-@@ -1410,10 +1410,13 @@
+@@ -1452,10 +1452,13 @@
          exclusions = self._macos_search_exclusions(path)
          if exclusions and not result.error:
              skipped = ", ".join(item.split("/")[-1] for item in exclusions)
@@ -661,7 +676,7 @@
  
 --- a/tools/file_tools.py
 +++ b/tools/file_tools.py
-@@ -1012,7 +1012,12 @@
+@@ -1026,7 +1026,12 @@
          # Structured like ``_warning`` above: text appended after the JSON
          # breaks every json.loads consumer (execute_code RPC, strict tool-message
          # providers) — #90322.
@@ -675,12 +690,10 @@
              result_dict["_hint"] = (
                  f"Results truncated. Use offset={offset + limit} to see more, "
                  "or narrow with a more specific pattern or file_glob."
-@@ -1020,6 +1025,35 @@
-         return json.dumps(result_dict, ensure_ascii=False)
-     except Exception as e:
+@@ -1036,6 +1041,36 @@
          return tool_error(str(e))
-+
-+
+ 
+ 
 +def _search_timeout_hint(result_dict: dict, target: str = "content") -> str:
 +    """Lucaryin fold: honest shape for a search that hit its time limit. The engine
 +    stops wherever the deadline caught it, so total_count only covers the part it
@@ -697,17 +710,20 @@
 +        return (
 +            f"File search timed out before finishing. {coverage} Never searched: whatever "
 +            "lies past the deadline, plus what a filename search skips by policy (listed in "
-+            "'warning' when it applies: macOS protected folders on a broad root, hidden and "
-+            "dependency/build/cache directories). Narrow 'path' to one folder or use a more "
-+            "specific name pattern (e.g. 'invoice*.pdf').")
++            "'warning' when it applies: macOS protected folders on a broad root, hidden "
++            "directories, and with ripgrep whatever .gitignore excludes). Narrow 'path' to one "
++            "folder or use a more specific name pattern (e.g. 'invoice*.pdf').")
 +    return (
 +        f"Search timed out before finishing. {coverage} Never searched: whatever lies "
 +        "past the deadline, plus what this search skips by policy (listed in 'warning' "
 +        "when it applies: macOS protected folders on a broad root, cloud files not "
-+        "downloaded to this Mac, binary files, files over the size cap, "
-+        "dependency/build/cache directories). Narrow 'path' to one folder, add a "
++        "downloaded to this Mac, binary files, files over the size cap, hidden and "
++        "dependency/cache directories such as node_modules, venv and .git — never a "
++        "folder merely named backup/build/out/dist/vendor). Narrow 'path' to one folder, add a "
 +        "file_glob (e.g. '*.pdf'), or use target='files' for a filename lookup "
 +        "(names only, nothing is read).")
- 
- 
++
++
+ # ---------------------------------------------------------------------------
+ # Schemas + Registry
  # ---------------------------------------------------------------------------

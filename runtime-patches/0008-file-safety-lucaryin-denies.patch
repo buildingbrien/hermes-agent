@@ -1,8 +1,370 @@
 --- a/agent/file_safety.py
 +++ b/agent/file_safety.py
-@@ -92,6 +92,13 @@
+@@ -7,7 +7,12 @@
+ 
+ from __future__ import annotations
+ 
++import functools
+ import os
++import stat
++import sys
++import time
++import unicodedata
+ from pathlib import Path
+ from contextlib import suppress
+ from typing import Optional
+@@ -33,13 +38,342 @@
+     return _constants_path("get_default_hermes_root")
+ 
+ 
++def _lucaryin_profile_homes() -> list[Path]:
++    """Lucaryin fold (R2-3-13, bug hunt round 2): every profile home under the
++    root, listed at CHECK time. A Lucaryin Mac runs one runtime per agent
++    (thoth, neith, ptah, set, motion ...) as the same OS user, each with its own
++    ``<root>/profiles/<name>``; upstream guards only the ACTIVE home and the
++    root, so one agent's file tools could read a sibling's auth.json / .env /
++    mcp-tokens and rewrite its state.db and sessions with no deny and no card.
++    Listed live (not memoised) so a profile created after import is covered."""
++    try:
++        return sorted(p for p in (_hermes_root_path() / "profiles").iterdir() if p.is_dir())
++    except OSError:
++        return []
++
++
++# Lucaryin fold (HA3 review, 2026-09-23): every deny comparison below goes
++# through _deny_key. macOS's default APFS volume and NTFS are case-insensitive
++# (APFS is normalization-insensitive too), but realpath() keeps whatever case
++# the caller typed, so an exact-string deny was one keystroke away from a
++# bypass: write ~/.hermes/CRON/jobs.json rewrote the real jobs.json, and
++# profiles/NEITH/auth.json read a sibling's keys — the R2-3-02 class again.
++# On those platforms both sides are NFC-normalized and case-folded (and on
++# Windows the trailing dots/spaces Win32 strips from a name are dropped).
++# A case-sensitive volume can only over-block, never under-block.
++_DENY_FOLDS_CASE = sys.platform == "darwin" or os.name == "nt"
++
++# Roots macOS firmlinks from /System/Volumes/Data (/usr/share/firmlinks):
++# /System/Volumes/Data/Users/x IS /Users/x, and realpath() leaves it alone.
++_FIRMLINK_FALLBACK = ("/AppleInternal", "/Applications", "/Library", "/Users", "/Volumes",
++                      "/cores", "/opt", "/pkg", "/private", "/usr/local")
++_firmlink_roots_cache: Optional[tuple] = None
++
++
++def _firmlink_roots() -> tuple:
++    global _firmlink_roots_cache
++    if _firmlink_roots_cache is None:
++        roots = []
++        with suppress(OSError, UnicodeDecodeError):
++            with open("/usr/share/firmlinks", encoding="utf-8") as f:
++                roots = [ln.split("\t", 1)[0].strip() for ln in f if ln.startswith("/")]
++        _firmlink_roots_cache = tuple(r for r in roots if r) or _FIRMLINK_FALLBACK
++    return _firmlink_roots_cache
++
++
++def _deny_text(s: str, *, nt: bool = os.name == "nt", darwin: bool = sys.platform == "darwin") -> str:
++    """The cheap textual aliases, folded before any comparison: on macOS a
++    leading /System/Volumes/Data in front of a firmlinked root; on Windows the
++    \\\\?\\ and \\\\?\\UNC\\ device prefixes (either slash direction)."""
++    if nt:
++        s = s.replace("/", "\\")
++        if s[:8].upper() == "\\\\?\\UNC\\":
++            s = "\\\\" + s[8:]
++        elif s[:4] in ("\\\\?\\", "\\\\.\\"):
++            s = s[4:]
++    elif darwin and s.startswith("/System/Volumes/Data/"):
++        rest = s[len("/System/Volumes/Data"):]
++        if any(rest == r or rest.startswith(r + "/") for r in _firmlink_roots()):
++            s = rest
++    return s
++
++
++def _deny_fold(s: str, *, nt: bool = os.name == "nt", folds: Optional[bool] = None) -> str:
++    """Case / normalization fold of a path or name (see _DENY_FOLDS_CASE)."""
++    if not ((_DENY_FOLDS_CASE if folds is None else folds) or nt):
++        return s
++    if nt:
++        s = "\\".join(part.rstrip(" .") if part not in (".", "..") else part
++                       for part in s.split("\\"))
++    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", s).casefold())
++
++
++def _deny_key(path) -> str:
++    """``path`` in deny-comparison form (see the notes above)."""
++    return _deny_key_of(os.fspath(path), _DENY_FOLDS_CASE)
++
++
++@functools.lru_cache(maxsize=8192)
++def _deny_key_of(s: str, folds: bool) -> str:
++    # One check compares the same few strings ~100 times; the fold is pure.
++    return _deny_fold(_deny_text(s), folds=folds)
++
++
++# Lucaryin fold (HA3 verifier, 2026-09-23): text is not identity. realpath()
++# does not canonicalise every alias of a path — a macOS firmlink spelling the
++# text fold above misses, a hardlinked file, on Windows the \\?\ spellings,
++# \\localhost\C$\ admin shares and 8.3 short names — so every deny below
++# ALSO compares by file identity (st_dev, st_ino; os.path.samestat): the
++# resolved path's existing ancestors are stat'ed once per check, each deny base
++# once per _DENY_STAT_TTL (cached). A base that does not exist yet is compared
++# as (its nearest existing ancestor, the folded rest of its path). A zero
++# st_ino (some network/FAT filesystems on Windows) is no identity at all.
++# A HARDLINKED file (st_nlink > 1) is also matched against the files directly
++# inside a denied directory, for directories small enough to list
++# (_DENY_DIR_SCAN_MAX entries: the auth dir with bridge.token, mcp-tokens/,
++# vault/, cron/); exact-file denies (auth.json, .env, state.db ...) match any
++# hardlink through the identity compare itself.
++_DENY_STAT_TTL = 2.0      # seconds a deny base's stat / listing is reused
++_DENY_CHAIN_TTL = 0.5     # seconds a checked path's ancestor chain is reused
++_DENY_DIR_SCAN_MAX = 256
++_deny_base_ids: dict = {}
++_deny_dir_ids: dict = {}
++_deny_chain_memo: tuple = ("", 0.0, {}, None)
++_deny_path = os.path      # the path flavour the walk splits with (tests swap in ntpath)
++
++
++def _deny_ident(st) -> Optional[tuple]:
++    return (st.st_dev, st.st_ino) if st is not None and st.st_ino else None
++
++
++def _deny_stat(p: str):
++    try:
++        return os.stat(p)
++    except (OSError, ValueError):
++        return None
++
++
++def _deny_walk(p: str, *, all_ancestors: bool):
++    """Yield ``(identity, folded components below it)`` for ``p``'s existing
++    ancestors, deepest first (``p`` itself included); only the nearest one
++    unless ``all_ancestors``."""
++    rest: list = []
++    while True:
++        ident = _deny_ident(_deny_stat(p))
++        if ident is not None:
++            yield ident, tuple(rest)
++            if not all_ancestors:
++                return
++        parent = _deny_path.dirname(p)
++        if not parent or parent == p:
++            return
++        rest.insert(0, _deny_fold(_deny_path.basename(p)))
++        p = parent
++
++
++def _deny_begin_check() -> None:
++    """A public check starts: its path's ancestor chain is stat'ed afresh."""
++    global _deny_chain_memo
++    _deny_chain_memo = ("", 0.0, {}, None)
++
++
++def _deny_chain(resolved) -> tuple:
++    """``({identity: [rest, ...]}, stat of the path itself or None)`` over the
++    checked path's existing ancestors, memoised for the check in progress."""
++    global _deny_chain_memo
++    key, now = os.fspath(resolved), time.monotonic()
++    memo_key, memo_until, memo, own = _deny_chain_memo
++    if memo_key == key and now < memo_until:
++        return memo, own
++    own = _deny_stat(key)
++    chain: dict = {}
++    for ident, rest in _deny_walk(key, all_ancestors=True):
++        chain.setdefault(ident, []).append(rest)
++    _deny_chain_memo = (key, now + _DENY_CHAIN_TTL, chain, own)
++    return chain, own
++
++
++def _deny_dir_members(base) -> frozenset:
++    """Identities of the regular files directly inside ``base`` (cached); empty
++    when it is not a directory or holds more than _DENY_DIR_SCAN_MAX entries."""
++    b = os.fspath(base).rstrip("/\\") or os.fspath(base)
++    now = time.monotonic()
++    hit = _deny_dir_ids.get(b)
++    if hit is not None and now < hit[0]:
++        return hit[1]
++    ids: set = set()
++    try:
++        with os.scandir(b) as it:
++            for n, entry in enumerate(it):
++                if n >= _DENY_DIR_SCAN_MAX:
++                    ids = set()
++                    break
++                with suppress(OSError):
++                    if entry.is_file(follow_symlinks=False):
++                        # os.stat, not entry.stat(): on Windows a DirEntry's
++                        # st_ino / st_dev are always zero.
++                        ident = _deny_ident(os.stat(entry.path, follow_symlinks=False))
++                        if ident is not None:
++                            ids.add(ident)
++    except OSError:
++        ids = set()
++    if len(_deny_dir_ids) > 1024:
++        _deny_dir_ids.clear()
++    out = frozenset(ids)
++    _deny_dir_ids[b] = (now + _DENY_STAT_TTL, out)
++    return out
++
++
++def _deny_base_id(base) -> Optional[tuple]:
++    """``(identity, rest)`` of a deny base's nearest existing ancestor, cached."""
++    b = os.fspath(base)
++    b = b.rstrip("/\\") or b
++    now = time.monotonic()
++    hit = _deny_base_ids.get(b)
++    if hit is not None and now < hit[0]:
++        return hit[1]
++    found = next(_deny_walk(b, all_ancestors=False), None)
++    if len(_deny_base_ids) > 4096:
++        _deny_base_ids.clear()
++    _deny_base_ids[b] = (now + _DENY_STAT_TTL, found)
++    return found
++
++
++def _deny_same_or_under(resolved, base, *, exact: bool) -> bool:
++    """File-identity form of ``resolved == base`` (``exact``) or ``resolved``
++    at/below ``base``."""
++    found = _deny_base_id(base)
++    if found is None:
++        return False
++    chain, own = _deny_chain(resolved)
++    rests = chain.get(found[0])
++    if rests:
++        brest = found[1]
++        if exact:
++            if brest in rests:
++                return True
++        elif any(r[:len(brest)] == brest for r in rests):
++            return True
++    if exact or own is None or own.st_nlink < 2 or not stat.S_ISREG(own.st_mode) or found[1]:
++        return False
++    return _deny_ident(own) in _deny_dir_members(base)
++
++
++def _deny_under(resolved, base) -> bool:
++    """``_is_under`` for the deny checks: equal to ``base`` or below it, compared
++    as ``_deny_key`` strings, then by file identity. (``_is_under`` itself keeps
++    upstream semantics for its other callers — the safe-root check and the
++    container-mirror classifier, which calls ``relative_to`` right after it.)"""
++    r, b = _deny_key(resolved), _deny_key(base)
++    if r == b or r.startswith(b if b.endswith(("/", "\\")) else b + os.sep):
++        return True
++    return _deny_same_or_under(resolved, base, exact=False)
++
++
++def _deny_same_location(a, b) -> bool:
++    """``a`` and ``b`` name the same place (text first, then identity) — for
++    comparing two deny BASES, e.g. the active home with the profile homes."""
++    if _deny_key(a) == _deny_key(b):
++        return True
++    ia = _deny_base_id(a)
++    return ia is not None and ia == _deny_base_id(b)
++
++
++def _deny_in(resolved, candidates) -> bool:
++    """Exact-path membership: ``_deny_key`` strings, then file identity."""
++    candidates = list(candidates)
++    key = _deny_key(resolved)
++    if any(key == _deny_key(c) for c in candidates):
++        return True
++    return any(_deny_same_or_under(resolved, c, exact=True) for c in candidates)
++
++
++def _resolve_child(base, rel: str) -> Optional[str]:
++    """``str((base / rel).resolve())`` for an ALREADY-RESOLVED ``base`` at a fraction
++    of the cost: only ``rel``'s own components are lstat'ed (plain strings, no
++    pathlib), and a symlink among them falls back to a full resolve. A missing
++    component ends the walk (resolve() appends the rest lexically too). With a
++    deny set that is profile-wide this runs ~100 times per check; resolving every
++    candidate in full cost 3.3 ms per check with six profiles (review,
++    2026-09-23). Windows always takes the full resolve (junctions are not
++    S_ISLNK)."""
++    b = os.fspath(base)
++    if os.name == "nt":  # pragma: no cover - Windows
++        return next((str(p) for p in _resolve_each([Path(b) / rel])), None)
++    p = b
++    for part in rel.split(os.sep):
++        p = os.path.join(p, part)
++        try:
++            if stat.S_ISLNK(os.lstat(p).st_mode):
++                return next((str(x) for x in _resolve_each([Path(b) / rel])), None)
++        except OSError:
++            return os.path.join(b, rel)
++    return p
++
++
++def _resolve_children(bases, rel: str) -> list[str]:
++    """``_resolve_child`` for every base, skipping failures."""
++    return [p for p in (_resolve_child(b, rel) for b in bases) if p is not None]
++
++
++def _lucaryin_auth_dirs() -> list[Path]:
++    """Resolved ``~/.lucaryin/auth`` and ``$LUCARYIN_AUTH_DIR`` (the bridge points
++    every agent at the former): the desktop app's connector tokens
++    (``{connector}.token``, read by bridges) and, since B1, the bridge's own bearer
++    (``bridge.token``, published for readers whose env no longer carries it —
++    hermes-bridge/server.py ``_publish_bridge_bearer_file``, which states the
++    runtime's deny set must cover it). The bridge gate cards a shell touch of
++    either spelling as credential_read; a cron job granted credential_read at
++    creation would still have read the bearer through read_file card-free, so the
++    file tools refuse the whole directory, read and write, at every trust level.
++    Nothing shipped reads it through them: the Google and Plaid skills use a
++    terminal curl, and the addons read the bearer with plain open()."""
++    dirs = [Path.home() / ".lucaryin" / "auth"]
++    env_dir = (os.environ.get("LUCARYIN_AUTH_DIR") or "").strip()
++    if env_dir:
++        dirs.append(Path(os.path.expanduser(env_dir)))
++    return list(dict.fromkeys(_resolve_each(dirs)))
++
++
++# Lucaryin fold (R2-3-13): another agent's PRIVATE state, denied to read and
++# write only in the SIBLING profile homes (the active agent keeps upstream's
++# behaviour on its own copies). config.yaml carries literal connector tokens
++# (PLAID_*, AgentCard, the Google access token — R2-1-22) and the MCP server
++# commands a rewrite would turn into code execution at that agent's next start;
++# state.db and sessions/ are that agent's whole customer transcript. An agent
++# that needs something from a teammate asks it (ask_agent), it does not open
++# the teammate's stores.
++_SIBLING_PRIVATE_FILES = ("config.yaml", "state.db", "state.db-wal", "state.db-shm")
++_SIBLING_PRIVATE_DIRS = ("sessions",)
++
++
++def _lucaryin_sibling_homes(hermes_dirs: list[Path]) -> list[Path]:
++    """``hermes_dirs`` minus the active HERMES_HOME (the root counts as a sibling
++    when a profile is active, and every profile does when the root is)."""
++    active = _resolve_each([_hermes_home_path()])
++    return [d for d in hermes_dirs if not any(_deny_same_location(d, a) for a in active)]
++
++
++def _sibling_private_hit(resolved, hermes_dirs: list[Path], *, files_only: bool = False) -> bool:
++    """True when ``resolved`` is (or, unless ``files_only``, lies inside) a sibling
++    profile's private state (see ``_SIBLING_PRIVATE_FILES``)."""
++    siblings = _lucaryin_sibling_homes(hermes_dirs)
++    if not siblings:
++        return False
++    names = _SIBLING_PRIVATE_FILES if files_only else _SIBLING_PRIVATE_FILES + _SIBLING_PRIVATE_DIRS
++    return any(_deny_under(resolved, p) for name in names for p in _resolve_children(siblings, name))
++
++
+ def _hermes_dirs() -> list[Path]:
+-    """Resolved active HERMES_HOME and global root, deduplicated.
++    """Resolved active HERMES_HOME, global root and (Lucaryin fold) every sibling
++    profile home, deduplicated.
+ 
+-    Both are checked so credential stores at <root>/... stay guarded when
+-    running under a profile (HERMES_HOME = <root>/profiles/<name>).
++    All are checked so credential stores at <root>/... stay guarded when
++    running under a profile (HERMES_HOME = <root>/profiles/<name>), and so the
++    deny set is profile-WIDE: the same files are denied in every profile dir.
+     """
+-    return list(dict.fromkeys(_resolve_each((_hermes_home_path(), _hermes_root_path()))))
++    return list(dict.fromkeys(_resolve_each(
++        (_hermes_home_path(), _hermes_root_path(), *_lucaryin_profile_homes()))))
+ 
+ 
+ def _resolve_each(paths) -> list[Path]:
+@@ -90,10 +424,21 @@
+     hermes_files = (".env", ".anthropic_oauth.json", os.path.join("cache", "bws_cache.enc.json"))
+     paths = [
          *(os.path.join(home, *f) for f in home_files),
-         *(str(base / f) for f in hermes_files for base in (_hermes_home_path(), _hermes_root_path())),
+-        *(str(base / f) for f in hermes_files for base in (_hermes_home_path(), _hermes_root_path())),
          "/etc/sudoers", "/etc/passwd", "/etc/shadow",
 +        # ── Lucaryin gate-state integrity (Sprint-1 CRITICAL) ──────────────
 +        # This file IS the consent gate's own state. If write_file can forge it
@@ -12,9 +374,17 @@
 +        # the durable boundary is the separate-user sandbox, FD1/FD3.)
 +        os.path.join(home, ".lucaryin", "agent-configs.db"),
      ]
-     return {os.path.realpath(p) for p in paths}
+-    return {os.path.realpath(p) for p in paths}
++    # Lucaryin fold: every profile's copy, not only the active one. The dirs are
++    # listed and resolved ONCE (a nested generator re-listed them per file) and
++    # each child is lstat'ed under its already-resolved dir (_resolve_child).
++    hermes_dirs = _hermes_dirs()
++    return {os.path.realpath(p) for p in paths} | {
++        p for f in hermes_files for p in _resolve_children(hermes_dirs, f)}
  
-@@ -102,6 +109,11 @@
+ 
+ def build_write_denied_prefixes(home: str) -> list[str]:
+@@ -102,6 +447,12 @@
          *(os.path.join(home, d) for d in (".ssh", ".aws", ".gnupg", ".kube")),
          "/etc/sudoers.d", "/etc/systemd",
          *(os.path.join(home, *d) for d in ((".docker",), (".azure",), (".config", "gh"), (".config", "gcloud"))),
@@ -22,11 +392,81 @@
 +        # Dialing policy, approval records, and grants: an agent that rewrites
 +        # these self-authorizes its own gates. Deny the whole surface; sanctioned
 +        # edits go through the bridge APIs, never a raw write.
-+        *(os.path.join(home, ".lucaryin", d) for d in ("policies", "approvals", "interactive-grants", "grants")),
++        *(os.path.join(home, ".lucaryin", d)
++          for d in ("policies", "approvals", "approved", "interactive-grants", "grants")),
      ]
      return [os.path.realpath(p) + os.sep for p in paths]
  
-@@ -229,7 +241,19 @@
+@@ -130,29 +481,47 @@
+ # rewrite. Session transcripts (state.db, sessions/) are application-owned
+ # state whose rewrite can falsify history and break resume/compression;
+ # mcp-tokens/ and pairing/ hold credential material.
+-_HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing")
++# Lucaryin fold (R2-1-14): cron/ holds jobs.json — the record of every job's
++# prompt, trust level and standing grants — plus its .jobs_*.tmp / backup
++# siblings and the .jobs.lock. An agent that rewrites it grants itself a
++# standing approval or raises a job's trust with no card. Job management goes
++# through the cronjob tool (which the bridge gate cards); the generic file
++# tools never write there. Denied in every profile dir (_hermes_dirs).
++_HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing", "cron")
+ 
+ 
+ def _classify_write_denial(path: str) -> Optional[str]:
+     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
++    _deny_begin_check()
+     home, resolved = _home_and_resolved(path)
+ 
+     # Approval-gated paths are allowed at this layer so interactive tools can
+     # prompt; checked first so the ``.ssh/`` prefix deny doesn't swallow them.
+-    if resolved in build_write_approval_paths(home):
++    # Lucaryin fold: every comparison here is a _deny_key comparison (case- and
++    # normalization-folded on macOS / Windows — see _DENY_FOLDS_CASE).
++    if _deny_in(resolved, build_write_approval_paths(home)):
+         return None
+ 
+-    if resolved in build_write_denied_paths(home) or any(
+-        resolved.startswith(prefix) for prefix in build_write_denied_prefixes(home)
++    if _deny_in(resolved, build_write_denied_paths(home)) or any(
++        _deny_under(resolved, prefix) for prefix in build_write_denied_prefixes(home)
+     ):
+         return "credential"
+ 
+-    for base in _hermes_dirs():
++    hermes_dirs = _hermes_dirs()
++    for base in hermes_dirs:
+         for sub in _HERMES_PROTECTED_SUBPATHS:
+             with suppress(Exception):
+-                if _is_under(resolved, os.path.realpath(os.path.join(str(base), sub))):
++                protected = _resolve_child(base, sub)
++                if protected is not None and _deny_under(resolved, protected):
+                     return "credential"
+ 
++    # Lucaryin fold: the connector-token / bridge-bearer store, and another
++    # agent's config.yaml (its MCP server commands and literal tokens).
++    if any(_deny_under(resolved, d) for d in _lucaryin_auth_dirs()):
++        return "credential"
++    if _sibling_private_hit(resolved, hermes_dirs, files_only=True):
++        return "credential"
++
+     safe_roots = get_safe_write_roots()
+     if safe_roots and not any(_is_under(resolved, root) for root in safe_roots):
+         return "safe_root"
+@@ -180,8 +549,9 @@
+ def is_write_approval_required(path: str) -> bool:
+     """True if ``path`` is approval-gated (``~/.ssh/config``): interactive callers
+     prompt, callers without a channel treat it as a block (fail closed)."""
++    _deny_begin_check()
+     home, resolved = _home_and_resolved(path)
+-    return resolved in build_write_approval_paths(home)
++    return _deny_in(resolved, build_write_approval_paths(home))
+ 
+ 
+ # Secret-bearing project-local env file basenames, blocked anywhere on disk.
+@@ -230,24 +600,51 @@
+     ``TERMINAL_CWD``) MUST pass an absolute path: ``resolve()`` here anchors at
+     the process cwd, so a relative ``"auth.json"`` would miss the denylist.
+     """
++    _deny_begin_check()
      resolved = Path(path).expanduser().resolve()
      hermes_dirs = _hermes_dirs()
      reason = None
@@ -37,13 +477,45 @@
 +    # — never read the material itself. It lives under $HOME (NOT HERMES_HOME),
 +    # so it needs its own check. Structural deny, no approval path.
 +    _lucaryin_browser = _resolve_each([Path.home() / ".lucaryin" / "agent-browser"])
-+    if _lucaryin_browser and _is_under(resolved, _lucaryin_browser[0]):
++    # Lucaryin fold: every comparison below is a _deny_key comparison (case-
++    # and normalization-folded on macOS / Windows — see _DENY_FOLDS_CASE).
++    if _lucaryin_browser and _deny_under(resolved, _lucaryin_browser[0]):
 +        reason = (
 +            "is inside the agent-browser profile, which holds the user's signed-in "
 +            "session material. Session material is structurally unreachable — use "
 +            "the browser tools to operate signed-in sites instead."
 +        )
-+    elif any(_is_under(resolved, hd / "skills" / ".hub") for hd in hermes_dirs):
++    elif any(_deny_under(resolved, d) for d in _lucaryin_auth_dirs()):
++        reason = (
++            "is inside the Lucaryin connector credential store (OAuth tokens and the "
++            "bridge bearer) and cannot be read directly. Connectors and the bridge use "
++            "these credentials through internal channels." + _DID_SUFFIX
++        )
++    elif any(_deny_under(resolved, hd / "skills" / ".hub") for hd in hermes_dirs):
          reason = (
              "is an internal Hermes cache file and cannot be read directly to prevent "
              "prompt injection. Use the skills_list or skill_view tools instead."
+         )
+-    elif any(resolved in _resolve_each(hd / name for hd in hermes_dirs) for name in _CREDENTIAL_FILE_NAMES):
++    elif any(_deny_in(resolved, _resolve_children(hermes_dirs, name)) for name in _CREDENTIAL_FILE_NAMES):
+         reason = (
+             "is a Hermes credential store and cannot be read directly. Provider tools "
+             "consume these credentials through internal channels." + _DID_SUFFIX
+         )
++    elif _sibling_private_hit(resolved, hermes_dirs):
++        reason = (
++            "is another agent's private state (its config.yaml, session database or "
++            "transcripts) and cannot be read directly. Ask that agent instead "
++            "(ask_agent)." + _DID_SUFFIX
++        )
+     else:
+         for subdir, dir_msg, file_msg in _READ_DENIED_DIRS:
+-            for blocked_dir in _resolve_each(hd / subdir for hd in hermes_dirs):
+-                if _is_under(resolved, blocked_dir):
+-                    reason = (dir_msg if resolved == blocked_dir else file_msg) + _DID_SUFFIX
++            for blocked_dir in _resolve_children(hermes_dirs, subdir):
++                if _deny_under(resolved, blocked_dir):
++                    reason = (dir_msg if _deny_key(resolved) == _deny_key(blocked_dir) else file_msg) + _DID_SUFFIX
+                     break
+             if reason:
+                 break
