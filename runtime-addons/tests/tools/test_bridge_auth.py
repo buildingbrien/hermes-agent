@@ -29,7 +29,7 @@ from tools import fleet_send
 _RUNTIME = Path(__file__).resolve().parents[2]
 ADDONS = _RUNTIME.parents[1] / "runtime-addons"
 ADDON_FILES = ("dial_meeting.py", "fleet_send.py", "delegate_neith.py", "board_tool.py", "meeting_notes.py",
-               "ask_agent_tool.py")
+               "ask_agent_tool.py", "gbrain_tool.py")
 
 # hermes-bridge/server.py @ lucaryin-ai 1ef2e65, copied verbatim (docstring included).
 BRIDGE_WRITER_SOURCE = textwrap.dedent('''
