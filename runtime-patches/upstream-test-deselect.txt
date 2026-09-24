@@ -28,6 +28,31 @@ tests/tools/test_local_env_blocklist.py::TestSanePathIncludesHomebrew::test_make
 # and no longer introduces itself as "Hermes Agent".
 tests/agent/test_prompt_builder.py::TestBuildContextFilesPrompt::test_empty_dir_loads_seeded_global_soul
 
+# 0009-browser-cdp-session-material (HA3, 2026-09-22): Network.getRequestPostData
+# and the CacheStorage domain are session material on a Lucaryin machine (the
+# body a form just posted; the Cache API) and are refused before any CDP
+# connection; upstream asserts they succeed and only redacts key-shaped values.
+tests/tools/test_browser_cdp_tool.py::test_get_request_post_data_flagged_passes_through
+tests/tools/test_browser_cdp_tool.py::test_get_request_post_data_unflagged_still_redacts
+tests/tools/test_browser_cdp_tool.py::test_nested_unflagged_binary_path_passes_through
+# Same fold, browser_console (review, 2026-09-23): session-material JS
+# (document.cookie, localStorage, ...) is refused at EVERY setting — the floor
+# under the bridge gate's credential_read card; upstream asserts the default
+# config evaluates it (its names-based denylist is opt-in). The rest of that
+# test's expressions (fetch, a password-field selector) still evaluate.
+tests/tools/test_browser_console.py::TestBrowserConsole::test_expression_allows_risky_eval_by_default
+
+# 0026-cron-oneshot-late-fire-window (HA4 + the B5 pair contract in
+# lucaryin-ai hermes-bridge/cron_tick_support.py, 2026-09-23): a one-shot past
+# its late-fire window is kept only while its run_claim / fire_claim is LIVE.
+# Upstream keeps it for any claim that is merely present; under the bridge's
+# serial ticks a tick killed while the one-shot sat queued left exactly such a
+# claim, and the job was then never run, never retired and never diagnosed.
+# This test's claim is 3 h old from another host (past the 1800 s TTL): it is
+# now retired with a diagnostic. A live claim still keeps the record
+# (runtime-addons/tests/cron/test_oneshot_late_fire_window.py).
+tests/cron/test_oneshot_grace_due_scan.py::TestOneShotGraceDueScan::test_stale_with_claim_skipped_but_record_kept
+
 # 0010-browser-tool-uiaccess: browser_type probes the target box (`get`)
 # before `fill` so UI-access session material is never typed into a page
 # the operator did not point at; upstream asserts exactly one browser

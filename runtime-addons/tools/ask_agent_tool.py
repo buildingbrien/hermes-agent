@@ -28,6 +28,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from tools.bridge_auth import bridge_bearer
 
 # Same map the bridges and voice server use. Keep in sync.
 AGENT_PORTS = {"thoth": 9001, "ptah": 9005, "set": 9006, "neith": 9007}
@@ -67,7 +68,7 @@ def ask_agent(agent: str, question: str, sender: str = "") -> str:
     payload = {"messages": [{"role": "user", "content": q}], "agent_id": target}
     payload.update(_budget_fields(sender))
     headers = {"Content-Type": "application/json"}
-    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+    token = bridge_bearer()  # file-then-env (tools/bridge_auth.py, HA3)
     if token:
         headers["Authorization"] = f"Bearer {token}"
 

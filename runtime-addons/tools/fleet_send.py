@@ -16,6 +16,7 @@ import time
 import urllib.request
 import urllib.error
 import uuid
+from tools.bridge_auth import bridge_bearer
 
 FLEET_SEND_SCHEMA = {
     "name": "fleet_send",
@@ -55,7 +56,7 @@ def _auth_headers(extra: "dict | None" = None) -> dict:
     h = {"Content-Type": "application/json"}
     if extra:
         h.update(extra)
-    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+    token = bridge_bearer()  # file-then-env (tools/bridge_auth.py, HA3)
     if token:
         h["Authorization"] = f"Bearer {token}"
     return h
@@ -66,30 +67,10 @@ def _auth_headers(extra: "dict | None" = None) -> dict:
 # exports FLEET_DELEGATION_* env vars. Attach the next-hop budget to every
 # outbound fleet message so the receiving bridge seeds its worker's depth
 # and refuses runaway cascades.
-_FLEET_VISITED_MAX = 16
-
-
-def _delegation_budget_fields(sender: str) -> dict:
-    try:
-        depth = max(0, int(os.environ.get("FLEET_DELEGATION_DEPTH", "0")))
-    except ValueError:
-        depth = 0
-    origin = os.environ.get("FLEET_DELEGATION_ORIGIN", "").strip().lower()
-    visited = []
-    for item in os.environ.get("FLEET_DELEGATION_VISITED", "").split(","):
-        name = item.strip().lower()
-        if name and name not in visited:
-            visited.append(name)
-        if len(visited) >= _FLEET_VISITED_MAX:
-            break
-    sender_l = (sender or "").strip().lower()
-    if sender_l and sender_l not in visited:
-        visited.append(sender_l)
-    return {
-        "delegation_depth": depth + 1,
-        "delegation_origin": origin or sender_l,
-        "delegation_visited": visited,
-    }
+# The budget lives in tools/fleet_budget.py, shared with delegate_to_neith
+# (R2-2-23: three copies had drifted; the bridge worker's default of 3 is the
+# fleet's). This name is kept for callers and tests.
+from tools.fleet_budget import next_hop_fields as _delegation_budget_fields  # noqa: E402
 
 
 def _post_json(url: str, payload: dict, timeout: int = 10) -> dict:

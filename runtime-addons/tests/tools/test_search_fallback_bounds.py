@@ -25,6 +25,7 @@ the rg anchoring; relative roots printed ``./x``; a symlinked root listed nothin
 
 import json
 import os
+import pathlib
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -36,8 +37,8 @@ from agent.search_policy import SEARCH_PRUNE_DIR_NAMES
 from tools.environments.local import LocalEnvironment
 from tools.file_operations import ExecuteResult, SearchResult, ShellFileOperations
 from tools.file_operations_search import (
-    _cap_output_columns, _maybe_warn_line_oriented_newline_pattern, _parse_search_output,
-    _split_tool_diagnostics)
+    _CONTENT_SEARCH_PRUNE_DIR_NAMES, _USER_CONTENT_DIR_NAMES, _cap_output_columns,
+    _maybe_warn_line_oriented_newline_pattern, _parse_search_output, _split_tool_diagnostics)
 
 PROTECTED = ("Desktop", "Documents", "Downloads", "Library")
 POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="native search lane is POSIX-only")
@@ -121,8 +122,11 @@ class TestFindEnumeratedFormOnMac:
         assert command.endswith("{} +")  # no shell redirect token on the native lane
         assert "--exclude-dir" not in command
         assert f"\\( -type d -name '.*' ! -path {q(str(root))} \\) -prune" in command
-        for name in SEARCH_PRUNE_DIR_NAMES:
+        # R2-3-35: dependency/cache names are pruned; user-folder names never are.
+        for name in _CONTENT_SEARCH_PRUNE_DIR_NAMES:
             assert f"-name {q(name)}" in command
+        for name in _USER_CONTENT_DIR_NAMES:
+            assert f"-name {q(name)}" not in command, name
         assert "cloud files not downloaded to this Mac" in (result.warning or "")
 
     def test_home_root_keeps_protected_prunes_and_adds_the_bounds(self, local_env, tmp_path, monkeypatch):
@@ -144,14 +148,14 @@ class TestFindEnumeratedFormOnMac:
         assert "discarded" not in result.warning  # not a timeout
 
     def test_root_named_like_a_pruned_dir_is_exempt(self, local_env, tmp_path, monkeypatch):
-        root = tmp_path / "build"
+        root = tmp_path / "node_modules"  # "build" is user content since R2-3-35
         root.mkdir()
         ops, capture = _local_ops(local_env, monkeypatch, cwd=tmp_path)
 
         ops.search("needle", path=str(root), target="content")
 
         (command, _cwd), = capture.calls
-        assert "-name 'build'" in command
+        assert "-name 'node_modules'" in command
         assert f"! -path {ops._escape_shell_arg(str(root))} \\) -prune" in command
 
     def test_relative_root_is_anchored_absolute_and_exempt_from_the_hidden_prune(self, local_env, tmp_path, monkeypatch):
@@ -249,8 +253,12 @@ class TestRecursiveGrepFormElsewhere:
         assert command.startswith("grep -rnHE --exclude-dir='.*' ")
         assert command.endswith(f"-I --line-buffered 'needle' {q(str(root))}")
         assert "$PWD" not in command
-        for name in SEARCH_PRUNE_DIR_NAMES:
+        # R2-3-35: the content lane excludes dependency/cache trees, never the
+        # plain-English folder names upstream's code-probe policy also carries.
+        for name in _CONTENT_SEARCH_PRUNE_DIR_NAMES:
             assert f"--exclude-dir={q(name)}" in command
+        for name in _USER_CONTENT_DIR_NAMES:
+            assert f"--exclude-dir={q(name)}" not in command, name
         assert "-flags" not in command and not command.startswith("find")
 
     def test_remote_shell_keeps_pwd_anchor_and_skips_the_roots_own_name(self, monkeypatch):
@@ -827,3 +835,115 @@ class TestHonestTimeoutHint:
 
 def test_cap_output_columns_matches_cut():
     assert _cap_output_columns("a" * 3000 + "\nshort\n", 2000) == "a" * 2000 + "\nshort\n"
+
+
+# ── R2-3-35: user folders named like build output are still searched ─────────
+
+class TestContentPrunePolicyKeepsUserFolders:
+    """Bug hunt round 2: the find/grep content lane applied the whole code-probe
+    policy, so documents in folders named backup, backups, out, dist, build,
+    target, vendor or coverage silently vanished from every user search."""
+
+    def test_user_content_names_are_carved_out_of_upstreams_policy(self):
+        assert _USER_CONTENT_DIR_NAMES == {"backup", "backups", "build", "coverage", "dist",
+                                           "out", "target", "vendor"}
+        assert _USER_CONTENT_DIR_NAMES <= SEARCH_PRUNE_DIR_NAMES
+        assert _CONTENT_SEARCH_PRUNE_DIR_NAMES == SEARCH_PRUNE_DIR_NAMES - _USER_CONTENT_DIR_NAMES
+        assert {"node_modules", "venv", ".git", "__pycache__", ".Trash", "site-packages"} <= _CONTENT_SEARCH_PRUNE_DIR_NAMES
+
+    def test_find_lane_prunes_dependency_trees_only(self, local_env, tmp_path, monkeypatch):
+        root = tmp_path / "Users" / "alice" / "Documents" / "Taxes"
+        root.mkdir(parents=True)
+        ops, capture = _local_ops(local_env, monkeypatch, cwd=tmp_path, home=tmp_path / "Users" / "alice")
+        ops.search("needle", path=str(root), target="content")
+        (command, _cwd), = capture.calls
+        assert command.startswith("find -H ")
+        assert "-name 'node_modules'" in command and "-name '.Trash'" in command
+        for name in _USER_CONTENT_DIR_NAMES:
+            assert f"-name '{name}'" not in command, name
+
+    def test_grep_lane_note_no_longer_claims_build_and_backup_are_skipped(self, local_env, tmp_path, monkeypatch):
+        root = tmp_path / "proj"
+        root.mkdir()
+        ops, _capture = _local_ops(local_env, monkeypatch, cwd=tmp_path, home=tmp_path)
+        result = ops.search("needle", path=str(root), target="content")
+        note = result.warning or ""
+        assert "dependency/cache directories" in note
+        assert "build" not in note and "backup" not in note
+
+    @POSIX_ONLY
+    def test_documents_in_a_backup_folder_are_found_and_node_modules_are_not(self, local_env, tmp_path, monkeypatch):
+        """Real find/grep (macOS) or grep -r (elsewhere): a hit under backup/ is
+        returned; the dependency tree next to it stays pruned."""
+        root = tmp_path / "docs"
+        for sub in ("backup", "out", "vendor", "node_modules", ".git"):
+            (root / sub).mkdir(parents=True)
+            (root / sub / "notes.txt").write_text("the needle is here\n")
+        (root / "top.txt").write_text("needle at the top\n")
+        ops = _real_ops(local_env, monkeypatch, cwd=root)
+        result = ops.search("needle", path=str(root), target="content")
+        assert result.error is None, result.error
+        hit_dirs = {pathlib.Path(m.path).parent.name for m in result.matches}
+        assert {"backup", "out", "vendor", "docs"} <= hit_dirs, hit_dirs
+        assert "node_modules" not in hit_dirs and ".git" not in hit_dirs, hit_dirs
+
+
+# ── R2-3-26: a symlinked cloud root is classified by its REAL path ───────────
+
+class TestCloudRootIsClassifiedByRealPath:
+    def _home_with_icloud_link(self, tmp_path):
+        home = tmp_path / "Users" / "alice"
+        drive = home / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+        drive.mkdir(parents=True)
+        (home / "iCloud").symlink_to(drive, target_is_directory=True)
+        return home
+
+    def test_symlinked_icloud_root_takes_the_find_lane(self, local_env, tmp_path, monkeypatch):
+        """``~/iCloud -> ~/Library/Mobile Documents/com~apple~CloudDocs``: the raw
+        spelling is not under a cloud dir, the real one is. Before the fix rg walked
+        straight into iCloud Drive and materialised every placeholder."""
+        home = self._home_with_icloud_link(tmp_path)
+        ops, capture = _local_ops(local_env, monkeypatch, cwd=home, engines=("rg", "grep", "find"), home=home)
+        result = ops.search("needle", path=str(home / "iCloud"), target="content")
+        assert [c.split(" ", 1)[0] for c, _cwd in capture.calls] == ["find"], capture.calls
+        assert "-flags +dataless -prune" in capture.calls[0][0]
+        assert "cloud files not downloaded to this Mac" in (result.warning or "")
+
+    def test_symlinked_subfolder_of_icloud_takes_the_find_lane(self, local_env, tmp_path, monkeypatch):
+        home = self._home_with_icloud_link(tmp_path)
+        (home / "iCloud" / "Projects").mkdir()
+        ops, capture = _local_ops(local_env, monkeypatch, cwd=home, engines=("rg", "grep", "find"), home=home)
+        ops.search("needle", path=str(home / "iCloud" / "Projects"), target="content")
+        assert capture.calls[0][0].startswith("find -H "), capture.calls
+
+    def test_home_spelled_through_a_symlink_still_classifies_documents(self, local_env, tmp_path, monkeypatch):
+        (tmp_path / "real").mkdir()
+        (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+        home = tmp_path / "link" / "Users" / "alice"
+        (home / "Documents").mkdir(parents=True)
+        real_home = tmp_path / "real" / "Users" / "alice"
+        ops, capture = _local_ops(local_env, monkeypatch, cwd=home, engines=("rg", "grep", "find"), home=home)
+        ops.search("needle", path=str(real_home / "Documents"), target="content")
+        assert capture.calls[0][0].startswith("find -H "), capture.calls
+
+    def test_plain_symlink_to_an_ordinary_folder_stays_on_rg(self, local_env, tmp_path, monkeypatch):
+        home = tmp_path / "Users" / "alice"
+        (home / "Projects").mkdir(parents=True)
+        (home / "work").symlink_to(home / "Projects", target_is_directory=True)
+        ops, capture = _local_ops(local_env, monkeypatch, cwd=home, engines=("rg", "grep", "find"), home=home)
+        ops.search("needle", path=str(home / "work"), target="content")
+        assert capture.calls[0][0].startswith("rg "), capture.calls
+
+
+def test_timeout_hint_no_longer_claims_build_folders_are_skipped():
+    """R2-3-35 follow-up (review, 2026-09-23): content search stopped pruning
+    user folders named build/backup/out/dist/vendor, and filename search never
+    pruned by name — the timeout hint still said "dependency/build/cache
+    directories" were never searched."""
+    from tools.file_tools import _search_timeout_hint
+    content = _search_timeout_hint({}, "content")
+    files = _search_timeout_hint({}, "files")
+    for hint in (content, files):
+        assert "dependency/build/cache" not in hint, hint
+    assert "node_modules" in content and "backup/build" in content
+    assert "hidden directories" in files and "dependency" not in files

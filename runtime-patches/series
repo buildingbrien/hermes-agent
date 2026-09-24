@@ -21,3 +21,5 @@
 0022-deepseek-vision-default.patch
 0023-cron-lucaryin-delivery.patch
 0024-cron-approval-gate.patch
+0025-lucaryin-child-env-strip.patch
+0026-cron-oneshot-late-fire-window.patch

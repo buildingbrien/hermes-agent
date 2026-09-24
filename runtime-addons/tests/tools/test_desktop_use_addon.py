@@ -623,3 +623,85 @@ class TestTccErrors:
         status = du._tcc_status()
         assert status["process"] == "bash" and status["subject_kind"] == "process"
         assert status["bundle_id"] is None
+
+
+# ── desktop_key: nothing model-authored reaches osascript (R2-2-07) ─────────────
+
+@pytest.fixture
+def key_ready(monkeypatch):
+    """Every precondition passes; the app is "frontmost"; osascript is recorded, not run."""
+    monkeypatch.setattr(du, "_require_ready", lambda app, need_input: None)
+    focused, scripts = [], []
+    monkeypatch.setattr(du, "_focus", lambda app, tries=4: focused.append(app) or True)
+    monkeypatch.setattr(du, "_frontmost_name", lambda: "Notes")
+    monkeypatch.setattr(du, "_audit", lambda entry: None)
+
+    class _Done:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(argv, **_kw):
+        scripts.append(argv)
+        return _Done()
+
+    monkeypatch.setattr(du.subprocess, "run", fake_run)
+    return focused, scripts
+
+
+class TestDesktopKeyAllowlist:
+    INJECTION = 'a" & (do shell script "id > /tmp/pwned") & "'
+
+    def test_quote_injection_is_refused_before_the_app_is_raised(self, key_ready):
+        """The round-2 exploit: an approved "save the note" card whose ``keys`` closes the
+        AppleScript literal. Refused, osascript never runs, the app is never focused."""
+        focused, scripts = key_ready
+        out = du.desktop_key(app="Notes", keys=self.INJECTION, description="save the note")
+        assert out["ok"] is False and "Refused" in out["error"]
+        assert scripts == [] and focused == []
+
+    @pytest.mark.parametrize("keys", [
+        'x"', "a\\", "a\nb", "a\rb", "up", "f5", "cmd+é", "cmd+", "shift", "a+b", "ab",
+        "return\" & (do shell script \"id\") & \"", "cmd+s\" & \"", "\x00", "a\tb",
+    ])
+    def test_anything_outside_the_allowlist_is_refused(self, key_ready, keys):
+        focused, scripts = key_ready
+        out = du.desktop_key(app="Notes", keys=keys, description="x")
+        assert out["ok"] is False, out
+        assert scripts == [] and focused == []
+
+    @pytest.mark.parametrize("keys,clause", [
+        ("cmd+s", 'keystroke "s" using {command down}'),
+        ("Cmd-Shift-S", 'keystroke "s" using {command down, shift down}'),
+        ("return", "key code 36"),
+        ("ctrl+enter", "key code 36 using {control down}"),
+        ("tab", "key code 48"),
+        ("esc", "key code 53"),
+        ("space", "key code 49"),
+        ("delete", "key code 51"),
+        ("shift+a", 'keystroke "a" using {shift down}'),
+        ("/", 'keystroke "/"'),
+        ("'", 'keystroke "\'"'),
+    ])
+    def test_allowlisted_combos_build_the_exact_script(self, key_ready, keys, clause):
+        focused, scripts = key_ready
+        out = du.desktop_key(app="Notes", keys=keys, description="x")
+        assert out["ok"] is True, out
+        assert focused == ["Notes"]
+        (argv,) = scripts
+        assert argv[:2] == ["osascript", "-e"]
+        assert argv[2] == f'tell application "System Events" to {clause}'
+
+    def test_every_keystroke_char_is_a_single_safe_printable(self):
+        """The literal that reaches ``keystroke "<x>"`` can never contain the two AppleScript
+        string metacharacters, a control character or anything non-ASCII."""
+        assert all(len(c) == 1 and 0x20 <= ord(c) < 0x7F for c in du._KEYSTROKE_CHARS)
+        assert '"' not in du._KEYSTROKE_CHARS and "\\" not in du._KEYSTROKE_CHARS
+        for bad in ('"', "\\", "\n", "\t", "é", "", "ab"):
+            clause, _ = du._parse_key_combo(bad)
+            assert clause is None, bad
+
+    def test_named_keys_are_integers_never_the_model_text(self):
+        for name, code in du._KEY_CODES.items():
+            clause, mods = du._parse_key_combo(name)
+            assert clause == f"key code {code}" and mods == []
+            assert isinstance(code, int)

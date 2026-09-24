@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 
 from tools.registry import tool_error, registry
+from tools.bridge_auth import bridge_bearer
 
 AGENT_PORTS = {"thoth": 9001, "neith": 9007, "ptah": 9005, "set": 9006}
 
@@ -39,7 +40,7 @@ def _agent() -> str:
 
 def _post(body: dict) -> dict:
     headers = {"Content-Type": "application/json"}
-    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+    token = bridge_bearer()  # file-then-env (tools/bridge_auth.py, HA3)
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(

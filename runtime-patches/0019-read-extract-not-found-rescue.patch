@@ -1,8 +1,54 @@
 --- a/tools/file_operations.py
 +++ b/tools/file_operations.py
-@@ -786,14 +786,18 @@
+@@ -23,7 +23,7 @@
+ from pathlib import Path
+ 
+ from tools.binary_extensions import BINARY_EXTENSIONS
+-from agent.file_safety import get_write_denied_error
++from agent.file_safety import get_read_block_error, get_write_denied_error
+ from tools.file_operations_common import (
+     ExecuteResult, PatchResult, ReadResult, SearchResult, WriteResult,
+     _UTF8_BOM, _detect_line_ending, _has_bom, _normalize_line_endings, _strip_bom,
+@@ -93,6 +93,32 @@
+     return f"Binary file ({kind}, {size}) — cannot display as text."
+ 
+ 
++def canonical_filename(name: str) -> str:
++    """The spelling ``_unicode_variant_match`` compares by: NFC, confusable
++    spaces/quotes collapsed, leading/trailing whitespace dropped (Lucaryin fold,
++    0019). Module-level so the read tools can run the deny list against the
++    spelling a not-found read would be RESCUED to, not only the one requested."""
++    out = unicodedata.normalize("NFC", name)
++    for src, dst in ShellFileOperations._CONFUSABLES:
++        out = out.replace(src, dst)
++    # Lucaryin fold: a leading space (iCloud/Finder " Resume.pdf") is invisible
++    # in ``ls -l`` output — the model retypes it without the space and can never
++    # discover the difference. Same class as NFD.
++    return out.strip()
++
++
++def _rescued_read_block_error(variant: str) -> Optional[str]:
++    """Lucaryin fold (R2-3-02): the deny list is evaluated by the read tools on the
++    REQUESTED path; the not-found rescue then reads a DIFFERENT, resolved spelling.
++    One trailing space on ``~/.hermes/auth/google_oauth.json`` passed the first
++    check (basename "google_oauth.json " is not a credential name) and the rescue
++    read the credential store. Every rescued spelling is re-checked here."""
++    try:
++        return get_read_block_error(variant)
++    except Exception:  # noqa: BLE001 — a guard failure must block, never open
++        return f"Access denied: {variant} could not be checked against the read deny list."
++
++
+ class FileOperations(ABC):
+     """Abstract interface for file operations across terminal backends."""
+ 
+@@ -792,16 +818,23 @@
+         equivalent spelling → suggest similar files."""
          variant = self._unicode_variant_match(path)
          if variant is not None:
++            blocked = _rescued_read_block_error(variant)
++            if blocked:
++                return ReadResult(error=blocked)
              result = self.read_file(variant, offset=offset, limit=limit)
 -            note = (
 -                f"Note: '{path}' not found byte-for-byte; resolved to "
@@ -13,7 +59,7 @@
              result.hint = f"{note} {result.hint}" if result.hint else note
              return result
          return self._suggest_similar_files(path)
-+
+ 
 +    @staticmethod
 +    def _unicode_variant_note(path: str, variant: str) -> str:
 +        return (
@@ -21,10 +67,11 @@
 +            f"the unicode-equivalent file '{variant}' (invisible "
 +            "difference: NFC/NFD, special space/quote characters, "
 +            "or leading/trailing whitespace).")
- 
++
      def _read_binary_file(self, path: str, offset: int, limit: int,
                            file_size: int, sample_bytes: Optional[bytes]) -> ReadResult:
-@@ -905,9 +909,9 @@
+         """Binary branch shared by every read path: UTF-16 text (Notepad, PowerShell
+@@ -918,20 +951,15 @@
  
      def _unicode_variant_match(self, path: str) -> Optional[str]:
          """On-disk spelling of a file whose name is unicode-equivalent to ``path``
@@ -37,19 +84,19 @@
          dir_path = os.path.dirname(path) or "."
          filename = os.path.basename(path)
          if not filename:
-@@ -917,7 +921,10 @@
-             out = unicodedata.normalize("NFC", name)
-             for src, dst in self._CONFUSABLES:
-                 out = out.replace(src, dst)
--            return out
-+            # Lucaryin fold: a leading space (iCloud/Finder " Resume.pdf") is
-+            # invisible in ``ls -l`` output — the model retypes it without the
-+            # space and can never discover the difference. Same class as NFD.
-+            return out.strip()
+             return None
  
+-        def _canon(name: str) -> str:
+-            out = unicodedata.normalize("NFC", name)
+-            for src, dst in self._CONFUSABLES:
+-                out = out.replace(src, dst)
+-            return out
+-
++        _canon = canonical_filename  # module-level: the read tools apply it too
          target = _canon(filename)
          ls_result = self._exec(f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null")
-@@ -940,7 +947,11 @@
+         if ls_result.exit_code != 0 or not ls_result.stdout.strip():
+@@ -953,7 +981,11 @@
          ls_result = self._exec(f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50")
          scored: list = []  # (score, filepath) — higher is better
          if ls_result.exit_code == 0 and ls_result.stdout.strip():
@@ -62,7 +109,21 @@
                  if not f:
                      continue
                  lf = f.lower()
-@@ -995,7 +1006,18 @@
+@@ -976,7 +1008,12 @@
+                 if score == 0 and difflib.SequenceMatcher(None, lower_name, lf).ratio() >= 0.8:
+                     score = 50
+                 if score > 0:
+-                    scored.append((score, os.path.join(dir_path, f)))
++                    candidate = os.path.join(dir_path, f)
++                    # Lucaryin fold (R2-3-02): a did-you-mean must never name a
++                    # read-denied sibling (the credential store next to a typo).
++                    if _rescued_read_block_error(candidate):
++                        continue
++                    scored.append((score, candidate))
+         scored.sort(key=lambda x: -x[0])
+         return ReadResult(error=f"File not found: {path}", similar_files=[fp for _, fp in scored[:5]])
+ 
+@@ -1008,7 +1045,21 @@
          path = self._expand_path(path)
          file_size, status = self._probe_regular_file(path)
          if status == "missing":
@@ -74,6 +135,9 @@
 +            # quote) — canary 2026-09-13, "Documents - <Name>’s MacBook Pro/ X.pdf".
 +            variant = self._unicode_variant_match(path)
 +            if variant is not None:
++                blocked = _rescued_read_block_error(variant)
++                if blocked:
++                    return ReadResult(error=blocked)
 +                result = self.read_file_bytes(variant, max_bytes=max_bytes)
 +                note = self._unicode_variant_note(path, variant)
 +                result.hint = f"{note} {result.hint}" if result.hint else note
@@ -84,7 +148,40 @@
          if status == "env_unavailable":
 --- a/tools/file_tools.py
 +++ b/tools/file_tools.py
-@@ -423,8 +423,21 @@
+@@ -21,7 +21,7 @@
+ from agent.file_safety import get_read_block_error
+ from tools.binary_extensions import has_binary_extension
+ from tools.file_operations import (
+-    ShellFileOperations, normalize_read_pagination, normalize_search_pagination)
++    ShellFileOperations, canonical_filename, normalize_read_pagination, normalize_search_pagination)
+ from tools.file_operations_common import DEFAULT_READ_LIMIT
+ from tools import file_state
+ from agent.redact import redact_sensitive_text
+@@ -405,6 +405,23 @@
+                 "a special (non-regular) file")
+ 
+ 
++def _read_block_error_any_spelling(resolved) -> str | None:
++    """Lucaryin fold (R2-3-02): the Hermes deny list, evaluated on the requested
++    spelling AND on the spelling the not-found rescue would resolve it to
++    (whitespace / NFC / confusables folded — ``canonical_filename``). The rescue
++    itself re-checks the variant it picks; this belt-and-braces check means a
++    denied store is refused up front, before any directory listing happens."""
++    target = str(resolved)
++    block_error = get_read_block_error(target)
++    if block_error:
++        return block_error
++    base = os.path.basename(target)
++    canon = canonical_filename(base)
++    if canon and canon != base:
++        return get_read_block_error(os.path.join(os.path.dirname(target), canon))
++    return None
++
++
+ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task_id: str) -> str | None:
+     """Render an extractable document (.docx/.xlsx/.pdf/...) as paginated text.
+ 
+@@ -419,8 +436,21 @@
      if not is_extractable_document(str(_resolved)):
          return None
      file_ops = _get_file_ops(task_id)
@@ -93,7 +190,7 @@
 +    # read_file_bytes — its not-found recovery lists the directory and
 +    # would surface sibling names from a credential store. The text path
 +    # runs this check before reading; the document path now does too.
-+    block_error = get_read_block_error(str(_resolved))
++    block_error = _read_block_error_any_spelling(_resolved)
 +    if block_error:
 +        return tool_error(block_error)
      try:
@@ -106,7 +203,7 @@
          if binary.error or binary.base64_content is None:
              raise ExtractionError(binary.error or "Document bytes unavailable")
          document_bytes = base64.b64decode(binary.base64_content, validate=True)
-@@ -454,10 +467,13 @@
+@@ -450,10 +480,13 @@
          "file_size": binary.file_size,
          "truncated": total_lines > end_line,
          "extracted_document": True}
@@ -121,3 +218,13 @@
      max_chars = _get_max_read_chars()
      if len(result_dict["content"]) > max_chars:
          _apply_char_budget(result_dict, result_dict["content"], offset, total_lines, max_chars)
+@@ -577,7 +610,8 @@
+         # Hermes internal denylist (prompt injection via catalog metadata,
+         # credential stores). Pass the RESOLVED path: the denylist's own
+         # resolve() uses the process cwd and would miss a relative "auth.json".
+-        block_error = get_read_block_error(str(_resolved))
++        # Lucaryin fold (R2-3-02): checked on the rescued spelling as well.
++        block_error = _read_block_error_any_spelling(_resolved)
+         if block_error:
+             return tool_error(block_error)
+ 
