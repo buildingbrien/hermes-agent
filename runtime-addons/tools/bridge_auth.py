@@ -1,7 +1,8 @@
 """bridge_auth — the one place an addon gets the bridge bearer (HA3, bug hunt round 2).
 
 Every addon that calls a bridge (fleet_send, delegate_to_neith, ask_agent, board,
-dial/meeting_notes, the cron meeting_join and p7 hooks) used to read
+dial/meeting_notes, gbrain_search/gbrain_read on the :9050 gbrain bridge, the
+cron meeting_join and p7 hooks) used to read
 ``BRIDGE_AUTH_TOKEN`` straight out of ``os.environ``. Patch 0025 now strips that
 name from every child the runtime spawns, and the bridge (B1) publishes the token
 to a file so the worker env stops being the only carrier. Readers go FILE first,
