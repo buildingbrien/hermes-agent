@@ -1,6 +1,6 @@
 --- a/cron/scheduler_delivery.py
 +++ b/cron/scheduler_delivery.py
-@@ -15,6 +15,7 @@ import contextvars
+@@ -15,6 +15,7 @@
  import logging
  import os
  import shutil
@@ -8,7 +8,7 @@
  import subprocess
  import sys
  from dataclasses import dataclass
-@@ -26,12 +27,23 @@ from hermes_cli._subprocess_compat import windows_hide_flags
+@@ -25,12 +26,23 @@
  logger = logging.getLogger("cron.scheduler")
  
  
@@ -31,9 +31,9 @@
 +    # Lucaryin chat and an explicit ``deliver=lucaryin[:<session>]`` validate.
 +    LUCARYIN_PLATFORM})
  
- # Platforms supporting a cron/notification home target -> env var used by gateway config.
- _HOME_TARGET_ENV_VARS = {
-@@ -91,6 +103,128 @@ def _resolve_origin(job: dict) -> Optional[dict]:
+ # Gateway platforms whose adapter declares ``supports_async_delivery = False`` (request/response
+ # only, ``send()`` is a stub) — a cron report can never reach them, so they are never a
+@@ -100,6 +112,128 @@
      return None
  
  
@@ -162,7 +162,7 @@
  def _cron_mirror_delivery_enabled(job: dict, cfg: Optional[dict] = None) -> bool:
      """Whether a cron delivery is also mirrored into the target chat's session transcript.
  
-@@ -593,11 +727,34 @@ def _resolve_single_delivery_target(
+@@ -639,11 +773,34 @@
                      job.get("name", job.get("id", "?")), platform_name)
                  # Stands in for the primary conversation (NOT a broadcast): mirror-eligible.
                  return _home_target(platform_name, chat_id, "origin_fallback")
@@ -197,7 +197,7 @@
          from tools.send_message_tool import prepare_send_message_platforms, resolve_send_target
          prepare_send_message_platforms()
          # pass_unresolved_references: no model in the loop to react; an unknown-to-directory target
-@@ -638,6 +795,11 @@ def _resolve_single_delivery_target(
+@@ -684,6 +841,11 @@
          }
      if not _is_known_delivery_platform(platform_name):
          return None
@@ -209,7 +209,7 @@
      chat_id = _get_home_target_chat_id(platform_name)
      return _home_target(platform_name, chat_id, home_provenance) if chat_id else None
  
-@@ -1765,6 +1927,17 @@ def _deliver_result(
+@@ -2030,6 +2192,17 @@
                      unverified_targets.append(bot_chat_error)
              continue
  
@@ -229,7 +229,7 @@
              notify_delivery=notify_delivery,
 --- a/cron/scheduler_preflight.py
 +++ b/cron/scheduler_preflight.py
-@@ -229,6 +229,11 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
+@@ -253,6 +253,11 @@
              # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
              if _delivery.parse_bot_chat_deliver_token(part) is not None:
                  continue

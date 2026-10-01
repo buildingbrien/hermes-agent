@@ -1,9 +1,10 @@
 --- a/cron/jobs.py
 +++ b/cron/jobs.py
 @@ -97,6 +97,55 @@
+ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
  OUTPUT_DIR = CRON_DIR / "output"
  ONESHOT_GRACE_SECONDS = 120
- 
++
 +# ── Lucaryin fold (HA4 / R2-1-43, bug hunt round 2, 2026-09-22) ─────────────
 +# The due scan retires a one-shot scanned more than ONESHOT_GRACE_SECONDS past
 +# its run time without firing it. On a Lucaryin Mac the bridge ticker runs the
@@ -52,11 +53,10 @@
 +            except (TypeError, OverflowError):
 +                pass
 +    return max(ONESHOT_GRACE_SECONDS, min(window, _MAX_LATE_FIRE_WINDOW_SECONDS))
-+
+ 
  
  @dataclass(frozen=True)
- class _CronStorePaths:
-@@ -2508,8 +2557,11 @@
+@@ -2468,8 +2517,11 @@
              job.get("name", job.get("id", "?")))
  
  
@@ -69,7 +69,7 @@
      """
      _write_oneshot_diagnostic(
          job,
-@@ -2517,7 +2569,7 @@
+@@ -2477,7 +2529,7 @@
          f"- job id: {job.get('id')}\n"
          f"- name: {job.get('name')}\n"
          f"- scheduled run time: {next_run}\n"
@@ -78,7 +78,7 @@
          f"- removed at: {_hermes_now().isoformat()}\n\n"
          "This one-shot's run time is more than the grace window in the "
          "past (scheduler down past the window, host asleep, or jobs.json "
-@@ -3061,11 +3113,27 @@
+@@ -3036,11 +3088,27 @@
      and recovery never revives them; only the due scan used to dispatch them hours late). With no
      claim stamped, retire it with a diagnostic (never silently delete). A claim may mean a run is
      still in flight elsewhere — skip but keep the record so its mark_job_run can land."""
@@ -110,11 +110,11 @@
      return True
  
  
---- a/cron/scheduler.py
-+++ b/cron/scheduler.py
-@@ -3917,6 +3917,17 @@
+--- a/cron/scheduler_tick.py
++++ b/cron/scheduler_tick.py
+@@ -77,6 +77,17 @@
          if verbose:
-             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
+             _sched.logger.info("%s - %s job(s) due", _sched._hermes_now().strftime('%H:%M:%S'), len(due_jobs))
  
 +        # Lucaryin fold (0026; B5 pair contract, hermes-bridge/cron_tick_support.py):
 +        # one-shots first. Under the bridge's serial ticks (HERMES_CRON_MAX_PARALLEL=1)

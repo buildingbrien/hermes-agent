@@ -1,6 +1,6 @@
 --- a/tools/file_operations_search.py
 +++ b/tools/file_operations_search.py
-@@ -23,6 +23,33 @@
+@@ -23,7 +23,34 @@
      "Desktop", "Documents", "Downloads", "Library", "Movies", "Music", "Pictures",
  )
  
@@ -30,10 +30,11 @@
 +    "backup", "backups", "build", "coverage", "dist", "out", "target", "vendor",
 +})
 +_CONTENT_SEARCH_PRUNE_DIR_NAMES = frozenset(SEARCH_PRUNE_DIR_NAMES - _USER_CONTENT_DIR_NAMES)
-+
  
++
  def _macos_protected_search_exclusions(
      path: str, *, cwd: Optional[str] = None, home: Optional[str] = None, platform: Optional[str] = None,
+ ) -> List[str]:
 @@ -118,27 +145,94 @@
      return result.stdout, None
  
@@ -243,10 +244,11 @@
  
      def _quote_executable(self, executable: str) -> str:
          """Quote an executable without leaking controller path semantics."""
-@@ -471,6 +586,109 @@
+@@ -482,7 +597,110 @@
+         for item in self._macos_search_exclusions(path):
              out.extend(["--glob", self._escape_shell_arg(f"!{item}/**")])
          return out
- 
++
 +    # --- Lucaryin fold (0020): local-macOS content-search bounds -------------------
 +
 +    def _local_darwin_env(self) -> bool:
@@ -318,7 +320,7 @@
 +            getattr(self.env, "cwd", None) or self.cwd) if normalized == "." else os.path.basename(normalized)
 +        return [f"--exclude-dir={self._escape_shell_arg(name)}"
 +                for name in sorted(_CONTENT_SEARCH_PRUNE_DIR_NAMES) if name != root_name]
-+
+ 
 +    def _prune_name_expr(self, root: str) -> str:
 +        """find ``\\( -type d \\( -name A -o -name B ... \\) ! -path <root> \\) -prune``
 +        for the shared prune policy; the root itself is exempt even when it carries a
@@ -350,11 +352,11 @@
 +                     "disables it on a local host).")
 +        return note
 +
-     def _path_exists_probe(self, path: str) -> str:
-         """Stdout of the existence probe: contains "exists" or "not_found"."""
-         if self._native_read_enabled():
-@@ -522,10 +740,17 @@
-             (existing if "exists" in self._path_exists_probe(expanded) else missing).append(expanded)
+     def _path_exists_probe(self, path: str) -> ExecuteResult:
+         """Existence probe; stdout contains "exists" or "not_found" (or the probe's
+         ``cwd_error`` when the exec wrapper itself failed)."""
+@@ -535,10 +753,17 @@
+             (existing if "exists" in self._path_exists_probe(expanded).stdout else missing).append(expanded)
          if not existing:
              return None
 +        # Lucaryin fold: the engines' own notes (a timed-out lane's skip list, the
@@ -371,7 +373,7 @@
          else:
              merged = SearchResult()
              for root in existing:
-@@ -537,6 +762,9 @@
+@@ -550,6 +775,9 @@
                  merged.counts.update(sub.counts)
                  merged.total_count += sub.total_count
                  merged.truncated = merged.truncated or sub.truncated
@@ -381,7 +383,7 @@
              merged.matches = merged.matches[:limit]
              merged.files = merged.files[:limit]
          note = f"path contained {len(parts)} entries; searched {len(existing)} that exist"
-@@ -549,6 +777,7 @@
+@@ -562,6 +790,7 @@
              protected_paths = [absolute for _r, _rel, absolute in self._effective_macos_search_exclusions(existing)]
              if protected_paths:
                  warning_parts.append(self._macos_protected_search_warning(protected_paths))
@@ -389,7 +391,7 @@
          merged.warning = " ".join(warning_parts)
          return merged
  
-@@ -586,6 +815,12 @@
+@@ -599,6 +828,12 @@
          rg = self._quote_executable(rg_executable)
          has_meta = bool(re.search(r"[.\[\](){}?*+^$\\|]", pattern))
          glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
@@ -402,7 +404,7 @@
          for flags, template in self._ZERO_MATCH_PROBES:
              if flags == "-F" and not has_meta:
                  continue
-@@ -595,9 +830,9 @@
+@@ -608,9 +843,9 @@
                  glob_expr_probe = f"{glob_expr} {self._search_prune_glob_args()}"
              else:
                  glob_expr_probe = glob_expr
@@ -415,7 +417,7 @@
              total, per_file = 0, []
              for line in (probe.stdout or "").strip().splitlines():
                  p, _sep, n = line.rpartition(":")
-@@ -772,13 +1007,19 @@
+@@ -795,13 +1030,19 @@
                  return SearchResult(error=capability_error)
          rg = self._quote_executable(rg_executable)
          sort_arg = " --sortr=modified" if order == "modified" else ""
@@ -436,7 +438,7 @@
          stdout, limit_reason = _search_stdout_and_limit(result)
          all_files = [f for f in stdout.splitlines() if f]
          if scoped_common:
-@@ -799,7 +1040,13 @@
+@@ -822,7 +1063,13 @@
      def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
                          limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
          """Content search: rg, else grep; attaches zero-match steering hints."""
@@ -451,7 +453,7 @@
          if used_rg:
              result = self._search_with_rg(pattern, path, file_glob, limit, offset, output_mode, context,
                                            rg_executable=self._resolve_command("rg") or "rg")
-@@ -810,7 +1057,8 @@
+@@ -833,7 +1080,8 @@
                  error="Content search requires ripgrep (rg) or grep. "
                        "Install ripgrep: https://github.com/BurntSushi/ripgrep#installation")
          if (not result.error and result.total_count == 0
@@ -461,7 +463,7 @@
              try:
                  hint = self._zero_match_probe(pattern, path, file_glob)
              except Exception:
-@@ -825,24 +1073,53 @@
+@@ -848,24 +1096,53 @@
  
      def _run_search_pipeline(self, cmd_parts: List[str], output_mode: str, limit: int,
                               offset: int, context: int, warning: Optional[str] = None,
@@ -525,7 +527,7 @@
  
      def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
                          limit: int, offset: int, output_mode: str, context: int,
-@@ -865,24 +1142,32 @@
+@@ -888,24 +1165,32 @@
              cmd_parts.append("--multiline")
          if context > 0:
              cmd_parts.extend(["-C", str(context)])
@@ -561,14 +563,14 @@
          if context > 0:
              parts.extend(["-C", str(context)])
          if file_glob:
-@@ -898,24 +1183,35 @@
-         # grep's --exclude-dir matches BASENAMES anywhere, so it can't express "only
-         # the home-level Downloads"; route pruning through find's path-scoped -prune.
-         protected_paths = self._protected_prune_paths(path)
--        if protected_paths:
+@@ -924,42 +1209,83 @@
+         # grep applies --exclude-dir='.*' to the command-line root too (GNU grep: to
+         # every component of it), so a search rooted under a hidden dir such as
+         # ~/.hermes returns nothing (#18473); find's -prune only sees descendants.
+-        if protected_paths or self._root_under_hidden_dir(path):
 +        # Lucaryin fold: on a local Mac every content search takes the find-enumerated
 +        # form — the only one that can cap file size and skip cloud placeholders.
-+        if protected_paths or self._local_darwin_env():
++        if protected_paths or self._local_darwin_env() or self._root_under_hidden_dir(path):
              return self._search_with_grep_pruned(
                  pattern, path, file_glob, limit, offset, output_mode, context, protected_paths)
          # -H forces filenames; -E matches rg regex behavior; --exclude-dir='.*'
@@ -600,23 +602,23 @@
  
      def _search_with_grep_pruned(self, pattern: str, path: str, file_glob: Optional[str],
                                   limit: int, offset: int, output_mode: str, context: int,
-@@ -923,16 +1219,46 @@
-         """grep fallback with PATH-scoped protected-dir pruning: ``find ... -prune``
-         enumerates files (traversal never enters protected dirs) and hands them to
-         grep via ``-exec {} +``; hidden dirs pruned to mirror ``--exclude-dir='.*'``.
--        Trade-off: find folds grep's exit code, so a hard grep error surfaces as an
--        empty result — acceptable for this darwin-local-broad-search-only branch."""
+                                  protected_paths: List[str]) -> SearchResult:
+         """grep fallback via ``find ... -prune -exec grep {} +``, used when the root needs
+         path-scoped pruning (macOS protected dirs) or is itself under a dot-directory
+-        (#18473: grep's ``--exclude-dir='.*'`` would drop the root). Trade-off: find folds
+-        grep's exit code, so a hard grep error surfaces as an empty result."""
++        (#18473: grep's ``--exclude-dir='.*'`` would drop the root); hidden dirs below
++        the root are pruned to mirror ``--exclude-dir='.*'``.
 +        Lucaryin fold: the same walk prunes the shared heavyweight-dir policy, skips
 +        files over the size cap and (local macOS) cloud placeholders, exempts the
 +        root from the name prunes, and keeps stderr so ``exec_folded`` can recover
 +        the hard grep error find's exit status hides."""
          grep_parts = self._grep_cmd(["grep", "-nHE"], pattern, output_mode, context)
--        find_parts = [
--            "find", self._escape_shell_arg(path or "."),
--            self._prune_expr(protected_paths), "-o",
--            "\\( -type d -name '.*' \\) -prune", "-o",
--            "-type f",
--        ]
+-        q_root = self._escape_shell_arg(path or ".")
+-        # ``-H``: follow a symlink handed in as the OPERAND (and only the operand). Without
+-        # it ``find <link> -type f`` tests the link itself and hands grep nothing, so a
+-        # symlinked root answered a confident ``total_count: 0`` on every platform (#116270).
+-        find_parts = ["find", "-H", q_root]
 +        root_path = path or "."
 +        if self._native_read_enabled() and not os.path.isabs(root_path):
 +            # Lucaryin fold: anchor a relative root to its absolute path (as the
@@ -626,10 +628,12 @@
 +            protected_paths = self._protected_prune_paths(root_path)
 +        root = self._escape_shell_arg(root_path)
 +        prunes: List[str] = []
-+        if protected_paths:
+         if protected_paths:
+-            find_parts.extend([self._prune_expr(protected_paths), "-o"])
+-        find_parts.extend([self._hidden_prune_expr([q_root]), "-o", "-type f"])
 +            prunes.append(self._prune_expr(protected_paths))
 +        # The root is exempt: "." and an explicit dot-dir root match '.*' themselves.
-+        prunes.append(f"\\( -type d -name '.*' ! -path {root} \\) -prune")
++        prunes.append(self._hidden_prune_expr([root]))
 +        prunes.append(self._prune_name_expr(root))
 +        cloud_safe = self._local_darwin_env()
 +        if cloud_safe:
@@ -659,7 +663,7 @@
 +        return result
 --- a/tools/file_operations.py
 +++ b/tools/file_operations.py
-@@ -1452,10 +1452,13 @@
+@@ -1475,10 +1475,13 @@
          exclusions = self._macos_search_exclusions(path)
          if exclusions and not result.error:
              skipped = ", ".join(item.split("/")[-1] for item in exclusions)
@@ -676,7 +680,7 @@
  
 --- a/tools/file_tools.py
 +++ b/tools/file_tools.py
-@@ -1026,7 +1026,12 @@
+@@ -1117,7 +1117,12 @@
          # Structured like ``_warning`` above: text appended after the JSON
          # breaks every json.loads consumer (execute_code RPC, strict tool-message
          # providers) — #90322.
@@ -690,7 +694,7 @@
              result_dict["_hint"] = (
                  f"Results truncated. Use offset={offset + limit} to see more, "
                  "or narrow with a more specific pattern or file_glob."
-@@ -1036,6 +1041,36 @@
+@@ -1127,6 +1132,36 @@
          return tool_error(str(e))
  
  
