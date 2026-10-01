@@ -1,0 +1,14 @@
+--- a/hermes_cli/models_catalog_static.py
++++ b/hermes_cli/models_catalog_static.py
+@@ -213,7 +213,10 @@
+         "claude-sonnet-4-6", "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929",
+         "claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-haiku-4-5-20251001",
+     ],
+-    "deepseek": ["deepseek-flash", "deepseek-v4-pro"],
++    # Lucaryin fold (patch 0031): deepseek-v4-pro stays the unpinned DeepSeek default
++    # (get_default_model_for_provider returns [0]); upstream v2026.9.21 put flash first.
++    # Model changes ship only as founder-pushed updates (D3), so the v2026.9.14 order is kept.
++    "deepseek": ["deepseek-v4-pro", "deepseek-flash"],
+     "xiaomi": ["mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2-flash"],
+     "tencent-tokenhub": list(_TENCENT_MODELS),
+     "tencent-tokenplan": list(_TENCENT_MODELS),

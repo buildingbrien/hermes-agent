@@ -1,6 +1,6 @@
 --- a/tools/cronjob_tools.py
 +++ b/tools/cronjob_tools.py
-@@ -543,6 +543,238 @@
+@@ -543,8 +543,240 @@
      result = _run_claimed_job(job, extra_prompt=extra_prompt)
      result["dispatched"] = False
      return result
@@ -162,8 +162,8 @@
 +    if sep:
 +        return not ref.strip()
 +    return platform.strip().lower() in _send_message_platforms()
-+
-+
+ 
+ 
 +def _send_message_platforms() -> frozenset:
 +    # send_message resolves a target's platform through this enum. Imported
 +    # lazily like this module's other gateway imports; without the gateway
@@ -236,9 +236,11 @@
 +            if to_error:
 +                return to_error
 +    return None
- 
- 
++
++
  # ---------------------------------------------------------------------------
+ # Tool actions. Each takes the cronjob() argument dict `a` (and the resolved
+ # job record for job-bound actions) and returns the JSON result string.
 @@ -589,7 +821,10 @@
          # failure_deliver shares deliver's grammar and validators.
          or _validate_bot_chat_deliver(_normalize_deliver_param(a["failure_deliver"]))
@@ -284,17 +286,29 @@
      task_id: str = None,
      session_id: Optional[str] = None,
      paused: bool = False,
-@@ -967,7 +1214,9 @@
+@@ -965,9 +1212,11 @@
+     "name": "cronjob_manage",
+     "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
  
- Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless pinned.
+-Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless pinned.
++Jobs run on the agent's main model (as configured when they fire) unless pinned.
  
 -Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
-+Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.
++Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the agent's main model (as configured when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.
 +
 +For a job that carries GRANTS, always prefer action='update' over remove+recreate: the user's standing approval lives on the job, so deleting it burns their consent and recreating files a fresh approval card they must tap again. Update preserves the grant.""",
      "parameters": {
          "type": "object",
          "properties": {
+@@ -983,7 +1232,7 @@
+             },
+             "pinned": {
+                 "type": "boolean",
+-                "description": "For create/update. ONLY set when the user explicitly asks to pin (or unpin) a job's model. pinned=true locks the CURRENT main agent model (and its provider) onto the job so later `hermes model` / `/model` changes never touch it; pinned=false releases the lock so the job follows the main agent model again. Never set it on your own initiative: by default jobs follow the main model."
++                "description": "For create/update. ONLY set when the user explicitly asks to pin (or unpin) a job's model. pinned=true locks the CURRENT main agent model (and its provider) onto the job so later changes to the main model never touch it; pinned=false releases the lock so the job follows the main agent model again. Never set it on your own initiative: by default jobs follow the main model."
+             },
+             "prompt": {
+                 "type": "string",
 @@ -1049,6 +1298,40 @@
              "attach_to_session": {
                  "type": "boolean",

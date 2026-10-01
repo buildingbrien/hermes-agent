@@ -103,6 +103,82 @@ tests/hermes_cli/test_model_normalize.py::TestDeepseekRetiredAliasesAndCustomSlu
 # previous 0006, fails only with the re-fitted one.
 tests/agent/test_provider_fallback.py::TestFallbackChainAdvancement::test_records_sequential_switches_in_order
 
+# 0030-neutral-failure-copy (founder lock: customer-facing Hermes/Nous branding
+# neutralized; DeepSeek is not named in the public privacy policy): upstream
+# v2026.9.21's failed-turn, session-storage, thinking-timeout and cron-failure
+# copy names the runtime ("Hermes hit repeated errors"), the vendor
+# (provider_label_for -> "DeepSeek"), the model id, the Hermes home path and
+# CLI commands a Lucaryin user cannot run (`hermes doctor|setup|fallback add|
+# cron run|cron runs|cron edit|cron doctor|sessions recover|auth add`, /model,
+# /reasoning, extra_headers, max_tokens / max_iterations). 0030 rebinds those
+# tables to agent/lucaryin_neutral_copy.py, so every test below that asserts
+# one of those strings (or the model id / provider label / token counts in the
+# text) diverges by design. The failure_reason / failure_retryable / layer
+# verdicts these tests also check are untouched, and the neutral copy is pinned
+# by runtime-addons/tests/agent/test_lucaryin_neutral_copy.py (503 and a
+# truncated tool call through AIAgent.run_conversation, loop_error, 4xx,
+# session storage, cron notices, drift guard). Verified 2026-10-01: each one
+# passes on pristine v2026.9.21 (CI green at dbdc4ca8, before 0030) and fails
+# only with 0030.
+tests/agent/test_corruption_recovery_guidance.py::test_corrupt_guidance_pins_the_failing_profile
+tests/agent/test_corruption_recovery_guidance.py::test_format_turn_completion_corrupt_includes_recovery_options
+tests/agent/test_corruption_recovery_guidance.py::test_format_turn_completion_corrupt_names_the_sessions_own_store
+tests/agent/test_corruption_recovery_guidance.py::test_format_turn_completion_corrupt_never_names_the_live_db
+tests/agent/test_failed_turn_chat_copy.py::test_api_key_rejection_chat_text_names_the_fix_and_the_provider_label
+tests/agent/test_failed_turn_chat_copy.py::test_exhausted_plan_quota_429_names_the_reset_window_not_wait_a_minute
+tests/agent/test_failed_turn_chat_copy.py::test_interpreter_shutdown_copy_substitutes_the_real_session_id
+tests/agent/test_failed_turn_chat_copy.py::test_invalid_response_copy_never_names_a_model_id_as_the_provider
+tests/agent/test_failed_turn_chat_copy.py::test_invalid_response_stamps_reason_from_embedded_provider_code
+tests/agent/test_failed_turn_chat_copy.py::test_max_retries_exhausted_chat_text_has_next_step_and_no_mechanism_lead
+tests/agent/test_failed_turn_chat_copy.py::test_model_not_found_chat_text_points_at_model_picker_not_http
+tests/agent/test_failed_turn_chat_copy.py::test_oauth_rejection_chat_text_names_the_provider_slug_and_the_failing_profile
+tests/agent/test_failed_turn_chat_copy.py::test_outer_loop_error_copy_has_no_apology_and_routes_to_gateway_layer
+tests/agent/test_failed_turn_site_codes.py::test_context_rejection_far_below_the_window_is_not_blamed_on_the_conversation
+tests/agent/test_failed_turn_site_codes.py::test_empty_response_exhaustion_has_one_text_everywhere
+tests/agent/test_failed_turn_site_codes.py::test_overflow_exhaustion_is_non_retryable_context_overflow_with_slash_commands
+tests/agent/test_failed_turn_site_codes.py::test_persistence_failure_default_copy_is_actionable_and_profile_aware
+tests/agent/test_failed_turn_site_codes.py::test_reasoning_only_copy_gives_the_fix_before_the_scratchpad
+tests/agent/test_run_agent.py::TestHandleMaxIterations::test_api_failure_returns_error
+tests/agent/test_run_agent.py::TestRetryExhaustion::test_invalid_response_returns_error_not_crash
+tests/agent/test_thinking_timeout_guidance.py::TestBuildThinkingTimeoutGuidance::test_guidance_mentions_config_path
+tests/agent/test_thinking_timeout_guidance.py::TestBuildThinkingTimeoutGuidance::test_guidance_mentions_known_providers
+tests/agent/test_turn_completion_explainer.py::test_deleted_wal_cause_is_plain_first_steps_not_a_forensic_runbook
+tests/agent/test_turn_completion_explainer.py::test_explanation_persistence_corrupt_backups_dir_follows_hermes_home
+tests/agent/test_turn_completion_explainer.py::test_explanation_persistence_corrupt_cause_never_says_free_space
+tests/agent/test_turn_completion_explainer.py::test_explanation_persistence_fts_index_never_advises_recovery
+tests/agent/test_turn_completion_explainer.py::test_explanation_persistence_one_arg_backward_compat
+tests/agent/test_turn_completion_explainer.py::test_explanation_persistence_replaced_cause_forbids_inplace_repair
+tests/agent/test_turn_completion_explainer.py::test_explanation_persistence_unknown_cause_is_neutral
+tests/agent/test_turn_completion_explainer.py::test_persistence_commands_are_pinned_to_the_failing_profile[deleted_wal]
+tests/agent/test_turn_completion_explainer.py::test_persistence_commands_are_pinned_to_the_failing_profile[replaced]
+tests/agent/test_turn_completion_explainer.py::test_persistence_commands_are_pinned_to_the_failing_profile[unknown]
+tests/cron/test_cron_failure_alert_remediation_hint.py::test_empty_chain_alert_names_the_remediation_commands
+tests/cron/test_cron_failure_alert_remediation_hint.py::test_exhausted_chain_alert_does_not_carry_the_config_hint
+tests/cron/test_cron_failure_alert_remediation_hint.py::test_rate_limit_empty_chain_also_carries_the_hint
+tests/cron/test_cron_failure_notice_copy.py::test_auth_failure_names_the_pinned_provider_and_the_failing_profile
+tests/cron/test_cron_failure_notice_copy.py::test_auth_failure_points_at_login_and_a_retry_command
+tests/cron/test_cron_failure_notice_copy.py::test_blocked_config_notice_says_it_did_not_run_and_will_self_heal
+tests/cron/test_cron_failure_notice_copy.py::test_cron_cause_gloss_is_the_shared_table
+tests/cron/test_cron_failure_notice_copy.py::test_generic_failure_names_runs_and_pause_commands_and_the_real_output_dir
+tests/cron/test_cron_failure_notice_copy.py::test_rate_and_usage_limit_phrases_still_yield_a_provider_notice
+tests/cron/test_cron_failure_notice_copy.py::test_transient_provider_failures_never_lead_with_jargon
+tests/cron/test_cron_failure_notice_copy.py::test_waf_block_names_the_header_fix_not_a_bare_rerun
+tests/cron/test_cron_failure_summarizer_inactivity.py::test_genuine_provider_timeout_with_fallback_configured
+tests/cron/test_cron_failure_summarizer_inactivity.py::test_genuine_provider_timeout_with_no_fallback_configured
+tests/cron/test_cron_failure_summarizer_inactivity.py::test_rate_limit_classification_still_takes_priority_over_inactivity_text
+tests/cron/test_cron_no_agent.py::test_agent_provider_timeout_delivery_keeps_fallback_guidance
+tests/cron/test_run_one_job.py::test_escaped_failure_delivery_stays_quiet_below_the_threshold
+tests/cron/test_run_one_job.py::test_run_one_job_exception_delivers_failure_alert
+tests/cron/test_scheduler.py::TestSummarizeCronFailureForDelivery::test_http_429_is_still_classified_as_a_rate_limit
+# Same fold, outside the CI slices (keeps a local full-suite run accurate):
+tests/hermes_cli/test_sqlite3_cli_salvage_gate.py::TestGuidanceNeverNamesLiveDb::test_run_agent_corrupt_explanation
+
+# 0031-deepseek-default-order (D3, founder-pushed model changes only): the
+# DeepSeek catalog keeps deepseek-v4-pro first, so an unpinned DeepSeek profile
+# still defaults to v4-pro; upstream v2026.9.21 put deepseek-flash first and
+# asserts that order. Outside the CI slices; listed for local full-suite runs.
+tests/hermes_cli/test_models_dev_preferred_merge.py::TestMergeHelper::test_deepseek_picker_ignores_models_dev_retired_ids
+
 # ── ENVIRONMENTAL ON GITHUB RUNNERS (not divergences; re-check on a runner change) ──
 # Fakes sys.platform="darwin" and runs a REAL search on Linux: patch 0020's
 # darwin-only `find -flags +dataless` prune then reaches GNU find, which has

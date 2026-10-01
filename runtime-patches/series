@@ -23,3 +23,5 @@
 0024-cron-approval-gate.patch
 0025-lucaryin-child-env-strip.patch
 0026-cron-oneshot-late-fire-window.patch
+0030-neutral-failure-copy.patch
+0031-deepseek-default-order.patch
