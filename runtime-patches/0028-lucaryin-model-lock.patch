@@ -1,0 +1,195 @@
+--- a/hermes_cli/fallback_config.py
++++ b/hermes_cli/fallback_config.py
+@@ -103,4 +103,7 @@
+             if identity not in seen:
+                 seen.add(identity)
+                 chain.append(entry)
+-    return chain
++    # Lucaryin 0028: DeepSeek-only model lock — every consumer of the configured
++    # chain (cron, gateway, CLI, auxiliary main-chain) sees DeepSeek routes only.
++    from agent.lucaryin_model_lock import filter_fallback_chain
++    return filter_fallback_chain(chain, source="config fallback_providers/fallback_model")
+--- a/agent/agent_init.py
++++ b/agent/agent_init.py
+@@ -1028,7 +1028,9 @@
+     sync_credential_pool_entry_id(agent)
+ 
+     # Ordered backups tried when the primary is exhausted (legacy single-dict or list).
+-    agent._fallback_chain = _fallback_entries(fallback_model)
++    # Lucaryin 0028: a chain handed straight to AIAgent passes the model lock too.
++    from agent.lucaryin_model_lock import filter_fallback_chain
++    agent._fallback_chain = filter_fallback_chain(_fallback_entries(fallback_model), source="AIAgent fallback_model")
+     agent._fallback_index = 0
+     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+     # Legacy attribute kept for backward compat (tests, external callers)
+@@ -2277,6 +2279,9 @@
+     _setup_logging(agent)
+     _set_defaults(agent, _STREAM_STATE)
+     _build_client(agent, api_key, base_url, fallback_model)
++    # Lucaryin 0028: DeepSeek-only model lock — refuse a non-DeepSeek primary route.
++    from agent.lucaryin_model_lock import enforce_agent_primary
++    enforce_agent_primary(agent)
+     _init_fallback_chain(agent, fallback_model)
+     _load_tools(agent, enabled_toolsets, disabled_toolsets)
+     _init_session_state(
+--- a/agent/chat_completion_helpers.py
++++ b/agent/chat_completion_helpers.py
+@@ -1723,6 +1723,9 @@
+     if agent._fallback_chain and reason not in _RATE_LIMIT_FAILOVER_REASONS:
+         agent._rate_limited_until = max(
+             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
++    # Lucaryin 0028: under the DeepSeek-only lock this is the fail-closed point — say so once.
++    from agent.lucaryin_model_lock import note_fail_closed
++    note_fail_closed(agent, reason)
+     return False
+ 
+ 
+@@ -1737,6 +1740,11 @@
+     from agent.fallback_cooldown import _is_entitlement_rejected
+     if _is_entitlement_rejected(agent, fb_provider, fb_model):
+         logger.info("Fallback skip: %s/%s was rejected as unentitled for this account", fb_provider, fb_model)
++        return True
++    # Lucaryin 0028: DeepSeek-only model lock — last line, whatever built the chain.
++    from agent.lucaryin_model_lock import refuse_fallback_entry
++    if refuse_fallback_entry(fb_provider, fb_model, fb.get("base_url")):
++        unavailable.add(fb_key)
+         return True
+     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
+     if local_skip_reason:
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -4995,6 +4995,23 @@
+     main_runtime: Optional[Dict[str, Any]] = None, is_vision: bool = False,
+     task: Optional[str] = None,
+ ) -> Tuple[Optional[Any], Optional[str]]:
++    """Central router (Lucaryin 0028: the result passes the DeepSeek-only model lock —
++    a client whose endpoint is not DeepSeek comes back as ``(None, None)``, the same
++    "provider not configured" answer every caller already handles). See
++    :func:`_resolve_provider_client_unlocked` for the routing contract."""
++    client, resolved_model = _resolve_provider_client_unlocked(
++        provider, model, async_mode, raw_codex, explicit_base_url, explicit_api_key, api_mode,
++        main_runtime, is_vision, task)
++    from agent.lucaryin_model_lock import guard_resolved_client
++    return guard_resolved_client(client, resolved_model, provider=provider, task=task)
++
++
++def _resolve_provider_client_unlocked(
++    provider: str, model: str = None, async_mode: bool = False, raw_codex: bool = False,
++    explicit_base_url: str = None, explicit_api_key: str = None, api_mode: str = None,
++    main_runtime: Optional[Dict[str, Any]] = None, is_vision: bool = False,
++    task: Optional[str] = None,
++) -> Tuple[Optional[Any], Optional[str]]:
+     """Central router: return a configured client (auth, base URL, API format) for a provider + optional model.
+     The client always exposes ``.chat.completions.create()``; Codex/Responses providers get an adapter.
+     ``provider``: built-in name, ``custom:<name>``, "custom" (OPENAI_BASE_URL + OPENAI_API_KEY) or "auto"
+--- a/agent/turn_usage.py
++++ b/agent/turn_usage.py
+@@ -200,6 +200,10 @@
+         prompt_tokens, completion_tokens, total_tokens,
+         api_duration, _cache_pct, _ident,
+     )
++    # Lucaryin 0028: one MODEL-LOCK VIOLATION line if this call was served off DeepSeek.
++    from agent.lucaryin_model_lock import alert_if_violation
++    alert_if_violation(agent.provider, agent.base_url, agent.model,
++                       where=f"{getattr(agent, 'platform', None) or 'agent'} main-loop")
+     # nous.anthropic_wire=auto: the session's wire is decided once, from this first response.
+     if agent.session_api_calls == 1 and (agent.provider or "") == "nous":
+         with suppress(Exception):
+--- a/agent/aux_accounting.py
++++ b/agent/aux_accounting.py
+@@ -53,6 +53,11 @@
+     The model is read from ``response.model`` (accurate after aux provider fallback);
+     *provider*/*base_url* reflect the originally-resolved route.
+     """
++    # Lucaryin 0028: one MODEL-LOCK VIOLATION line if an auxiliary call was served off DeepSeek
++    # (only when the endpoint is known — fallback-path calls pass no provider/base_url).
++    if base_url:
++        from agent.lucaryin_model_lock import alert_if_violation
++        alert_if_violation(provider, base_url, getattr(response, "model", None), where=f"auxiliary {task or 'call'}")
+     try:
+         if not task or task in _EXCLUDED_TASKS:
+             return
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2164,6 +2164,9 @@
+         return setup
+ 
+     setup.runtime, setup.model = _resolve_job_runtime(job, job_id, jc)
++    # Lucaryin 0028: DeepSeek-only model lock — an unattended run never starts off DeepSeek.
++    from agent.lucaryin_model_lock import enforce_runtime
++    enforce_runtime(setup.runtime, setup.model, where=f"cron job '{job_name}' ({job_id})")
+     setup.reasoning_config = _resolve_job_reasoning_config(
+         job, _cfg if isinstance(_cfg, dict) else {}, str(setup.model)
+     )
+@@ -2220,8 +2223,9 @@
+ class _FireAudit:
+     """One usage_audit.jsonl line per fire (created once the agent exists; fire id + start clock)."""
+ 
+-    def __init__(self, job: dict, job_id: str, model: str):
++    def __init__(self, job: dict, job_id: str, model: str, agent: Any = None):
+         self.job, self.job_id, self.model = job, job_id, model
++        self.agent = agent  # Lucaryin 0028: the route that actually served, not only the configured model
+         self.fire_id = uuid.uuid4().hex
+         self.t_start = time.monotonic()
+ 
+@@ -2236,6 +2240,11 @@
+             "response_silent": bool(result.get("response_silent")),
+             "deliver_target": self.job.get("deliver"),
+             "model": self.model or None,
++            # Lucaryin 0028: the provider/model the agent ended on, and whether it switched —
++            # "model" alone is the configured one, which hid every Anthropic fallback (review F04).
++            "provider": getattr(self.agent, "provider", None) or None,
++            "served_model": getattr(self.agent, "model", None) or None,
++            "fallback_activated": bool(getattr(self.agent, "_fallback_activated", False)),
+             "duration_ms": int((time.monotonic() - self.t_start) * 1000),
+             "error": error})
+ 
+@@ -2378,7 +2387,7 @@
+         agent = _construct_cron_agent(
+             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
+             session_db=_session_db)
+-        _audit = _FireAudit(job, job_id, model)
++        _audit = _FireAudit(job, job_id, model, agent)
+ 
+         # Arm the Lucaryin approval gate now that the agent exists and before it
+         # runs its first tool. See _install_cron_approval_gate: cron must do this
+--- a/agent/agent_runtime_helpers.py
++++ b/agent/agent_runtime_helpers.py
+@@ -2161,6 +2161,9 @@
+     api_mode, base_url, destination_capabilities = _resolve_switch_destination(
+         agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm
+     )
++    # Lucaryin 0028: DeepSeek-only model lock — a live /model switch never leaves DeepSeek.
++    from agent.lucaryin_model_lock import enforce_switch
++    enforce_switch(new_provider, base_url, new_model)
+     snapshot = _snapshot_switch_state(agent)
+     try:
+         _swap_switch_runtime(
+--- a/agent/anthropic_credentials.py
++++ b/agent/anthropic_credentials.py
+@@ -238,6 +238,11 @@
+     """Read refreshable Claude Code OAuth credentials (Keychain and/or file). When both exist: prefer the only
+     non-expired one (Claude Code 2.1.x refreshes one source but not the other), else the later ``expiresAt`` so a
+     refresh uses the freshest refreshToken. ~/.claude.json primaryApiKey is deliberately excluded."""
++    # Lucaryin 0028: never borrow Claude Code's login under the DeepSeek-only lock or with
++    # auth.adopt_external_logins: false (every reader of the borrowed login comes through here).
++    from agent.lucaryin_model_lock import external_logins_allowed
++    if not external_logins_allowed(source="Claude Code"):
++        return None
+     kc_creds = _read_claude_code_credentials_from_keychain()
+     file_creds = _read_claude_code_credentials_from_file()
+     if not (kc_creds and file_creds):
+--- a/hermes_cli/auth_codex.py
++++ b/hermes_cli/auth_codex.py
+@@ -419,6 +419,11 @@
+ 
+ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
+     """Read ~/.codex/auth.json (Codex CLI file) tokens if valid and not expired; never writes."""
++    # Lucaryin 0028: never borrow the Codex CLI's login under the DeepSeek-only lock or with
++    # auth.adopt_external_logins: false.
++    from agent.lucaryin_model_lock import external_logins_allowed
++    if not external_logins_allowed(source="Codex CLI"):
++        return None
+     from hermes_cli.auth import _codex_access_token_is_expiring
+     codex_home = os.getenv("CODEX_HOME", "").strip() or str(Path.home() / ".codex")
+     auth_path = Path(codex_home).expanduser() / "auth.json"
