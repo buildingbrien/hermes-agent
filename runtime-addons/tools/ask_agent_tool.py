@@ -55,7 +55,9 @@ def ask_agent(agent: str, question: str, sender: str = "") -> str:
     if target not in AGENT_PORTS:
         return json.dumps({
             "success": False,
-            "error": f"Unknown agent '{agent}'. Valid: {', '.join(sorted(AGENT_PORTS))}.",
+            "error": (f"Unknown agent '{agent}'. 'agent' is an agent id: "
+                      f"{', '.join(sorted(AGENT_PORTS))}. The fleet roster pairs each "
+                      f"teammate's name with its id; a name is not an id."),
         })
     if not q:
         return json.dumps({"success": False, "error": "question is required"})
@@ -120,13 +122,16 @@ ASK_AGENT_SCHEMA = {
         "The teammate does not see your conversation and does not remember "
         "earlier calls, so make each question self-contained — restate any "
         "role, persona or context the answer depends on. "
-        "Valid agents: thoth, neith, ptah, set."
+        "The `agent` field alone decides who is asked: an agent id (thoth, "
+        "neith, ptah or set), never a display name; the fleet roster pairs each "
+        "teammate's name with its id."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "agent": {"type": "string",
-                      "description": "Teammate to ask: thoth, neith, ptah, or set."},
+                      "enum": ["neith", "ptah", "set", "thoth"],
+                      "description": "The teammate to ask, by agent id: thoth, neith, ptah or set."},
             "question": {"type": "string",
                          "description": "The self-contained question or task."},
         },
