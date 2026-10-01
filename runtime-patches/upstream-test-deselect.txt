@@ -119,7 +119,9 @@ tests/agent/test_provider_fallback.py::TestFallbackChainAdvancement::test_record
 # truncated tool call through AIAgent.run_conversation, loop_error, 4xx,
 # session storage, cron notices, drift guard). Verified 2026-10-01: each one
 # passes on pristine v2026.9.21 (CI green at dbdc4ca8, before 0030) and fails
-# only with 0030.
+# only with 0030. (test_413_compression: the compaction-disabled copy no longer
+# names the compression.enabled config key; /compress is still offered.)
+tests/agent/test_413_compression.py::TestOverflowWithCompactionDisabled::test_413_does_not_compress_when_disabled
 tests/agent/test_corruption_recovery_guidance.py::test_corrupt_guidance_pins_the_failing_profile
 tests/agent/test_corruption_recovery_guidance.py::test_format_turn_completion_corrupt_includes_recovery_options
 tests/agent/test_corruption_recovery_guidance.py::test_format_turn_completion_corrupt_names_the_sessions_own_store
