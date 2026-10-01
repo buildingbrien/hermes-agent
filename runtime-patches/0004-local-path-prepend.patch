@@ -1,6 +1,6 @@
 --- a/tools/environments/local.py
 +++ b/tools/environments/local.py
-@@ -491,6 +491,24 @@
+@@ -603,6 +603,24 @@
      return _prepend_missing_path_entries(existing_path, [bin_dir] if bin_dir else [])
  
  
@@ -25,10 +25,10 @@
  def _managed_runtime_path_entries() -> list[str]:
      """Existing Hermes-managed runtime dirs: ``$HERMES_HOME/node`` (+``/bin``) and
      ``$HERMES_HOME/bin`` (managed ``uv``). Per call, not cached: home is
-@@ -542,7 +560,8 @@
- def _make_run_env(env: dict) -> dict:
-     """Build a run environment with a sane PATH and provider-var stripping."""
-     return _scrubbed_env([(dict(os.environ | env), True)], frozenset(),
+@@ -674,7 +692,8 @@
+     (``strip_launch_profile_env``, a no-op for the launch profile) so the backend's own ``env``
+     and the served profile's declared passthrough names are what the child sees."""
+     return _scrubbed_env([(dict(strip_launch_profile_env(os.environ.copy()) | env), True)], frozenset(),
 -                         lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
 +                         lambda p: _prepend_local_bin_dir(
 +                             _prepend_git_bash_dirs(_append_missing_sane_path_entries(p))))

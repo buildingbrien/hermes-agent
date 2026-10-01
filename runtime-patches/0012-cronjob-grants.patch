@@ -1,9 +1,11 @@
 --- a/tools/cronjob_tools.py
 +++ b/tools/cronjob_tools.py
-@@ -544,6 +544,238 @@ def _try_dispatch_background_run(
+@@ -543,8 +543,240 @@
+     result = _run_claimed_job(job, extra_prompt=extra_prompt)
+     result["dispatched"] = False
      return result
- 
- 
++
++
 +# Actions a job may carry as standing grants. The bridge gate
 +# (approval_gate._grant_permits) decides at run time what a stored grant covers,
 +# but it never refuses to STORE one. A shape it would not honour must be stopped
@@ -160,8 +162,8 @@
 +    if sep:
 +        return not ref.strip()
 +    return platform.strip().lower() in _send_message_platforms()
-+
-+
+ 
+ 
 +def _send_message_platforms() -> frozenset:
 +    # send_message resolves a target's platform through this enum. Imported
 +    # lazily like this module's other gateway imports; without the gateway
@@ -239,7 +241,7 @@
  # ---------------------------------------------------------------------------
  # Tool actions. Each takes the cronjob() argument dict `a` (and the resolved
  # job record for job-bound actions) and returns the JSON result string.
-@@ -588,7 +820,10 @@ def _action_create(a: Dict[str, Any]) -> str:
+@@ -589,7 +821,10 @@
          # failure_deliver shares deliver's grammar and validators.
          or _validate_bot_chat_deliver(_normalize_deliver_param(a["failure_deliver"]))
          or (a["context_from"] and _validate_context_from_refs(
@@ -251,7 +253,7 @@
      if error:
          return tool_error(error, success=False)
  
-@@ -604,6 +839,7 @@ def _action_create(a: Dict[str, Any]) -> str:
+@@ -607,6 +842,7 @@
              model=_normalize_optional_job_value(a["model"]), provider=_normalize_optional_job_value(a["provider"]),
              base_url=_normalize_optional_job_value(a["base_url"], strip_trailing_slash=True),
              script=_normalize_optional_job_value(script), context_from=context_from,
@@ -259,7 +261,7 @@
              enabled_toolsets=a["enabled_toolsets"] or None, workdir=_normalize_optional_job_value(a["workdir"]),
              no_agent=_no_agent, attach_to_session=a["attach_to_session"],
              monitor_script=_normalize_optional_job_value(a["monitor_script"]),
-@@ -814,6 +1050,16 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
+@@ -820,6 +1056,16 @@
      if a["workdir"] is not None:
          # Empty string clears; otherwise update_job() validates/normalizes.
          updates["workdir"] = _normalize_optional_job_value(a["workdir"]) or None
@@ -276,29 +278,42 @@
      if a["no_agent"] is not None:
          # Flipping to True needs a script on the job or in this same update.
          target_no_agent = bool(a["no_agent"])
-@@ -955,6 +1201,7 @@ def cronjob(
+@@ -918,6 +1164,7 @@
      monitor_url: Optional[str] = None,
      reasoning_effort: Optional[str] = None,
      failure_deliver: Optional[Union[str, List[str]]] = None,
 +    grants: Optional[List[Any]] = None,
-     all: Optional[bool] = None,
      task_id: str = None,
      session_id: Optional[str] = None,
-@@ -1004,7 +1251,9 @@ CRONJOB_SCHEMA = {
+     paused: bool = False,
+@@ -965,9 +1212,11 @@
+     "name": "cronjob_manage",
+     "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires a job immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
  
- 'resnap' adopts the CURRENT global inference resolution for an unpinned job (job_id) or all unpinned jobs (all=true) WITHOUT pinning it, so it keeps tracking future global changes — use after deliberately changing the default model.
+-Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless pinned.
++Jobs run on the agent's main model (as configured when they fire) unless pinned.
  
--Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Prefer updating an existing job over creating near-duplicates.""",
-+Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Prefer updating an existing job over creating near-duplicates.
+-Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
++Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the agent's main model (as configured when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.
 +
 +For a job that carries GRANTS, always prefer action='update' over remove+recreate: the user's standing approval lives on the job, so deleting it burns their consent and recreating files a fresh approval card they must tap again. Update preserves the grant.""",
      "parameters": {
          "type": "object",
          "properties": {
-@@ -1087,6 +1336,40 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
+@@ -983,7 +1232,7 @@
+             },
+             "pinned": {
+                 "type": "boolean",
+-                "description": "For create/update. ONLY set when the user explicitly asks to pin (or unpin) a job's model. pinned=true locks the CURRENT main agent model (and its provider) onto the job so later `hermes model` / `/model` changes never touch it; pinned=false releases the lock so the job follows the main agent model again. Never set it on your own initiative: by default jobs follow the main model."
++                "description": "For create/update. ONLY set when the user explicitly asks to pin (or unpin) a job's model. pinned=true locks the CURRENT main agent model (and its provider) onto the job so later changes to the main model never touch it; pinned=false releases the lock so the job follows the main agent model again. Never set it on your own initiative: by default jobs follow the main model."
+             },
+             "prompt": {
+                 "type": "string",
+@@ -1049,6 +1298,40 @@
+             "attach_to_session": {
                  "type": "boolean",
                  "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), a user-written bare platform target (deliver='slack' — that platform's home channel), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
-             },
++            },
 +            "grants": {
 +                "type": "array",
 +                "items": {"type": "object"},
@@ -332,16 +347,15 @@
 +                    "can never be granted. Actions outside the grants still "
 +                    "gate normally at run time."
 +                ),
-+            },
+             },
          },
          "required": ["action"]
-     }
-@@ -1111,7 +1394,12 @@ def check_cronjob_requirements() -> bool:
+@@ -1078,7 +1361,12 @@
  _HANDLER_FORWARDED_ARGS = (
      "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
      "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
--    "paused_reason", "all")
-+    "paused_reason", "all",
+-    "paused_reason", "pinned")
++    "paused_reason", "pinned",
 +    # Lucaryin (0012): standing grants the model requests. Without this the handler drops
 +    # them and the job is stored with grants=[] — every unattended run then re-asks. The
 +    # approval gate classifies cronjob_manage+grants as a standing_grant card, so the

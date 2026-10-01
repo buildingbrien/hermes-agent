@@ -1,6 +1,6 @@
 --- a/agent/prompt_builder.py
 +++ b/agent/prompt_builder.py
-@@ -126,15 +126,29 @@
+@@ -155,15 +155,29 @@
      return (content[end + 4:].lstrip("\n") or content) if end != -1 else content
  
  
@@ -32,10 +32,12 @@
  )
  
  HERMES_AGENT_HELP_GUIDANCE = (
-@@ -564,6 +578,87 @@
+@@ -613,8 +627,89 @@
+         (True, "This is a prior, not a rule: when the request names its own target, follow the request.]"),
+     )
      return " ".join(text for ok, text in gated if ok)
- 
- 
++
++
 +# Anti-hallucination grounding.  Unlike TOOL_USE_ENFORCEMENT_GUIDANCE (which
 +# targets models that under-call tools), this block targets fabrication:
 +# invented URLs, contacts, quotes, and claims of tool use that never happened.
@@ -114,13 +116,13 @@
 +            "its date caveat, or ask the user to provide the material)."
 +        )
 +    return "\n".join(lines)
-+
-+
+ 
+ 
 +
  # Models whose system prompt is sent as the 'developer' role (stronger instruction-following weight);
  # swapped at the API boundary in _build_api_kwargs().
  DEVELOPER_ROLE_MODELS = ("gpt-5", "codex")
-@@ -774,6 +869,23 @@
+@@ -820,6 +915,23 @@
  )
  
  
@@ -144,7 +146,16 @@
  # Backends that run commands (and every file tool) in a separate container / remote host: host OS/$HOME/cwd
  # would mislead, so the agent only sees the machine it can touch.
  _REMOTE_TERMINAL_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "ssh", "vercel_sandbox", "managed_modal"})
-@@ -1003,6 +1115,10 @@
+@@ -881,7 +993,7 @@
+     "path conversion is disabled here, so `git -C /c/Users/x` or `node /tmp/a.js` fails with 'cannot change to'/'not "
+     "found' even though `cd /c/Users/x` (a bash builtin) works. Pass `C:/Users/x`-style forward-slash native paths to "
+     # no-tmp: ok — tells the model what NOT to use
+-    "native tools, and prefer `$LOCALAPPDATA/Temp` (or `$TMPDIR`, which Hermes points at its own scratch dir) for scratch files a native tool must read — never a bare `/tmp`. When "
++    "native tools, and prefer `$LOCALAPPDATA/Temp` (or `$TMPDIR`, which points at your own scratch dir) for scratch files a native tool must read — never a bare `/tmp`. When "
+     "answering prompts in a pty background process, use process(submit) — never process(write) with a bare trailing "
+     "newline: Enter on a Windows PTY is a carriage return, and a lone `\\n"
+     "` is not delivered as a line terminator, so the child's prompt silently never returns. When a CLI offers a "
+@@ -1061,6 +1173,10 @@
      is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS or _plugin_backend_is_remote(backend)
      hints = [_remote_backend_hint(backend)] if is_remote_backend else _local_host_hints()
      hints += [WSL_ENVIRONMENT_HINT] if is_wsl() else []

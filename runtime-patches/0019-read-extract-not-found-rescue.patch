@@ -3,7 +3,7 @@
 @@ -23,7 +23,7 @@
  from pathlib import Path
  
- from tools.binary_extensions import BINARY_EXTENSIONS
+ from tools.binary_extensions import has_binary_extension
 -from agent.file_safety import get_write_denied_error
 +from agent.file_safety import get_read_block_error, get_write_denied_error
  from tools.file_operations_common import (
@@ -42,7 +42,7 @@
  class FileOperations(ABC):
      """Abstract interface for file operations across terminal backends."""
  
-@@ -792,16 +818,23 @@
+@@ -812,16 +838,23 @@
          equivalent spelling → suggest similar files."""
          variant = self._unicode_variant_match(path)
          if variant is not None:
@@ -71,7 +71,7 @@
      def _read_binary_file(self, path: str, offset: int, limit: int,
                            file_size: int, sample_bytes: Optional[bytes]) -> ReadResult:
          """Binary branch shared by every read path: UTF-16 text (Notepad, PowerShell
-@@ -918,20 +951,15 @@
+@@ -938,20 +971,15 @@
  
      def _unicode_variant_match(self, path: str) -> Optional[str]:
          """On-disk spelling of a file whose name is unicode-equivalent to ``path``
@@ -96,7 +96,7 @@
          target = _canon(filename)
          ls_result = self._exec(f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null")
          if ls_result.exit_code != 0 or not ls_result.stdout.strip():
-@@ -953,7 +981,11 @@
+@@ -973,7 +1001,11 @@
          ls_result = self._exec(f"ls -1 {self._escape_shell_arg(dir_path)} 2>/dev/null | head -50")
          scored: list = []  # (score, filepath) — higher is better
          if ls_result.exit_code == 0 and ls_result.stdout.strip():
@@ -109,7 +109,7 @@
                  if not f:
                      continue
                  lf = f.lower()
-@@ -976,7 +1008,12 @@
+@@ -996,7 +1028,12 @@
                  if score == 0 and difflib.SequenceMatcher(None, lower_name, lf).ratio() >= 0.8:
                      score = 50
                  if score > 0:
@@ -123,7 +123,7 @@
          scored.sort(key=lambda x: -x[0])
          return ReadResult(error=f"File not found: {path}", similar_files=[fp for _, fp in scored[:5]])
  
-@@ -1008,7 +1045,21 @@
+@@ -1028,7 +1065,21 @@
          path = self._expand_path(path)
          file_size, status = self._probe_regular_file(path)
          if status == "missing":
@@ -145,22 +145,24 @@
 +            return self._suggest_similar_files(path)
          if status == "not_regular":
              return self._not_regular_error(path)
-         if status == "env_unavailable":
+         if status not in ("ok", "bad_size"):
 --- a/tools/file_tools.py
 +++ b/tools/file_tools.py
-@@ -21,7 +21,7 @@
- from agent.file_safety import get_read_block_error
+@@ -23,7 +23,7 @@
  from tools.binary_extensions import has_binary_extension
+ from tools.skill_provenance import is_background_review
  from tools.file_operations import (
 -    ShellFileOperations, normalize_read_pagination, normalize_search_pagination)
 +    ShellFileOperations, canonical_filename, normalize_read_pagination, normalize_search_pagination)
- from tools.file_operations_common import DEFAULT_READ_LIMIT
+ from tools.file_operations_common import DEFAULT_READ_LIMIT, count_conflict_blocks
  from tools import file_state
- from agent.redact import redact_sensitive_text
-@@ -405,6 +405,23 @@
+ from agent.redact import _is_secret_file_arg, redact_sensitive_text
+@@ -414,6 +414,23 @@
+         return None
+     return next((label for predicate, label in _SPECIAL_FILE_KINDS if predicate(mode)),
                  "a special (non-regular) file")
- 
- 
++
++
 +def _read_block_error_any_spelling(resolved) -> str | None:
 +    """Lucaryin fold (R2-3-02): the Hermes deny list, evaluated on the requested
 +    spelling AND on the spelling the not-found rescue would resolve it to
@@ -176,12 +178,10 @@
 +    if canon and canon != base:
 +        return get_read_block_error(os.path.join(os.path.dirname(target), canon))
 +    return None
-+
-+
- def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task_id: str) -> str | None:
-     """Render an extractable document (.docx/.xlsx/.pdf/...) as paginated text.
  
-@@ -419,8 +436,21 @@
+ 
+ def _read_extracted_document(path: str, _resolved, offset: int, limit: int, task_id: str) -> str | None:
+@@ -430,8 +447,21 @@
      if not is_extractable_document(str(_resolved)):
          return None
      file_ops = _get_file_ops(task_id)
@@ -203,7 +203,7 @@
          if binary.error or binary.base64_content is None:
              raise ExtractionError(binary.error or "Document bytes unavailable")
          document_bytes = base64.b64decode(binary.base64_content, validate=True)
-@@ -450,10 +480,13 @@
+@@ -461,10 +491,13 @@
          "file_size": binary.file_size,
          "truncated": total_lines > end_line,
          "extracted_document": True}
@@ -218,9 +218,9 @@
      max_chars = _get_max_read_chars()
      if len(result_dict["content"]) > max_chars:
          _apply_char_budget(result_dict, result_dict["content"], offset, total_lines, max_chars)
-@@ -577,7 +610,8 @@
-         # Hermes internal denylist (prompt injection via catalog metadata,
-         # credential stores). Pass the RESOLVED path: the denylist's own
+@@ -617,7 +650,8 @@
+         # credential stores). Runs BEFORE document extraction so a
+         # protected SQLite store (state.db) cannot be read through the extractor. Pass the RESOLVED path: the denylist's own
          # resolve() uses the process cwd and would miss a relative "auth.json".
 -        block_error = get_read_block_error(str(_resolved))
 +        # Lucaryin fold (R2-3-02): checked on the rescued spelling as well.

@@ -1,0 +1,60 @@
+--- a/agent/turn_failure_copy.py
++++ b/agent/turn_failure_copy.py
+@@ -405,3 +405,12 @@
+ class _Defaults(dict):
+     def __missing__(self, key: str) -> str:
+         return ""
++
++
++# Lucaryin fold (patch 0030): customer-facing copy names no runtime, vendor or model and no CLI
++# command — the neutral tables live in agent/lucaryin_neutral_copy.py (runtime-addons). Runs last,
++# so every importer of this module binds the neutral versions.
++from agent.lucaryin_neutral_copy import neutralize_turn_failure_copy as _lucaryin_neutralize  # noqa: E402
++
++_lucaryin_neutralize(globals())
++del _lucaryin_neutralize
+--- a/agent/turn_explainers.py
++++ b/agent/turn_explainers.py
+@@ -396,3 +396,12 @@
+                     "{backups_dir}", str(get_default_hermes_root() / "backups")
+                 )
+         return _NO_REPLY + body if body else ""
++
++
++# Lucaryin fold (patch 0030): customer-facing copy names no runtime, vendor or model and no CLI
++# command — the neutral tables live in agent/lucaryin_neutral_copy.py (runtime-addons). Runs last,
++# so every importer of this module binds the neutral versions.
++from agent.lucaryin_neutral_copy import neutralize_turn_explainers as _lucaryin_neutralize  # noqa: E402
++
++_lucaryin_neutralize(globals())
++del _lucaryin_neutralize
+--- a/agent/thinking_timeout_guidance.py
++++ b/agent/thinking_timeout_guidance.py
+@@ -49,3 +49,12 @@
+         f"Advanced: set `providers.{provider}.models.{model}.stale_timeout_seconds: 900` in "
+         f"`{display_hermes_home()}/config.yaml` to allow a longer wait."
+     )
++
++
++# Lucaryin fold (patch 0030): customer-facing copy names no runtime, vendor or model and no CLI
++# command — the neutral tables live in agent/lucaryin_neutral_copy.py (runtime-addons). Runs last,
++# so every importer of this module binds the neutral versions.
++from agent.lucaryin_neutral_copy import neutralize_thinking_timeout_guidance as _lucaryin_neutralize  # noqa: E402
++
++_lucaryin_neutralize(globals())
++del _lucaryin_neutralize
+--- a/cron/scheduler_failure_copy.py
++++ b/cron/scheduler_failure_copy.py
+@@ -142,3 +142,12 @@
+         "the next scheduled time and will not repeat this alert; check with "
+         "`hermes cron doctor`."
+     )
++
++
++# Lucaryin fold (patch 0030): customer-facing copy names no runtime, vendor or model and no CLI
++# command — the neutral tables live in agent/lucaryin_neutral_copy.py (runtime-addons). Runs last,
++# so every importer of this module binds the neutral versions.
++from agent.lucaryin_neutral_copy import neutralize_cron_failure_copy as _lucaryin_neutralize  # noqa: E402
++
++_lucaryin_neutralize(globals())
++del _lucaryin_neutralize

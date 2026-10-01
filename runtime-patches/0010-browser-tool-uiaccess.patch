@@ -1,9 +1,11 @@
 --- a/tools/browser_tool.py
 +++ b/tools/browser_tool.py
-@@ -228,6 +228,103 @@
+@@ -252,8 +252,105 @@
+ from tools import browser_tool_cloud as _cloud
+ 
  from tools import browser_tool_lightpanda_fallback as _lp
- 
- 
++
++
 +# ===========================================================================
 +# Lucaryin UI-access: the signed-in "team browser" as a third CDP-override tier
 +# ===========================================================================
@@ -34,8 +36,8 @@
 +    if _SIGNED_IN_BROWSER_UNREACHABLE:
 +        logger.info("signed-in browser reachable again — clearing unreachable flag")
 +    _SIGNED_IN_BROWSER_UNREACHABLE = False
-+
-+
+ 
+ 
 +def _agent_browser_cdp() -> str:
 +    """CDP endpoint of the signed-in agent browser, or "" on a machine that has
 +    never used one. If the profile exists but the browser is closed, ask a local
@@ -104,7 +106,7 @@
  # Single shared real-profile copy-browser session: concurrent tasks reuse it
  # instead of each launching a rival Chromium on the same copied user-data-dir.
  _REAL_PROFILE_SESSION = "hermes-real-profile"
-@@ -431,6 +528,24 @@
+@@ -462,6 +559,24 @@
  # ----------------------------------------------------------------------------
  BROWSER_TOOL_SCHEMAS = [
      {
@@ -127,9 +129,9 @@
 +    },
 +    {
          "name": "browser_navigate",
-         "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
+         "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer a lightweight retrieval tool when one is available (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer an available text-extraction or terminal-fetch tool; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
          "parameters": {
-@@ -750,14 +865,46 @@
+@@ -778,14 +893,46 @@
      # and blocked redirects must not retarget follow-up clicks to an irrelevant session.
      _last_active_session_key[effective_task_id] = nav_session_key
      _lp._copy_fallback_warning(response, result)
@@ -179,7 +181,7 @@
      if any(pattern in title_lower for pattern in _BOT_DETECTION_TITLE_PATTERNS):
          response["bot_detection_warning"] = (
              f"Page title '{title}' suggests bot detection. The site may have blocked this request. "
-@@ -844,11 +991,35 @@
+@@ -872,11 +1019,35 @@
      return ref if ref.startswith("@") else f"@{ref}"
  
  
@@ -215,7 +217,7 @@
      return _guarded_action(task_id, "click", "click", [ref], {"clicked": ref}, f"Failed to click {ref}")
  
  
-@@ -861,6 +1032,7 @@
+@@ -889,6 +1060,7 @@
      if blocked is not None:
          return blocked
      ref = _at_ref(ref)
@@ -223,13 +225,15 @@
      result = _session._run_browser_command(effective_task_id, "fill", [ref, text])
      from agent.display import redact_browser_typed_text_for_display, redact_tool_args_for_display
      # Typed text goes through the secret-pattern redactor so API keys / tokens don't
-@@ -1248,6 +1420,59 @@
+@@ -1270,8 +1442,61 @@
+             error_info["note"] = "Screenshot was captured but vision analysis failed. You can still share it via MEDIA:<path>."
+         _lp._copy_fallback_warning(error_info, result)
          return _dumps(error_info)
- 
++
  
 +def request_signin(host: str, reason: str = "") -> str:
 +    """Lucaryin (#72): file a sign-in CARD so the USER can log in to a site the task needs.
-+
+ 
 +    The card pops in chat; on approve the bridge opens + fronts the team browser at the site's
 +    login page, the user signs in themselves, and the turn auto-resumes when a fresh session
 +    appears. The agent never sees, asks for, or types credentials. After calling this, END the
@@ -283,11 +287,10 @@
  # ---------------------------------------------------------------------------
  # Registry
  # ---------------------------------------------------------------------------
-@@ -1312,6 +1537,18 @@
-     registry.register(name=_name, toolset="browser", schema=_BROWSER_SCHEMA_MAP[_name],
+@@ -1337,7 +1562,19 @@
                        handler=_routed_handler(_name, _fallback_call(_name, _defaults, *_extra)),
                        check_fn=_check_fn, emoji=_emoji)
-+
+ 
 +# Lucaryin (#72): request_signin is a chat-card filer, NOT a browser action, so it registers
 +# directly (no extension routing, no browser-availability gate — it must work even when the
 +# team browser is unreachable, which is exactly when the model needs it).
@@ -300,5 +303,7 @@
 +    emoji="🔐",
 +)
  
- 
++
  # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+ # Names external plugins imported from this module before the Sep 2026 decomposition.
+ # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).

@@ -17,6 +17,8 @@
      return _constants_path("get_default_hermes_root")
  
  
+-def _hermes_dirs() -> list[Path]:
+-    """Resolved active HERMES_HOME and global root, deduplicated.
 +def _lucaryin_profile_homes() -> list[Path]:
 +    """Lucaryin fold (R2-3-13, bug hunt round 2): every profile home under the
 +    root, listed at CHECK time. A Lucaryin Mac runs one runtime per agent
@@ -29,7 +31,9 @@
 +        return sorted(p for p in (_hermes_root_path() / "profiles").iterdir() if p.is_dir())
 +    except OSError:
 +        return []
-+
+ 
+-    Both are checked so credential stores at <root>/... stay guarded when
+-    running under a profile (HERMES_HOME = <root>/profiles/<name>).
 +
 +# Lucaryin fold (HA3 review, 2026-09-23): every deny comparison below goes
 +# through _deny_key. macOS's default APFS volume and NTFS are case-insensitive
@@ -343,13 +347,10 @@
 +    return any(_deny_under(resolved, p) for name in names for p in _resolve_children(siblings, name))
 +
 +
- def _hermes_dirs() -> list[Path]:
--    """Resolved active HERMES_HOME and global root, deduplicated.
++def _hermes_dirs() -> list[Path]:
 +    """Resolved active HERMES_HOME, global root and (Lucaryin fold) every sibling
 +    profile home, deduplicated.
- 
--    Both are checked so credential stores at <root>/... stay guarded when
--    running under a profile (HERMES_HOME = <root>/profiles/<name>).
++
 +    All are checked so credential stores at <root>/... stay guarded when
 +    running under a profile (HERMES_HOME = <root>/profiles/<name>), and so the
 +    deny set is profile-WIDE: the same files are denied in every profile dir.
@@ -360,8 +361,8 @@
  
  
  def _resolve_each(paths) -> list[Path]:
-@@ -90,10 +424,21 @@
-     hermes_files = (".env", ".anthropic_oauth.json", os.path.join("cache", "bws_cache.enc.json"))
+@@ -200,10 +534,21 @@
+     )
      paths = [
          *(os.path.join(home, *f) for f in home_files),
 -        *(str(base / f) for f in hermes_files for base in (_hermes_home_path(), _hermes_root_path())),
@@ -384,7 +385,7 @@
  
  
  def build_write_denied_prefixes(home: str) -> list[str]:
-@@ -102,6 +447,12 @@
+@@ -212,6 +557,12 @@
          *(os.path.join(home, d) for d in (".ssh", ".aws", ".gnupg", ".kube")),
          "/etc/sudoers.d", "/etc/systemd",
          *(os.path.join(home, *d) for d in ((".docker",), (".azure",), (".config", "gh"), (".config", "gcloud"))),
@@ -397,37 +398,42 @@
      ]
      return [os.path.realpath(p) + os.sep for p in paths]
  
-@@ -130,29 +481,47 @@
- # rewrite. Session transcripts (state.db, sessions/) are application-owned
- # state whose rewrite can falsify history and break resume/compression;
- # mcp-tokens/ and pairing/ hold credential material.
--_HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing")
+@@ -243,7 +594,13 @@
+ # browser-profile/ (copied cookies / Login Data) hold credential material.
+ # Control files (auth.json, config.yaml, webhook_subscriptions.json) are
+ # deliberately NOT here (#45947): read-denied, but the user may ask to edit them.
+-_HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing", "vault", "browser-profile")
 +# Lucaryin fold (R2-1-14): cron/ holds jobs.json — the record of every job's
 +# prompt, trust level and standing grants — plus its .jobs_*.tmp / backup
 +# siblings and the .jobs.lock. An agent that rewrites it grants itself a
 +# standing approval or raises a job's trust with no card. Job management goes
 +# through the cronjob tool (which the bridge gate cards); the generic file
 +# tools never write there. Denied in every profile dir (_hermes_dirs).
-+_HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing", "cron")
++_HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing", "vault", "browser-profile", "cron")
  
  
  def _classify_write_denial(path: str) -> Optional[str]:
-     """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
+@@ -253,26 +610,38 @@
+     # prefixes defeat string-prefix denylist comparison after normalization.
+     if is_nt_namespace_path(path):
+         return "nt_namespace"
 +    _deny_begin_check()
-     home, resolved = _home_and_resolved(path)
+     homes, resolved = _homes_and_resolved(path)
  
      # Approval-gated paths are allowed at this layer so interactive tools can
      # prompt; checked first so the ``.ssh/`` prefix deny doesn't swallow them.
--    if resolved in build_write_approval_paths(home):
+-    if any(resolved in build_write_approval_paths(home) for home in homes):
 +    # Lucaryin fold: every comparison here is a _deny_key comparison (case- and
 +    # normalization-folded on macOS / Windows — see _DENY_FOLDS_CASE).
-+    if _deny_in(resolved, build_write_approval_paths(home)):
++    if any(_deny_in(resolved, build_write_approval_paths(home)) for home in homes):
          return None
  
--    if resolved in build_write_denied_paths(home) or any(
--        resolved.startswith(prefix) for prefix in build_write_denied_prefixes(home)
-+    if _deny_in(resolved, build_write_denied_paths(home)) or any(
-+        _deny_under(resolved, prefix) for prefix in build_write_denied_prefixes(home)
+     if any(
+-        resolved in build_write_denied_paths(home)
+-        or any(resolved.startswith(prefix) for prefix in build_write_denied_prefixes(home))
++        _deny_in(resolved, build_write_denied_paths(home))
++        or any(_deny_under(resolved, prefix) for prefix in build_write_denied_prefixes(home))
+         for home in homes
      ):
          return "credential"
  
@@ -451,21 +457,21 @@
      safe_roots = get_safe_write_roots()
      if safe_roots and not any(_is_under(resolved, root) for root in safe_roots):
          return "safe_root"
-@@ -180,8 +549,9 @@
+@@ -302,8 +671,9 @@
  def is_write_approval_required(path: str) -> bool:
      """True if ``path`` is approval-gated (``~/.ssh/config``): interactive callers
      prompt, callers without a channel treat it as a block (fail closed)."""
 +    _deny_begin_check()
-     home, resolved = _home_and_resolved(path)
--    return resolved in build_write_approval_paths(home)
-+    return _deny_in(resolved, build_write_approval_paths(home))
+     homes, resolved = _homes_and_resolved(path)
+-    return any(resolved in build_write_approval_paths(home) for home in homes)
++    return any(_deny_in(resolved, build_write_approval_paths(home)) for home in homes)
  
  
  # Secret-bearing project-local env file basenames, blocked anywhere on disk.
-@@ -230,24 +600,51 @@
-     ``TERMINAL_CWD``) MUST pass an absolute path: ``resolve()`` here anchors at
-     the process cwd, so a relative ``"auth.json"`` would miss the denylist.
-     """
+@@ -360,24 +730,51 @@
+     nt_error = get_nt_namespace_error(path, verb="Read")
+     if nt_error:
+         return nt_error
 +    _deny_begin_check()
      resolved = Path(path).expanduser().resolve()
      hermes_dirs = _hermes_dirs()
@@ -480,7 +486,7 @@
 +    # Lucaryin fold: every comparison below is a _deny_key comparison (case-
 +    # and normalization-folded on macOS / Windows — see _DENY_FOLDS_CASE).
 +    if _lucaryin_browser and _deny_under(resolved, _lucaryin_browser[0]):
-+        reason = (
+         reason = (
 +            "is inside the agent-browser profile, which holds the user's signed-in "
 +            "session material. Session material is structurally unreachable — use "
 +            "the browser tools to operate signed-in sites instead."
@@ -492,7 +498,7 @@
 +            "these credentials through internal channels." + _DID_SUFFIX
 +        )
 +    elif any(_deny_under(resolved, hd / "skills" / ".hub") for hd in hermes_dirs):
-         reason = (
++        reason = (
              "is an internal Hermes cache file and cannot be read directly to prevent "
              "prompt injection. Use the skills_list or skill_view tools instead."
          )

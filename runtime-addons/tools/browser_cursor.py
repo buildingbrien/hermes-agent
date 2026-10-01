@@ -24,7 +24,15 @@ from typing import Optional, Any, Dict
 
 # One idempotent script: create-or-reuse a shadow-hosted cursor, then move it.
 # {X}/{Y} are numeric substitutions we control; nothing else is interpolated.
-_CURSOR_JS = """
+# Kept readable below, then folded onto ONE line: the agent-browser CLI takes
+# the script as a single argv element, and on Windows its ``.cmd`` shim hop
+# re-parses the command line, so a newline would truncate it to its first line
+# (upstream #113838; tests/tools/test_browser_eval_shim_args.py pins every
+# ``tools/browser_*`` ``*_JS`` constant single-line). Every statement ends in
+# ``;``/``{``/``}`` and the script has no ``//`` comments, so joining the lines
+# with a space changes nothing it does (inside the HTML/CSS template a newline
+# and a space are the same whitespace).
+_CURSOR_JS_SOURCE = """
 (() => {
   const HOST_ID = '__lucaryin_cursor_host__';
   let host = document.getElementById(HOST_ID);
@@ -59,7 +67,8 @@ _CURSOR_JS = """
   window.__lucCursorTimer = setTimeout(() => { const h=document.getElementById(HOST_ID); if(h) h.remove(); }, 8000);
   return 'ok';
 })()
-""".strip()
+"""
+_CURSOR_JS = " ".join(line.strip() for line in _CURSOR_JS_SOURCE.strip().splitlines() if line.strip())
 
 
 def cursor_move_js(x: float, y: float, pulse: bool = False) -> str:

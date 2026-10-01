@@ -249,8 +249,12 @@ class TestOneShotsRunFirst:
         import cron.scheduler as sched
 
         home, locks = cron_home
-        sched._parallel_pool = None
-        sched._parallel_pool_max_workers = None
+        # Upstream v2026.9.21 keys the persistent pool per profile home
+        # (``_parallel_pools`` / ``_parallel_pool_max_workers`` dicts); start from
+        # empty ones so this test owns the single-worker pool it creates, and the
+        # module's real dicts come back untouched afterwards.
+        monkeypatch.setattr(sched, "_parallel_pools", {})
+        monkeypatch.setattr(sched, "_parallel_pool_max_workers", {})
         sched._running_job_ids.clear()
         monkeypatch.setenv("HERMES_CRON_MAX_PARALLEL", "1")
 

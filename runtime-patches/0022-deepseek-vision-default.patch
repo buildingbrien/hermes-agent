@@ -1,13 +1,13 @@
 --- a/agent/auxiliary_client.py
 +++ b/agent/auxiliary_client.py
-@@ -793,7 +793,24 @@
- 
- 
- # Dedicated vision models for direct providers whose main chat model differs.
--_PROVIDER_VISION_MODELS: Dict[str, str] = {"xiaomi": "mimo-v2.5", "zai": "glm-5v-turbo"}
+@@ -844,7 +844,24 @@
+ # global and CN); the former glm-5v-turbo pin 404s / 1211 "Unknown Model" on the coding endpoints
+ # (#111429). ZaiProfile has no default_vision_model(), so dropping the pin would route vision to
+ # the user's text-only chat model and skip Z.AI entirely.
+-_PROVIDER_VISION_MODELS: Dict[str, str] = {"xiaomi": "mimo-v2.5", "zai": "glm-5.3-flash"}
 +_PROVIDER_VISION_MODELS: Dict[str, str] = {
 +    "xiaomi": "mimo-v2.5",
-+    "zai": "glm-5v-turbo",
++    "zai": "glm-5.3-flash",
 +    # Lucaryin fold (patch 0022; upstream DeepSeekProfile has no
 +    # default_vision_model()): deepseek-flash (V4.1-Flash) is natively
 +    # multimodal, while the main model deepseek-v4-pro rejects images, so a
