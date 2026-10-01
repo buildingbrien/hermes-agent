@@ -64,9 +64,76 @@ _NO_RETRY_GUIDANCE = (
 )
 
 _TIMEOUT_GUIDANCE = (
-    "Tell the user your research agent timed out, and offer to try again with "
-    "a narrower, more specific task. Do not retry automatically."
+    "The research is UNFINISHED, not done: tell the user that plainly. If any "
+    "files are listed, Neith already wrote them: read them before doing any "
+    "research yourself, and never write over them. Offer to try again with a "
+    "narrower, more specific task. Do not retry automatically."
 )
+
+# Local-convo review F19 (Sep 26): Neith's 28 KB report was already on disk
+# when this tool said only "did not finish within her 300-second limit"; Merlin
+# then wrote a 9 KB report over the same file. The bridge's 504 now carries
+# what is known: whether she is still working (her result is then posted into
+# the caller's chat with the owner when it lands) and which files she wrote.
+_STILL_RUNNING_GUIDANCE = (
+    "The research is UNFINISHED, not done: tell the user that plainly. Neith is "
+    "still working on it. {where} Do not redo the research, do not re-send the "
+    "task, and never write over the files listed here; read them if you need "
+    "what is already there."
+)
+
+
+def _origin() -> dict:
+    try:
+        from tools.fleet_send import turn_origin
+        return turn_origin()
+    except Exception:  # noqa: BLE001
+        return {"session_id": "", "source": ""}
+
+
+def _where() -> str:
+    """Where her late result lands, for this turn's surface (fleet_send)."""
+    try:
+        from tools.fleet_send import late_result_where
+        return late_result_where()
+    except Exception:  # noqa: BLE001
+        return "Her result comes back to you when it lands."
+
+_BUSY_GUIDANCE = (
+    "Do not re-send it. Neith is already working on this request and its result "
+    "comes back to you when it finishes; tell the user it is in progress."
+)
+
+
+def _files_written(body) -> list:
+    files = body.get("files_written") if isinstance(body, dict) else None
+    out = []
+    for f in files if isinstance(files, list) else []:
+        if isinstance(f, dict) and isinstance(f.get("path"), str):
+            rec = {"path": f["path"]}
+            if isinstance(f.get("bytes"), int):
+                rec["bytes"] = f["bytes"]
+            out.append(rec)
+    return out[:20]
+
+
+def _timeout_result(body) -> str:
+    """The bridge's 504 for a delegation that missed its window, relayed with
+    every fact it carries — never as a bare "timed out"."""
+    body = body if isinstance(body, dict) else {}
+    still = bool(body.get("still_running"))
+    files = _files_written(body)
+    where = _where()
+    error = ("Neith accepted the task but did not finish within her 300-second "
+             "limit. " + (f"She is still working on it. {where}"
+                          if still else "Her run was stopped, unfinished."))
+    out = {"source": "neith", "status": "timeout", "unfinished": True,
+           "still_running": still, "error": error,
+           "guidance": (_STILL_RUNNING_GUIDANCE.format(where=where) if still
+                        else _TIMEOUT_GUIDANCE)}
+    if files:
+        out["files_written"] = files
+    return json.dumps(out, ensure_ascii=False)
 
 
 DELEGATE_TO_NEITH_SCHEMA = {
@@ -79,7 +146,10 @@ DELEGATE_TO_NEITH_SCHEMA = {
         "knowledge cutoff. Neith does NOT see this conversation, so make the task "
         "specific and self-contained. If Neith's bridge is unavailable the result "
         "says so (status 'failed' or 'timeout') — tell the user honestly and do "
-        "the research with your own tools if you can; it is not retried for you."
+        "the research with your own tools if you can; it is not retried for you. "
+        "A 'timeout' is UNFINISHED work, never finished: if it says she is still "
+        "working, her result comes back to you when it lands (the result says "
+        "where), so do not redo it; and never write over any files it lists."
     ),
     "parameters": {
         "type": "object",
@@ -111,6 +181,12 @@ def _call_neith_sync(task: str, budget: "dict | None" = None) -> dict:
         # WS2: propagate the delegation budget so Neith's bridge seeds her
         # worker's depth and refuses onward hops.
         payload.update(budget)
+    # The chat this turn runs in: her late result is written there (F19/F31).
+    origin = _origin()
+    if origin.get("session_id"):
+        payload["requester_session_id"] = origin["session_id"]
+    if origin.get("source"):
+        payload["requester_source"] = origin["source"]
     headers = {"Content-Type": "application/json"}
     # Bridge auth (P4): attach the per-launch token when present so this keeps
     # working once the bridges require authentication. Harmless when unset.
@@ -204,14 +280,17 @@ def delegate_to_neith_tool(args, **kw):
                 _NO_RETRY_GUIDANCE,
             )
         if e.code == 504:
-            # Neith took the task but her worker hit its 300s cap. Do NOT run
-            # the fallback here — she is up, just slow; stacking another
-            # multi-minute attempt on top invites pile-ups.
+            # Neith took the task but her worker hit its 300s window. Do NOT
+            # run the fallback here — she is up, just slow; stacking another
+            # multi-minute attempt on top invites pile-ups. Relay what the
+            # bridge knows (still running? files already written?).
+            return _timeout_result(body)
+        if e.code == 409 and isinstance(body, dict) and body.get("status") in ("busy", "duplicate"):
+            # F32: the same request is already running on Neith's bridge.
             return _structured_failure(
-                "timeout",
-                "Neith accepted the task but did not finish within her "
-                "300-second limit.",
-                _TIMEOUT_GUIDANCE,
+                body["status"],
+                str(body.get("error") or "Neith is already working on this request."),
+                _BUSY_GUIDANCE,
             )
         neith_err = str(
             (isinstance(body, dict) and body.get("error"))

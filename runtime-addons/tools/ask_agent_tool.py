@@ -35,8 +35,67 @@ AGENT_PORTS = {"thoth": 9001, "ptah": 9005, "set": 9006, "neith": 9007}
 
 # Long enough for a real tool-bearing turn on the far side (research, file
 # reads, vision), short enough that a wedged teammate cannot hang the caller
-# for the whole turn budget.
-_SYNC_TIMEOUT = 300.0
+# for the whole turn budget. The far bridge gives a delegated turn 300 s and
+# then answers 504 itself with what it knows (still running? files written?);
+# this client waits slightly longer so that answer arrives instead of a bare
+# client-side "timed out" (local-convo review F19: both were 300 s, so the
+# client always lost the race and the facts with it).
+_SYNC_TIMEOUT = 320.0
+
+
+def _http_error_body(e) -> dict:
+    try:
+        body = json.loads(e.read().decode("utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _files_written(body: dict) -> list:
+    out = []
+    for f in body.get("files_written") or []:
+        if isinstance(f, dict) and isinstance(f.get("path"), str):
+            rec = {"path": f["path"]}
+            if isinstance(f.get("bytes"), int):
+                rec["bytes"] = f["bytes"]
+            out.append(rec)
+    return out[:20]
+
+
+def _origin() -> dict:
+    try:
+        from tools.fleet_send import turn_origin
+        return turn_origin()
+    except Exception:  # noqa: BLE001
+        return {"session_id": "", "source": ""}
+
+
+def _where() -> str:
+    try:
+        from tools.fleet_send import late_result_where
+        return late_result_where()
+    except Exception:  # noqa: BLE001
+        return "Its answer comes back to you when it lands."
+
+
+def _timeout_answer(target: str, body: dict) -> str:
+    """A teammate that missed the window: unfinished, never 'answered'."""
+    still = bool(body.get("still_running"))
+    out = {
+        "success": False, "agent": target, "status": "timeout", "unfinished": True,
+        "still_running": still,
+        "error": (f"{target} did not answer within the 300-second window. "
+                  + (f"{target} is still working. {_where()}"
+                     if still else f"{target}'s run was stopped, unfinished.")),
+        "guidance": (
+            "Tell the user plainly that it is unfinished. Do not guess what "
+            f"{target} would have said, do not re-ask the same question now, and "
+            "never write over any files listed here; read them if you need them."),
+    }
+    files = _files_written(body)
+    if files:
+        out["files_written"] = files
+    return json.dumps(out, ensure_ascii=False)
 
 
 def _budget_fields(sender: str) -> dict:
@@ -69,6 +128,12 @@ def ask_agent(agent: str, question: str, sender: str = "") -> str:
 
     payload = {"messages": [{"role": "user", "content": q}], "agent_id": target}
     payload.update(_budget_fields(sender))
+    # The chat this turn runs in: a late answer is written there (F19/F31).
+    origin = _origin()
+    if origin.get("session_id"):
+        payload["requester_session_id"] = origin["session_id"]
+    if origin.get("source"):
+        payload["requester_source"] = origin["source"]
     headers = {"Content-Type": "application/json"}
     token = bridge_bearer()  # file-then-env (tools/bridge_auth.py, HA3)
     if token:
@@ -80,7 +145,33 @@ def ask_agent(agent: str, question: str, sender: str = "") -> str:
             url, data=json.dumps(payload).encode(), headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=_SYNC_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as e:
+        # HTTPError IS a URLError: before this branch a 504 (the teammate
+        # missed its window) was reported as "bridge is unreachable".
+        body = _http_error_body(e)
+        if e.code == 504:
+            return _timeout_answer(target, body)
+        if e.code == 409 and body.get("status") in ("busy", "duplicate"):
+            return json.dumps({
+                "success": False, "agent": target, "status": body["status"],
+                "error": body.get("error") or f"{target} is already working on this.",
+                "guidance": body.get("guidance") or (
+                    "Do not re-ask now; the earlier answer comes back to you when "
+                    "it finishes. Tell the user it is in progress."),
+            }, ensure_ascii=False)
+        if body.get("refused"):
+            return json.dumps({"success": False, "agent": target, "refused": True,
+                               "error": body.get("error", "refused")})
+        return json.dumps({
+            "success": False, "agent": target,
+            "error": str(body.get("error") or f"{target}'s bridge returned HTTP {e.code}")
+                     + ". Say so plainly rather than inventing their answer.",
+        })
+    except TimeoutError:
+        return _timeout_answer(target, {})
     except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), TimeoutError):
+            return _timeout_answer(target, {})
         return json.dumps({
             "success": False, "agent": target,
             "error": f"{target}'s bridge is unreachable ({e}). Say so plainly "
@@ -140,6 +231,19 @@ ASK_AGENT_SCHEMA = {
 }
 
 
+def _asking_agent(kw: dict) -> str:
+    """Who is asking. The runtime's dispatcher passes a handler only task_id,
+    session_id and user_task, so the asker is this process's bridge profile
+    (BRIDGE_PROFILE, which the bridge sets in every worker's env — the same
+    source fleet_send and delegate_to_neith read). Without it the far bridge
+    could not name the asker: the question read as if the owner had typed it,
+    single-flight never applied, a timed-out answer was never delivered late,
+    and in a nested hand-off the previous hop was named instead (Lucaryin
+    local-convo review, round 2)."""
+    return str(kw.get("agent_id") or kw.get("profile")
+               or os.environ.get("BRIDGE_PROFILE") or "").strip().lower()
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error  # noqa: E402
 
@@ -150,7 +254,7 @@ registry.register(
     handler=lambda args, **kw: ask_agent(
         agent=args.get("agent") or "",
         question=args.get("question") or "",
-        sender=(kw.get("agent_id") or kw.get("profile") or "")),
+        sender=_asking_agent(kw)),
     check_fn=check_ask_agent_requirements,
     emoji="💬",
 )

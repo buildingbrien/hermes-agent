@@ -24,6 +24,11 @@ FLEET_SEND_SCHEMA = {
         "Send a message to another agent in the Lucaryin fleet. "
         "Automatically confirms delivery and falls back to direct bridge "
         "routing if the pub/sub bus is unavailable. "
+        "If another agent handed you the task you are working on, do not use "
+        "this to reply to it: your reply in this turn goes back to that agent "
+        "automatically, and a send to it is refused as a loop (status "
+        "'not_delivered'). Never tell the user a message was delivered unless "
+        "the status says 'delivered'. "
         "Valid recipients: thoth, neith, ptah, set."
     ),
     "parameters": {
@@ -76,6 +81,89 @@ def _auth_headers(extra: "dict | None" = None) -> dict:
 # (R2-2-23: three copies had drifted; the bridge worker's default of 3 is the
 # fleet's). This name is kept for callers and tests.
 from tools.fleet_budget import next_hop_fields as _delegation_budget_fields  # noqa: E402
+from tools.fleet_budget import budget_from_env as _budget_from_env  # noqa: E402
+from tools.fleet_budget import refusal_reason as _refusal_reason  # noqa: E402
+
+
+# Turn sources with no person in a chat to post a late result to.
+_AUTONOMOUS_SOURCES = frozenset({"cron", "heartbeat", "system", "notetaker"})
+
+
+def turn_origin() -> dict:
+    """The chat the current turn runs in and its surface, sent with a
+    delegation (fleet_send, ask_agent, delegate_to_neith) so the bridge writes
+    its late result into THIS chat rather than whichever chat is newest when
+    it lands, and never relays a scheduled run's into the user's chat
+    (Lucaryin local-convo review F19/F31). A cron run (the runtime's own
+    HERMES_CRON_SESSION marker) is "cron" and names no chat; otherwise the
+    bridge worker's LUCARYIN_TURN_SESSION_ID / HERMES_TURN_SOURCE. The id
+    goes to this machine's bridges only, never onto the fleet bus. Never
+    raises."""
+    try:
+        from tools.approval_context import _is_cron_approval_context
+        if _is_cron_approval_context():
+            return {"session_id": "", "source": "cron"}
+    except Exception:  # noqa: BLE001
+        pass
+    sid = (os.environ.get("LUCARYIN_TURN_SESSION_ID") or "").strip()[:80]
+    src = (os.environ.get("HERMES_TURN_SOURCE") or "").strip().lower()[:32]
+    return {"session_id": sid, "source": src}
+
+
+def late_result_where(source: "str | None" = None) -> str:
+    """Where a delegation's late result will land, said truthfully for this
+    turn's surface: the bridge adds it to the asking chat as a relayed row,
+    which the desktop app shows and the phone app does not; a scheduled run
+    has no chat to add it to."""
+    src = (turn_origin()["source"] if source is None else str(source or "")).strip().lower()
+    if src in _AUTONOMOUS_SOURCES:
+        return ("Its result will not be posted to the user (this is a scheduled "
+                "run); it shows in Team Chat when it lands.")
+    if src == "mobile":
+        return ("When it lands, the result is added to this conversation, but the "
+                "phone app does not show it by itself: tell the user to ask you for "
+                "it (or look in the desktop app).")
+    if src == "voice":
+        return ("When it lands, the result is added to your newest chat with the "
+                "user in the desktop app, not to this call: tell the user to ask "
+                "you for it later.")
+    return "Its result will be posted into this chat when it lands."
+
+
+def _not_delivered(recipient: str, reason: str, guidance: str) -> str:
+    """A send the recipient's loop guard would refuse — so it is NOT
+    delivered, said plainly. It is not a transport failure either: nothing
+    is dead-lettered and nothing should be retried."""
+    return json.dumps({
+        "success": False,
+        "status": "not_delivered",
+        "refused": True,
+        "recipient": recipient,
+        "method": "none",
+        "error": reason,
+        "message": f"NOT delivered to {recipient}: {reason}. {guidance}",
+    })
+
+
+def _preflight_refusal(recipient: str, sender: str):
+    """Local-convo review F31 (Sep 25 04:12Z): Merlin, running a task Ptah had
+    delegated to him, fleet_sent Ptah "Confirmed, I'm ready". This tool said
+    "delivered"; Ptah's bridge then refused it as a loop, and Merlin told the
+    owner it was confirmed. The recipient's refusal is deterministic (the same
+    budget fields travel with the message), so run it here first."""
+    depth, _origin, visited = _budget_from_env()
+    reason = _refusal_reason(recipient, sender, depth, visited)
+    if not reason:
+        return None
+    if visited and visited[-1] == recipient:
+        guidance = (f"{recipient} handed you the task you are working on, so your "
+                    f"reply in this turn goes back to {recipient} automatically "
+                    f"when you finish. Do not send it; do not tell the user it was "
+                    f"sent separately.")
+    else:
+        guidance = (f"Do the work with your own tools, and tell the user plainly "
+                    f"that the message was not delivered. Do not retry it.")
+    return _not_delivered(recipient, reason, guidance)
 
 
 def _post_json(url: str, payload: dict, timeout: int = 10) -> dict:
@@ -192,6 +280,10 @@ def fleet_send_tool(args, **kw):
         from tools.registry import tool_error
         return tool_error(f"Cannot send to yourself ({sender}).")
 
+    refused = _preflight_refusal(recipient, sender)
+    if refused:
+        return refused
+
     port = os.environ.get("HERMES_SERVER_PORT", "9001")
     bus_url = f"http://127.0.0.1:{port}/api/bus/send"
 
@@ -205,6 +297,13 @@ def fleet_send_tool(args, **kw):
         "task_id": str(uuid.uuid4()),
     }
     payload.update(_delegation_budget_fields(sender))
+    # The chat this turn runs in, for this bridge's record of the delegation
+    # (its late result lands there). Not part of what is published.
+    _origin = turn_origin()
+    if _origin["session_id"]:
+        payload["origin_session_id"] = _origin["session_id"]
+    if _origin["source"]:
+        payload["origin_source"] = _origin["source"]
 
     # Receipt is tri-state: "delivered" (confirmed), "queued" (published but
     # unconfirmed — recipient may still pick it up), or "dead" (every transport
@@ -256,6 +355,11 @@ def fleet_send_tool(args, **kw):
                 ),
             })
 
+        # The bridge ran the recipient's loop guard and refused it (F31).
+        if result.get("refused") or result.get("status") == "not_delivered":
+            return _not_delivered(
+                recipient, str(result.get("error") or "the recipient would refuse it"),
+                str(result.get("guidance") or "Do not retry it; tell the user it was not delivered."))
         # Bus accepted the request but reported failure → dead.
         reason = result.get("error", "bus returned success=false")
     except urllib.error.URLError as e:
