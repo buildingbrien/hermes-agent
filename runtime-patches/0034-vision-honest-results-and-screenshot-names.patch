@@ -1,0 +1,241 @@
+--- a/tools/vision_tools.py
++++ b/tools/vision_tools.py
+@@ -266,7 +266,126 @@
+     "request_too_large", "exceeds", "size limit",
+ )
+ 
++# ── Lucaryin fold (0034, F50): never report an image as seen when it was not ───────────────
++# DeepSeek's vision model answers a picture it could not take with text such as
++# 'The image appears as "[Unsupported Image]"' — HTTP 200, so the tool used to return
++# success:true and the agent reasoned about a screenshot it never saw (5 of 9 analyses of
++# 1-2.3 MB screenshots on 2026-09-25). Big images go out downscaled up front, an unseen answer
++# is retried once smaller, and a second unseen answer is a failure the agent has to say.
++_LUCARYIN_VISION_PROACTIVE_BYTES = 1024 * 1024          # raw file size that triggers a downscale
++_LUCARYIN_VISION_TARGET_B64 = 1400 * 1024               # ~1 MB of JPEG once base64-encoded
++_LUCARYIN_VISION_MAX_DIMENSION = 2048
++_LUCARYIN_VISION_RETRY_B64 = 700 * 1024                 # the one smaller retry after an unseen answer
++_LUCARYIN_VISION_RETRY_DIMENSION = 1568
++# What counts as "not seen" is deliberately narrow (round 2: a check that matched phrases
++# anywhere flagged real answers such as "I don't see a photo in the profile header; it shows
++# the initials BC" and broke image-presence checks). Only these, and only at the start:
++#   1. an empty answer, or the bare "[Unsupported Image]" placeholder;
++#   2. the INPUT itself came through as the placeholder ('The image appears as "[Unsupported
++#      Image]"');
++#   3. a refusal whose object is the whole input ("I can't see the image you attached.",
++#      "I cannot view the screenshot."), not a part of it ("the image's corner") or a thing
++#      on screen ("any photo in the avatar slot");
++#   4. "No image was provided/attached" about the request, not about something on screen;
++#   5. (round 3) the provider's own placeholder AND a first-person "I can't see / view it" in the
++#      first two sentences of a short answer ('It appears as "[Unsupported Image]". I cannot
++#      see the content.').
++# Rules 2 and 4 must end the sentence (or go on to say why): 'There is no image in the
++# message; the email body is text' and 'The image appears as "[Unsupported Image]" in the
++# Gmail preview pane' describe a screen. Anything that describes what is on screen, including
++# "did not load" or a quoted placeholder inside the picture, is a real answer.
++import re as _re  # noqa: E402
+ 
++_UNSEEN_NOUN = r"(?:image|picture|photo|screenshot)s?"
++_UNSEEN_COURTESY_RE = _re.compile(
++    r"^(?:(?:i'?m|i am|so|very)\s+sorry|sorry|unfortunately|apologies|i apologi[sz]e)\b[\s,!.:;-]*"
++    r"(?:but\s+)?")
++_UNSEEN_PLACEHOLDER_ONLY_RE = _re.compile(r"^[\W_]*\[unsupported image\][\W_]*$")
++# The sentence stops there, or goes on to say why or to ask for the file again; never ";" or a
++# bare "," (those go on to describe what IS on screen).
++_UNSEEN_END = (
++    r"(?=\s*(?:[.!:\u2014\u2013]|\s-\s|$)"
++    r"|,?\s+(?:because|since|due\s+to|so\b|and\b|which\s+means|could\s+you|can\s+you|please\b|"
++    r"right\s+now|at\s+the\s+moment))")
++_UNSEEN_PLACEHOLDER_AS_INPUT_RE = _re.compile(
++    r"^(?:it|(?:the|this|your|that)\s+(?:(?:attached|provided|uploaded|shared)\s+)?" + _UNSEEN_NOUN
++    + r"(?:\s+(?:content|contents|itself))?"
++    + r"(?:\s+you(?:'ve|\s+have)?\s+(?:sent|attached|provided|shared|uploaded))?)\s+"
++    r"(?:only\s+)?(?:appears|appeared|is|was|seems|came\s+through|comes\s+through|shows\s+up|"
++    r"showed\s+up|is\s+shown|was\s+shown|is\s+displayed|was\s+displayed|renders|rendered)\s+"
++    r"(?:only\s+)?(?:as\s+|to\s+be\s+)?(?:an?\s+|the\s+)?(?:placeholder\s+)?(?:text\s+)?"
++    r"[\"'(:\s]*\[unsupported image\][\"')\]]*(?:\s+placeholder)?(?:\s+(?:to\s+me|on\s+my\s+(?:side|end)))?"
++    + _UNSEEN_END)
++# Rule 5: the placeholder plus the model saying, in the first person, that it cannot see it.
++_UNSEEN_PLACEHOLDER_RE = _re.compile(r"\[unsupported image\]")
++_UNSEEN_FIRST_PERSON_CANNOT_RE = _re.compile(
++    r"\bi(?:'m|\s+am)?\s+(?:still\s+)?(?:can't|cannot|can\s+not|could\s+not|couldn't|unable\s+to|"
++    r"not\s+able\s+to|was\s+unable\s+to|wasn't\s+able\s+to|was\s+not\s+able\s+to|don't|do\s+not)"
++    r"\s+(?:actually\s+)?(?:see|view|access|open|load|process|analy[sz]e|read|interpret|make\s+out)\b")
++_UNSEEN_REQUEST = r"(?:your|the|this)\s+(?:message|request|query|prompt|input)\b"
++# The input named as such: "the image you sent", "the attached screenshot", "any image attached
++# to your message", "an image in your message".
++_UNSEEN_QUALIFIER = (
++    r"(?:\s+you(?:'ve|\s+have)?\s+(?:sent|attached|provided|shared|uploaded)"
++    r"|\s+(?:attached|provided|included|uploaded)\s+(?:to|in|with)\s+" + _UNSEEN_REQUEST
++    + r"|\s+in\s+" + _UNSEEN_REQUEST + r")")
++_UNSEEN_MODAL = (
++    r"(?:i\s+|i'm\s+|i\s+am\s+)?(?:can't|cannot|can\s+not|unable\s+to|not\s+able\s+to|"
++    r"am\s+unable\s+to|am\s+not\s+able\s+to|was\s+unable\s+to|wasn't\s+able\s+to|"
++    r"was\s+not\s+able\s+to|could\s+not|couldn't)\s+"
++    r"(?:see|view|access|open|load|process|analy[sz]e|display|read|interpret)")
++_UNSEEN_NOT_SEE = r"(?:i\s+)?(?:don't|do\s+not)\s+(?:see|have\s+access\s+to)"
++_UNSEEN_REFUSAL_RE = _re.compile(
++    r"^(?:"
++    # "I can't see the image." / "I cannot view the screenshot." — the whole input. Not
++    # "the photo" bare (a profile photo is a thing on screen) unless it is named as the input.
++    + _UNSEEN_MODAL + r"\s+(?:the|this|your|that)\s+(?:image|picture|screenshot)s?(?:" + _UNSEEN_QUALIFIER + r")?"
++    # "... the photo you sent", "I don't see any image attached to your message".
++    + r"|(?:" + _UNSEEN_MODAL + r"|" + _UNSEEN_NOT_SEE + r")\s+(?:(?:the|this|your|that|any|an?)\s+)?"
++    r"(?:(?:attached|provided|uploaded|shared)\s+" + _UNSEEN_NOUN + r"(?:" + _UNSEEN_QUALIFIER + r")?"
++    r"|" + _UNSEEN_NOUN + _UNSEEN_QUALIFIER + r")"
++    # "I can't view images right now."
++    + r"|" + _UNSEEN_MODAL + r"\s+(?:images|pictures|photos|screenshots)"
++    + r")" + _UNSEEN_END)
++_UNSEEN_NO_INPUT_RE = _re.compile(
++    r"^(?:there\s+(?:is|was)\s+no|no)\s+" + _UNSEEN_NOUN + r"(?:"
++    r"\s+(?:(?:was|were|has\s+been|have\s+been|is|are)\s+)?"
++    r"(?:provided|attached|included|uploaded|shared|received|sent|given)"
++    r"(?:\s+(?:in|with|to)\s+" + _UNSEEN_REQUEST + r")?" + _UNSEEN_END
++    + r"|\s+(?:in|with)\s+" + _UNSEEN_REQUEST + _UNSEEN_END + r")")
++# Unseen answers are short; a refusal-shaped opening followed by a long description is a
++# real analysis that starts politely.
++_UNSEEN_MAX_LEN = 800
++_UNSEEN_LEADING_SENTENCES = 2
++
++
++def _analysis_says_unseen(analysis: Optional[str]) -> bool:
++    """True when the vision model's answer says it could not see the picture it was sent."""
++    if not analysis or not analysis.strip():
++        return True
++    text = " ".join(analysis.lower().split())
++    for a, b in (("\u2019", "'"), ("\u2018", "'"), ("\u201c", '"'), ("\u201d", '"')):
++        text = text.replace(a, b)
++    if _UNSEEN_PLACEHOLDER_ONLY_RE.match(text):
++        return True
++    # The sentence starts the rules may anchor at: the answer's first sentences only.
++    bounds = [m.end() for m in _re.finditer(r"[.!?]\s+", text)]
++    starts = [0] + bounds[:_UNSEEN_LEADING_SENTENCES - 1]
++    lead = text[:bounds[_UNSEEN_LEADING_SENTENCES - 1]] if len(bounds) >= _UNSEEN_LEADING_SENTENCES else text
++    if (len(text) < _UNSEEN_MAX_LEN and _UNSEEN_PLACEHOLDER_RE.search(lead)
++            and _UNSEEN_FIRST_PERSON_CANNOT_RE.search(lead)):
++        return True
++    for start in starts:
++        sentence = text[start:]
++        sentence = _UNSEEN_COURTESY_RE.sub("", sentence, count=1)
++        if _UNSEEN_PLACEHOLDER_AS_INPUT_RE.match(sentence):
++            return True
++        if len(text) < _UNSEEN_MAX_LEN and (
++                _UNSEEN_REFUSAL_RE.match(sentence) or _UNSEEN_NO_INPUT_RE.match(sentence)):
++            return True
++    return False
++
++
+ def _is_image_size_error(error: Exception) -> bool:
+     """Detect if an API error is related to image or payload size."""
+     err_str = str(error).lower()
+@@ -730,7 +849,13 @@
+         analysis, scale_note = await stage(user_prompt, debug_call_data, temp_paths)
+         analysis_length = len(analysis) if analysis else 0
+         logger.info("%s analysis completed (%s characters)", kind.capitalize(), analysis_length)
+-        analysis = analysis or f"There was a problem with the request and the {kind} could not be analyzed."
++        if not analysis:
++            # Lucaryin fold (0034): an empty answer means nothing was analysed — say so.
++            debug_call_data["error"] = f"empty {kind} analysis"
++            return finish({
++                "success": False, "error": f"The vision model returned no analysis of this {kind}.",
++                "analysis": f"There was a problem with the request and the {kind} could not be analyzed.",
++            })
+         result = {"success": True, "analysis": f"[{scale_note}] {analysis}" if scale_note else analysis}
+         if scale_note:
+             result["scale_note"] = scale_note
+@@ -775,6 +900,11 @@
+             image_data_url = await _resize_prepared(prepared, _scale_info)
+             if len(image_data_url) > _MAX_BASE64_BYTES:
+                 raise ValueError(_too_large_message(image_data_url))
++        if prepared.size_bytes > _LUCARYIN_VISION_PROACTIVE_BYTES or len(image_data_url) > _LUCARYIN_VISION_TARGET_B64:
++            # Lucaryin fold (0034): big screenshots come back "[Unsupported Image]" — send them smaller.
++            image_data_url = await _resize_prepared(
++                prepared, _scale_info, max_base64_bytes=_LUCARYIN_VISION_TARGET_B64,
++                max_dimension=_LUCARYIN_VISION_MAX_DIMENSION, force_jpeg=True)
+         debug_call_data["image_size_bytes"] = prepared.size_bytes
+         messages = _media_messages(prompt, "image_url", image_data_url)
+         logger.info("Processing image with vision model...")
+@@ -793,6 +923,21 @@
+             response = await async_call_llm(**call_kwargs)
+         analysis = await _call_vision_llm(
+             call_kwargs, "Vision LLM returned empty content, retrying once", response)
++        if analysis and _analysis_says_unseen(analysis):
++            # Lucaryin fold (0034): one smaller retry, then an honest failure.
++            logger.warning("Vision model did not see the image (%r); retrying once downscaled", analysis[:120])
++            image_data_url = await _resize_prepared(
++                prepared, _scale_info, max_base64_bytes=_LUCARYIN_VISION_RETRY_B64,
++                max_dimension=_LUCARYIN_VISION_RETRY_DIMENSION, force_jpeg=True)
++            messages[0]["content"][1]["image_url"]["url"] = image_data_url
++            analysis = await _call_vision_llm(
++                call_kwargs, "Vision LLM returned empty content, retrying once")
++            if analysis and _analysis_says_unseen(analysis):
++                snippet = " ".join(analysis.split())[:160]
++                raise ValueError(
++                    "the vision model could not view this picture, even after downscaling it "
++                    f"(it answered: {snippet!r}). Do not describe it; tell the user it could not be "
++                    "viewed and ask for a smaller PNG or JPEG, or a crop of the part that matters.")
+         return analysis, _build_scale_note(_scale_info or None, prepared.crop_offset or None)
+     return await _run_analysis("image", image_url, user_prompt, model, stage)
+ 
+--- a/tools/image_source.py
++++ b/tools/image_source.py
+@@ -73,6 +73,16 @@
+     candidate = s[len("file://"):] if s.lower().startswith("file://") else s
+     p = Path(os.path.expanduser(candidate))
+     host_target = _permitted_host_read_target(p, ctx)
++    if host_target is not None and not host_target.is_file():
++        # Lucaryin fold (0034, F50): macOS names screenshots "Screenshot … at 8.14.32\u202fPM.png"
++        # (narrow no-break space); a model retyping the name sends a plain space and got "media file
++        # not found" for a file on the Desktop. Same unicode-equivalent rescue read_file has (0019);
++        # the rescued spelling still goes through the host-read and credential checks below.
++        rescued = _unicode_variant_on_disk(host_target)
++        if rescued is not None:
++            rescued_target = _permitted_host_read_target(rescued, ctx)
++            if rescued_target is not None and rescued_target.is_file():
++                host_target = rescued_target
+     if host_target is not None and host_target.is_file():
+         _guard_credential_read(host_target, s)
+         data = await asyncio.to_thread(host_target.read_bytes)
+@@ -83,6 +93,43 @@
+     return await _resolve_container_fallback(p, ctx, s, permitted)
+ 
+ 
++# Lucaryin fold (0034): a directory listing bigger than this is not scanned for a variant.
++_VARIANT_SCAN_MAX_ENTRIES = 5000
++
++
++def _canonical_name(name: str) -> str:
++    try:
++        from tools.file_operations import canonical_filename
++        return canonical_filename(name)
++    except Exception:  # noqa: BLE001 — same folding, without the read tools
++        import unicodedata
++        out = unicodedata.normalize("NFC", name)
++        for src, dst in (("\u202f", " "), ("\u00a0", " "), ("\u2019", "'"), ("\u2018", "'")):
++            out = out.replace(src, dst)
++        return out.strip()
++
++
++def _unicode_variant_on_disk(path: Path) -> Optional[Path]:
++    """The one entry in ``path``'s directory whose name is unicode-equivalent to ``path``'s
++    (NFC/NFD, narrow/no-break spaces, curly quotes, edge whitespace), else None. Several
++    candidates = a homoglyph collision: guessing could open the wrong file, so none."""
++    try:
++        parent, name = path.parent, path.name
++        if not name or not parent.is_dir():
++            return None
++        want = _canonical_name(name)
++        matches = []
++        with os.scandir(parent) as entries:
++            for n, entry in enumerate(entries):
++                if n >= _VARIANT_SCAN_MAX_ENTRIES:
++                    return None
++                if entry.name != name and _canonical_name(entry.name) == want:
++                    matches.append(entry.name)
++        return parent / matches[0] if len(matches) == 1 else None
++    except OSError:
++        return None
++
++
+ def _guard_credential_read(host_target: Path, src: str) -> None:
+     """Shared credential-read guard: refuse secret-bearing files (.env, auth.json) with a specific
+     error. Guard import is best-effort; a real block always propagates."""

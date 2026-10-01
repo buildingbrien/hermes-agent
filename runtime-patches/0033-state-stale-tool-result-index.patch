@@ -1,0 +1,76 @@
+--- a/hermes_state_schema.py
++++ b/hermes_state_schema.py
+@@ -133,6 +133,35 @@
+     "INSERT INTO state_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+ )
+ _CLEAR_REBUILD_MARKERS_SQL = "DELETE FROM state_meta WHERE key IN ('fts_rebuild_high_water', 'fts_rebuild_progress')"
++
++
++# Lucaryin fold (0033, F37): indexes an older Lucaryin runtime created and nothing in this
++# schema owns. The pre-rebase v4.6.87 runtime (schema v7, "stop double-writing tool-result
++# rows") added a partial UNIQUE index on messages(session_id, tool_call_id) with no ``active``
++# filter. In-place compaction (archive_and_compact) soft-archives the active rows and re-inserts
++# the carried tail under the SAME session id with the SAME tool_call_ids, so on every state.db
++# that ever ran that build the compaction transaction hits "UNIQUE constraint failed:
++# messages.session_id, messages.tool_call_id", rolls back, and a long session never shrinks.
++# The rebased runtime never creates it, so dropping it restores upstream's shape exactly.
++_STALE_LUCARYIN_INDEXES = ("idx_messages_tool_result_unique",)
++
++
++def _drop_stale_lucaryin_indexes(cursor: sqlite3.Cursor) -> None:
++    """Drop the leftover indexes above. Probe first: DROP INDEX takes the write lock even
++    when the index is absent, and this runs on every open (see the NULL-``active`` heal)."""
++    for name in _STALE_LUCARYIN_INDEXES:
++        try:
++            present = cursor.execute(
++                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1", (name,)
++            ).fetchone()
++            if present is None:
++                continue
++            cursor.execute(f"DROP INDEX IF EXISTS {_q(name)}")
++            logger.warning("Dropped stale index %s left by an older Lucaryin runtime "
++                           "(it made in-place compaction fail with a UNIQUE error)", name)
++        except sqlite3.Error as exc:
++            # Never abort opening the DB over this; compaction keeps failing loudly instead.
++            logger.warning("Could not drop stale index %s: %s", name, exc)
+ 
+ 
+ def _legacy_inline_reinsert_sql(table: str, indent: int, *, delete_first: bool = False) -> str:
+@@ -921,6 +950,7 @@
+         except sqlite3.OperationalError as exc:
+             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
+         self._execute_ddl_skipping_settled_triggers(cursor, DEFERRED_INDEX_SQL)  # same ordering constraint (``active``)
++        _drop_stale_lucaryin_indexes(cursor)
+ 
+         # Heal NULL ``active`` rows on every startup: older reconciler builds added ``active``
+         # without NOT NULL DEFAULT 1, so ``WHERE active = 1`` loaders hid whole histories. A
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -58,6 +58,18 @@
+ # Cooldown armed when a compression SPLIT fails (session_split_failed / rotation rollback, #97948 symptom
+ # B).
+ _SPLIT_FAILURE_COOLDOWN_SECONDS = 60
++# Lucaryin fold (0033, F37): a constraint violation is NOT transient — the same rows collide the
++# same way on the next turn, so the 60s rung re-ran a doomed summary call (and its tokens) on every
++# turn of a long session (10 failures in 2 h on 2026-09-28). Back off for the rest of the sitting.
++_SPLIT_INTEGRITY_FAILURE_COOLDOWN_SECONDS = 1800
++
++
++def _split_failure_cooldown_seconds(error: BaseException) -> int:
++    """Cooldown for a failed split: long for a deterministic DB constraint error, else the 60s rung."""
++    import sqlite3
++    if isinstance(error, sqlite3.IntegrityError) or "constraint failed" in str(error).lower():
++        return _SPLIT_INTEGRITY_FAILURE_COOLDOWN_SECONDS
++    return _SPLIT_FAILURE_COOLDOWN_SECONDS
+ 
+ # Marker tui_gateway/server.py::_status_update matches to tag kind="compacting" for drivers' "Summarizing…" UI. Keep
+ # the phrase intact when rewording. Idle/preflight/retry lines lack it; is_compaction_progress_status covers those.
+@@ -3371,7 +3383,7 @@
+             with _swallow('could not record split-failure cooldown', exc_info=True):
+                 # See #97948.
+                 agent.context_compressor._record_compression_failure_cooldown(
+-                    _SPLIT_FAILURE_COOLDOWN_SECONDS, f"session_split_failed: {e}"
++                    _split_failure_cooldown_seconds(e), f"session_split_failed: {e}"
+                 )
+     return _CommitOutcome(
+         compressed=compressed, commit_started_at=commit_started_at, old_session_id=old_session_id,
