@@ -42,6 +42,16 @@ tests/tools/test_browser_cdp_tool.py::test_nested_unflagged_binary_path_passes_t
 # test's expressions (fetch, a password-field selector) still evaluate.
 tests/tools/test_browser_console.py::TestBrowserConsole::test_expression_allows_risky_eval_by_default
 
+# 0008-file-safety-lucaryin-denies (R2-3-13, sibling-profile private state):
+# with a profile active, the global root counts as a SIBLING home, so its
+# config.yaml (literal connector tokens + MCP server commands another agent
+# starts) is write-denied to the active agent's file tools; upstream
+# (v2026.9.21, #110464) asserts root/config.yaml stays writable under a
+# profile. The active profile's own auth.json / config.yaml /
+# webhook_subscriptions.json stay writable, as upstream intends (#45947).
+# Verified 2026-10-01: passes on pristine v2026.9.21, fails only with 0008.
+tests/agent/test_file_safety_write_credentials.py::test_control_files_and_lookalikes_outside_home_stay_writable
+
 # 0026-cron-oneshot-late-fire-window (HA4 + the B5 pair contract in
 # lucaryin-ai hermes-bridge/cron_tick_support.py, 2026-09-23): a one-shot past
 # its late-fire window is kept only while its run_claim / fire_claim is LIVE.
@@ -103,6 +113,12 @@ tests/tools/test_macos_protected_search.py::test_grep_pruned_search_still_finds_
 # 4-core runner (passes on upstream's 96-core runner and locally). Timing, not
 # behaviour — failed identically on the retry.
 tests/agent/test_owned_process_cleanup.py::test_child_close_kills_only_its_processes
+# New in v2026.9.21: imports botocore unconditionally to validate against the
+# real Bedrock Converse shape. botocore ships only with the `bedrock` extra,
+# which neither upstream's CI extras list nor ours installs (the product is
+# DeepSeek-only and never loads agent/bedrock_adapter). Missing module, not
+# behaviour — the rest of the file (83 tests) runs and passes.
+tests/agent/test_bedrock_adapter.py::TestReasoningReplaySchema::test_call_converse_replays_thinking_botocore_accepts
 
 # 0022 adds; the two branches touch this path add/add, so at merge time keep
 # the ci/runtime-tests file and append the section below after its last
