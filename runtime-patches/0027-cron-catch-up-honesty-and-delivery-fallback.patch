@@ -1,0 +1,475 @@
+--- a/cron/jobs.py
++++ b/cron/jobs.py
+@@ -144,6 +144,67 @@
+                 window = max(window, int((end_dt - next_run_dt).total_seconds()))
+             except (TypeError, OverflowError):
+                 pass
++    return max(ONESHOT_GRACE_SECONDS, min(window, _MAX_LATE_FIRE_WINDOW_SECONDS))
++
++
++# ── Lucaryin fold (0027, review F16, 2026-09-23) ─────────────────────────────
++# A RECURRING job tied to a moment must not be caught up hours late. On Sep 23
++# the app was down from ~13:06Z to 03:56Z; the weekly AD|BC Sync clerk join
++# ('25 12 * * 3', a prompt job carrying an unattended outbound_call grant to the
++# meeting's dial-in) came due at 12:25 EDT and fired as a catch-up 41,521 s
++# late, at midnight. The run itself declined to dial a dead conference line —
++# model judgement was the only thing between a stale grant and a midnight call.
++# A recurring job is time-bound when it carries an outbound_call grant, a
++# meeting payload, type "meeting_join", or an explicit
++# ``late_fire_window_seconds``. Past its window the due scan SKIPS the
++# occurrence, keeps the job on its schedule, and stamps ``last_missed`` =
++# {scheduled_at, detected_at, lateness_seconds, window_seconds}. The bridge
++# (hermes-bridge/cron_tick_support.py, class 7) diffs that stamp and says
++# "missed" in chat.
++#
++# The window is the ONE-SHOT window (0026), not a shorter one: the due scan runs
++# once per tick, and under the bridge's serial ticks (HERMES_CRON_MAX_PARALLEL=1)
++# a tick lasts as long as all its due jobs together, so a job that comes due
++# while a long tick runs is scanned late although the app was up the whole time
++# (review of the first cut, 2026-10-01: a 10-minute window skipped a weekly call
++# scanned 15, 25 and 45 minutes late on a busy tick). So: the explicit field,
++# clamped; else 30 minutes; for a job carrying a meeting, until that meeting is
++# over when that is later — the stored meeting's own end when it is THIS
++# occurrence's (ends after the slot, within 6 h of it), else the meeting's length
++# (end - start; a standing meeting lasts as long each week). Clamped to
++# [ONESHOT_GRACE_SECONDS, 6 h] like the one-shot window.
++
++
++def _time_bound_recurring_window_seconds(
++    job: Dict[str, Any], next_run_dt: Optional[datetime] = None,
++) -> Optional[int]:
++    """How late a time-bound recurring ``job`` may still fire, or None when it is not time-bound."""
++    if not isinstance(job, dict):
++        return None
++    explicit = job.get(_LATE_FIRE_WINDOW_FIELD)
++    if explicit is not None:
++        try:
++            return max(ONESHOT_GRACE_SECONDS, min(int(explicit), _MAX_LATE_FIRE_WINDOW_SECONDS))
++        except (TypeError, ValueError, OverflowError):
++            pass
++    grants = job.get("grants") if isinstance(job.get("grants"), list) else []
++    meeting = job.get("meeting") if isinstance(job.get("meeting"), dict) else {}
++    if not (job.get("type") == "meeting_join" or meeting
++            or any(isinstance(g, dict) and g.get("action") == "outbound_call" for g in grants)):
++        return None
++    window = _DEFAULT_LATE_FIRE_WINDOW_SECONDS
++    try:
++        start_dt = _parse_aware(str(meeting.get("start_iso"))) if meeting.get("start_iso") else None
++        end_dt = _parse_aware(str(meeting.get("end_iso"))) if meeting.get("end_iso") else None
++        until_end = None
++        if end_dt is not None and next_run_dt is not None:
++            until_end = (end_dt - next_run_dt).total_seconds()
++        if until_end is not None and 0 < until_end <= _MAX_LATE_FIRE_WINDOW_SECONDS:
++            window = max(window, int(until_end))
++        elif start_dt is not None and end_dt is not None and end_dt > start_dt:
++            window = max(window, int((end_dt - start_dt).total_seconds()))
++    except (TypeError, ValueError, OverflowError):
++        pass
+     return max(ONESHOT_GRACE_SECONDS, min(window, _MAX_LATE_FIRE_WINDOW_SECONDS))
+ 
+ 
+@@ -3104,6 +3165,36 @@
+         d.label, d.next_run, grace, new_next)
+     record_catch_up_occurrence()
+     return False
++
++
++def _skip_late_time_bound_recurring(d: _DueJob) -> bool:
++    """Lucaryin fold (0027, see _time_bound_recurring_window_seconds): True when a time-bound
++    recurring job is past its window — the occurrence is skipped (never caught up), the job stays
++    on its schedule, and ``last_missed`` records it for the bridge to say in chat."""
++    window = _time_bound_recurring_window_seconds(d.job, d.next_run_dt)
++    if window is None:
++        return False
++    lateness = (d.scan.now - d.next_run_dt).total_seconds()
++    if lateness <= window:
++        return False
++    new_next = d.recompute_next()
++    if not new_next:
++        return False  # cannot re-anchor: leave it to the ordinary late / catch-up path
++    missed = {
++        "scheduled_at": d.next_run,
++        "detected_at": d.scan.now.isoformat(),
++        "lateness_seconds": round(lateness, 1),
++        "window_seconds": int(window),
++    }
++    d.scan.persist(d.job["id"], next_run_at=new_next, last_missed=missed)
++    rj = d.scan.find(d.job["id"])
++    if rj is not None:
++        rj.pop("pending_slot", None)  # the skipped slot must not be restored and fired later
++    logger.warning(
++        "Job '%s' is time-bound and %.0fs past its %ds window (scheduled %s); skipping this "
++        "occurrence instead of catching up. Next run: %s",
++        d.label, lateness, window, d.next_run, new_next)
++    return True
+ 
+ 
+ def _retire_expired_oneshot(d: _DueJob) -> bool:
+@@ -3247,6 +3338,9 @@
+     if not manual_run and kind == "cron" and _reanchor_stale_cron(d):
+         return False
+     grace = _compute_grace_seconds(d.schedule)
++    # Lucaryin fold (0027): a meeting / call job past its window is missed, not caught up.
++    if not manual_run and recurring and _skip_late_time_bound_recurring(d):
++        return False
+     if not manual_run and recurring and _fast_forward_missed_recurring(d, grace):
+         return False
+     if kind == "once":
+--- a/cron/occurrences.py
++++ b/cron/occurrences.py
+@@ -18,8 +18,19 @@
+         return None
+ 
+ 
++# Lucaryin fold (0027, review F42): a run that did all its work but whose message reached
++# nobody is finished as status 'failed' with an error starting with this prefix
++# (scheduler._finish_completed_run), so nothing reports it as done. Its side effects (an email,
++# a dial) still happened, so for the at-most-once guard below it IS a completed occurrence —
++# re-anchor, DST migration and an external fire claim must never run it again.
++UNDELIVERED_ERROR_PREFIX = "not delivered: "
++
++
+ def completed_occurrence(job, instant):
+-    """Unknown/failed/pruned attempts cannot prove completion: keep them eligible."""
++    """Unknown/failed/pruned attempts cannot prove completion: keep them eligible.
++
++    Lucaryin fold (0027): a 'failed' row whose run completed and only its delivery failed
++    (``UNDELIVERED_ERROR_PREFIX``) counts as completed here."""
+     from cron.executions import _transaction
+ 
+     instant = scheduled_instant(instant)
+@@ -29,7 +40,9 @@
+         with _transaction() as conn:
+             return conn.execute(
+                 "SELECT 1 FROM executions WHERE job_id=? AND scheduled_instant=? "
+-                "AND status='completed' LIMIT 1", (str(job['id']), instant)
++                "AND (status='completed' OR (status='failed' AND substr(error, 1, ?) = ?)) "
++                "LIMIT 1",
++                (str(job['id']), instant, len(UNDELIVERED_ERROR_PREFIX), UNDELIVERED_ERROR_PREFIX)
+             ).fetchone() is not None
+     except Exception:
+         logger.warning("Cannot check completed occurrence for job %s", job['id'], exc_info=True)
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -2895,11 +2895,36 @@
+     if delivery_outcome in ("delivered", "not_configured") and not d.success:
+         # Failure ping left the process (or had a configured target): mark the incident alerted.
+         _mark_incident_alerted(d.failure_incident_id)
++    # Lucaryin fold (0027, review F42): a run whose message reached nobody is not "completed" —
++    # the founder's trademark reminder was written, delivered nowhere, and its execution row said
++    # completed. The job record keeps the agent outcome (mark_job_run above: last_status
++    # "delivery_failed", failure_streak untouched); only the execution ledger row is failed, so
++    # nothing that reads it reports the occurrence as done. The error carries
++    # occurrences.UNDELIVERED_ERROR_PREFIX, which the at-most-once guard
++    # (occurrences.completed_occurrence) still counts as a completed occurrence: the run's side
++    # effects happened, so it must never be fired again.
++    undelivered = (d.success and delivery_outcome == "failed"
++                   and not _meeting_join_web_origin_gap(job, d.delivery_error))
++    from cron.occurrences import UNDELIVERED_ERROR_PREFIX
+     finish_execution(
+-        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
++        execution_id, success=d.success and not undelivered,
++        error=(f"{UNDELIVERED_ERROR_PREFIX}{d.delivery_error}" if undelivered else d.error),
++        delivery_outcome=delivery_outcome)
+     return True
+ 
+ 
++# Lucaryin fold (0027): meeting_join jobs are still created with origin platform 'web' (review
++# F17, fixed separately), which cron delivery does not know, so every join run ends
++# delivery_failed "unknown platform 'web'". The Lucaryin bridge posts the call's own outcome in
++# chat, so that one known gap is not an undelivered run; any other delivery error still is.
++_WEB_ORIGIN_GAP_RE = re.compile(r"\s*unknown platform 'web'\s*", re.IGNORECASE)
++
++
++def _meeting_join_web_origin_gap(job: dict, delivery_error) -> bool:
++    return (isinstance(job, dict) and job.get("type") == "meeting_join"
++            and bool(_WEB_ORIGIN_GAP_RE.fullmatch(str(delivery_error or ""))))
++
++
+ def _deliver_crash_failure(
+     job: dict, err_text: str, *, adapters, loop,
+ ) -> tuple[Optional[str], str]:
+--- a/cron/scheduler_delivery.py
++++ b/cron/scheduler_delivery.py
+@@ -14,6 +14,7 @@
+ import contextvars
+ import logging
+ import os
++import re
+ import shutil
+ import sqlite3
+ import subprocess
+@@ -130,20 +131,66 @@
+     return db_path if os.path.exists(db_path) else None
+ 
+ 
++# Lucaryin fold (0027, review F46): a test conversation is never a delivery target. Morning
++# Briefing's origin had been captured from ``meeting_chain_test_20260818`` and 8 briefings landed
++# there. A "test" TOKEN in the id (real ids are timestamps, hex and numeric chat ids); mirrors
++# hermes-bridge/owner_thread.is_test_session_id.
++_TEST_SESSION_TOKEN = re.compile(r"(?:^|[_\-.])tests?(?:$|[_\-.\d])", re.IGNORECASE)
++
++# Lucaryin fold (0027): "the owner's current conversation" is ONE rule on both sides — this
++# runtime fallback and the bridge's notices (hermes-bridge/owner_thread.owner_main_thread) must
++# land in the same thread. Mirrors of owner_thread.HUMAN_SOURCES, _MACHINE_ID_PREFIXES and
++# _GROUP_CHAT_PREFIX: surfaces a person types into; id stems the bridge, the voice server and the
++# board mint for machine traffic that can still carry source 'web' (a voice driver_ session is
++# 'web'); Team Chat turns persisted in an ordinary session.
++_HUMAN_SOURCES = ("web", "mobile", "telegram")
++_MACHINE_ID_PREFIXES = (
++    "cron_", "inbound_", "dialer_", "driver_", "voice_", "meeting_", "outbound_",
++    "board_trigger_", "fleet_", "subagent_",
++)
++_GROUP_CHAT_PREFIX = "[Group Chat"
++
++
++def _is_test_session_id(session_id: str) -> bool:
++    return bool(_TEST_SESSION_TOKEN.search(str(session_id or "")))
++
++
++def _is_owner_thread_candidate(conn, session_id) -> bool:
++    """owner_thread._acceptable_id + its group-chat check, on an open state.db connection."""
++    sid = str(session_id or "").strip()
++    if not sid or _is_test_session_id(sid) or sid.lower().startswith(_MACHINE_ID_PREFIXES):
++        return False
++    try:
++        row = conn.execute(
++            "SELECT content FROM messages WHERE session_id = ? AND role = 'user' "
++            "ORDER BY timestamp ASC LIMIT 1", (sid,)).fetchone()
++    except Exception:  # noqa: BLE001
++        return True
++    first = str(row[0] or "") if row else ""
++    return not first.lstrip().startswith(_GROUP_CHAT_PREFIX)
++
++
+ def _latest_lucaryin_session() -> str:
+-    """Lucaryin fold (patch 0023): the conversation a human is actually reading on this host, or "".
++    """Lucaryin fold (patch 0023, rule replaced in 0027): the conversation the owner is reading on
++    this host, or "".
+ 
+-    Last-resort target for ``deliver=origin`` without an origin and for bare ``deliver=lucaryin``.
+-    "Most recent session" is the obvious rule and the wrong one: every /api/chat/sync call (fleet
+-    ask_agent, delegation, verification) opens a fresh source='web' session indistinguishable by
+-    id or source from a real chat, so the newest session is usually a one-shot nobody will ever
+-    open. A conversation with real accumulated history is the signal — hence the message-count
+-    floor, with recency only breaking ties among genuine threads.
++    Last-resort target for ``deliver=origin`` without an origin, for bare ``deliver=lucaryin``,
++    and for a ``lucaryin`` target whose session is gone or is a test chat. The rule is the
++    bridge's (hermes-bridge/owner_thread.owner_main_thread), so a cron delivery and the bridge's
++    own notices land in the same thread: the session holding the most recent message the HUMAN
++    typed (``role = 'user'`` — cron's own deliveries are assistant rows and must not make a stale
++    thread current) on a human surface (web / mobile / telegram), skipping machine-minted ids
++    (voice driver_ sessions are 'web'), test chats and group-chat sessions. When nobody has typed
++    yet, the newest human-surface session that passes the same filters.
+ 
+-    Recency is the latest HUMAN message (``role = 'user'``), not the latest row: cron's own
+-    deliveries land as assistant messages, so ranking by any message would keep an origin-less
+-    heartbeat on whichever thread it last wrote to until the human posted elsewhere.
++    0023 required >= 20 messages instead, to skip the one-shot 'web' sessions /api/chat/sync used
++    to open for fleet ask_agent; the bridge now re-tags those 'fleet' (R2-2-20). The floor picked
++    a 24-row voice driver_ session over the founder's phone thread, and skipped a fresh thread
++    the founder was typing in (review, 2026-10-01).
+ 
++    Driven from ``sessions`` (one indexed MAX per human-surface session), not a GROUP BY over
++    every message — this runs on delivery paths and must not hold a long read on state.db.
++
+     Reads the store read-only at the ``SessionDB`` default path without opening a ``SessionDB``
+     (which would create an empty state.db on a plain hermes-agent host; see
+     _lucaryin_store_path). "" when there is no store or no such session, which lets the callers
+@@ -156,19 +203,34 @@
+         conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+     except Exception:  # noqa: BLE001
+         return ""
++    placeholders = ",".join("?" for _ in _HUMAN_SOURCES)
+     try:
+-        row = conn.execute(
+-            "SELECT s.id FROM sessions s "
+-            "WHERE s.source IN ('web','mobile') AND s.message_count >= 20 "
+-            "ORDER BY (SELECT max(m.timestamp) FROM messages m "
+-            "          WHERE m.session_id = s.id AND m.role = 'user') DESC "
+-            "LIMIT 1"
+-        ).fetchone()
+-    except Exception:  # noqa: BLE001 — older schema, no sessions table
++        try:
++            rows = conn.execute(
++                "SELECT id FROM ("
++                "  SELECT s.id AS id, (SELECT MAX(m.timestamp) FROM messages m "
++                "                      WHERE m.session_id = s.id AND m.role = 'user') AS last_typed "
++                f"  FROM sessions s WHERE COALESCE(s.source, '') IN ({placeholders})"
++                ") WHERE last_typed IS NOT NULL ORDER BY last_typed DESC LIMIT 50",
++                _HUMAN_SOURCES).fetchall()
++        except Exception:  # noqa: BLE001 — older schema, no sessions table
++            return ""
++        for row in rows:
++            if row and _is_owner_thread_candidate(conn, row[0]):
++                return str(row[0])
++        # Nobody has typed anything yet: the newest human-surface session.
++        try:
++            rows = conn.execute(
++                f"SELECT id FROM sessions WHERE COALESCE(source, '') IN ({placeholders}) "
++                "ORDER BY started_at DESC LIMIT 50", _HUMAN_SOURCES).fetchall()
++        except Exception:  # noqa: BLE001
++            return ""
++        for row in rows:
++            if row and _is_owner_thread_candidate(conn, row[0]):
++                return str(row[0])
+         return ""
+     finally:
+         conn.close()
+-    return str(row[0]) if row and row[0] else ""
+ 
+ 
+ def _deliver_to_lucaryin_session(job: dict, session_id: str, content: str) -> Optional[str]:
+@@ -202,11 +264,28 @@
+     try:
+         from hermes_state import SessionDB
+         with SessionDB() as db:
+-            if db.get_session(session_id) is None:
+-                logger.warning(
+-                    "Job '%s': lucaryin delivery target session %s is not in state.db",
+-                    job_id, session_id)
+-                return f"lucaryin delivery target session {session_id} not found in state.db"
++            # Lucaryin fold (0027, review F42/F46): the job's own thread is gone (the session
++            # archiver removed the Aug 24 phone thread, and the founder's one-month trademark
++            # reminder was written and then delivered nowhere) or is a test chat. Deliver to the
++            # conversation the owner is reading instead; only when there is none is it an error.
++            missing = db.get_session(session_id) is None
++            if missing or _is_test_session_id(session_id):
++                fallback = _latest_lucaryin_session()
++                if fallback and fallback != session_id:
++                    logger.warning(
++                        "Job '%s': lucaryin delivery target session %s is %s; delivering to the "
++                        "owner's current conversation %s instead", job_id, session_id,
++                        "not in state.db" if missing else "a test chat", fallback)
++                    if missing:
++                        content = (
++                            "↪️ This was meant for an earlier conversation that is no longer "
++                            f"available, so it is here instead.\n\n{content}")
++                    session_id = fallback
++                elif missing:
++                    logger.warning(
++                        "Job '%s': lucaryin delivery target session %s is not in state.db",
++                        job_id, session_id)
++                    return f"lucaryin delivery target session {session_id} not found in state.db"
+             db.append_message(session_id=session_id, role="assistant", content=content)
+     except Exception as e:  # pragma: no cover — defensive
+         logger.error("Job '%s': lucaryin state.db write failed: %s", job_id, e)
+--- a/cron/scheduler_prompt.py
++++ b/cron/scheduler_prompt.py
+@@ -205,6 +205,104 @@
+ )
+ 
+ 
++# ── Lucaryin fold (0027, review F16, 2026-09-23) ─────────────────────────────
++# A catch-up run (last_dispatch.kind == "catch_up": dispatched beyond its grace
++# window, after the scheduler was not running) looked to the model like an
++# on-time run. On Sep 24 at 03:57Z the AD|BC Sync job, 11.5 h late, told the
++# founder "The cron schedule is misconfigured — it should fire ~12:25 PM ET on
++# Wednesdays (e.g. 25 12 * * 3)": exactly the stored schedule. The prompt now
++# says the run is late, by how much, and why. The Lucaryin bridge records when
++# it was down (hermes-bridge/cron_tick_support.py class 6) in
++# <cron dir>/.scheduler_downtime.json = {"from": <epoch>, "until": <epoch>,
++# "recent": [{"from", "until"}, ...]} — the latest window at the top level, and
++# the last few in "recent" (a sleeping laptop's dark-wake cycles would otherwise
++# overwrite the window that covers the slot); when one covers the scheduled time
++# the note says so.
++_DOWNTIME_FILE = ".scheduler_downtime.json"
++_DOWNTIME_START_SLACK_SECONDS = 60
++
++
++def _local_label(dt) -> str:
++    local = dt.astimezone()
++    return f"{local:%a %b} {local.day} {local:%H:%M %Z}".strip()
++
++
++def _late_label(seconds: float) -> str:
++    seconds = max(0, int(seconds))
++    hours, rem = divmod(seconds, 3600)
++    minutes = rem // 60
++    if hours and minutes:
++        return f"{hours} h {minutes} min"
++    if hours:
++        return f"{hours} h"
++    return f"{max(minutes, 1)} min"
++
++
++def _read_downtime_windows() -> list:
++    """[(from, until), ...] epoch seconds recorded by the Lucaryin bridge; [] when none."""
++    try:
++        from cron.jobs import _current_cron_store
++        raw = json.loads((_current_cron_store().cron_dir / _DOWNTIME_FILE).read_text(encoding="utf-8"))
++    except Exception:
++        return []
++    if not isinstance(raw, dict):
++        return []
++    entries = [raw] + [w for w in (raw.get("recent") if isinstance(raw.get("recent"), list) else [])]
++    windows = []
++    for w in entries:
++        try:
++            start, end = float(w["from"]), float(w["until"])
++        except Exception:
++            continue
++        if end > start and (start, end) not in windows:
++            windows.append((start, end))
++    return windows
++
++
++def _downtime_covering(due_ts: float) -> Optional[tuple]:
++    """The recorded downtime window that covers ``due_ts``, or None."""
++    for start, end in _read_downtime_windows():
++        if start - _DOWNTIME_START_SLACK_SECONDS <= due_ts <= end:
++            return (start, end)
++    return None
++
++
++def _catch_up_note(job: dict) -> str:
++    """The scheduling note for THIS run when it is a catch-up, else "".
++
++    Only the stamp of this occurrence counts: a manual run carries no ``_scheduled_instant`` and
++    may still hold an older catch-up stamp in jobs.json."""
++    stamp = job.get("last_dispatch")
++    if not isinstance(stamp, dict) or stamp.get("kind") != "catch_up":
++        return ""
++    from datetime import datetime
++    from cron.occurrences import scheduled_instant
++    instant = job.get("_scheduled_instant")
++    if not instant or scheduled_instant(stamp.get("scheduled_at")) != instant:
++        return ""
++    try:
++        due = datetime.fromisoformat(str(stamp.get("scheduled_at")))
++        late = float(stamp.get("lateness_seconds") or 0.0)
++    except (TypeError, ValueError):
++        return ""
++    window = _downtime_covering(due.timestamp())
++    if window:
++        why = (" because the Lucaryin app was not running (or the computer was asleep) from "
++               f"{_local_label(datetime.fromtimestamp(window[0]).astimezone())} until "
++               f"{_local_label(datetime.fromtimestamp(window[1]).astimezone())}")
++    else:
++        why = (" because the scheduler did not run at that time (the app was closed, the "
++               "computer was asleep, or earlier scheduled jobs ran long)")
++    return (
++        "## Scheduling note\n"
++        f"This run is a catch-up. It was scheduled for {_local_label(due)} and is starting "
++        f"{_late_label(late)} late{why}. The job's schedule is correct and is not misconfigured, "
++        "so do not suggest changing it. If this task was tied to that time (a meeting, a call, or "
++        "a reminder for a moment that has passed), say plainly that it was missed because the "
++        "app was not running then, and do not act as if it were on time.\n\n"
++    )
++
++
+ def _build_job_prompt(
+     job: dict, prerun_script: Optional[tuple] = None, extra_prompt: Optional[str] = None) -> str:
+     """Build the effective prompt for a cron job, optionally loading skills first.
+@@ -251,6 +349,11 @@
+         prompt = f"{notepad_section}{prompt}"
+         has_injected_data = True
+ 
++    # Lucaryin fold (0027): a catch-up run is told it is late and why (see _catch_up_note).
++    catch_up = _catch_up_note(job)
++    if catch_up:
++        prompt = f"{catch_up}{prompt}"
++
+     prompt = _CRON_HINT + prompt
+     skill_names = _job_skill_names(job)
+     if not skill_names:

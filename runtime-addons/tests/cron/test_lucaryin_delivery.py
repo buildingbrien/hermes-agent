@@ -67,14 +67,14 @@ def _messages(session_id: str) -> list:
 
 @pytest.fixture
 def human_sessions():
-    """Two real conversations (older 25-message, newer 30-message), a fresh one-shot ``web``
-    session (what /api/chat/sync opens for fleet ask_agent / delegation) and a busy CLI session.
-    The newer real conversation is the one a human is reading."""
+    """Two real conversations (older 25-message, newer 30-message), a fresh one-shot session
+    /api/chat/sync opened for fleet ask_agent / delegation (the bridge re-tags it 'fleet',
+    R2-2-20) and a busy CLI session. The newer real conversation is the one a human is reading."""
     _seed(OLD_CHAT, "web", 25)
     time.sleep(0.01)
     _seed(NEW_CHAT, "web", 30)
     time.sleep(0.01)
-    _seed(ONE_SHOT, "web", 2)
+    _seed(ONE_SHOT, "fleet", 2)
     _seed(CLI_CHAT, "cli", 40)
     return {"old": OLD_CHAT, "new": NEW_CHAT, "one_shot": ONE_SHOT, "cli": CLI_CHAT}
 
@@ -121,8 +121,8 @@ class TestResolution:
             "_resolved_from": "origin"}]
 
     def test_origin_without_origin_falls_back_to_the_conversation_a_human_reads(self, human_sessions):
-        """Not the newest session (a one-shot), not the busiest (CLI): the newest ``web``/``mobile``
-        session with real history."""
+        """Not the newest session (a fleet one-shot), not the busiest (CLI): the ``web``/``mobile``
+        session with the latest message a human typed."""
         assert _latest_lucaryin_session() == human_sessions["new"]
         targets = _resolve_delivery_targets(_job(deliver="origin", origin=None))
         assert targets == [{
@@ -154,7 +154,7 @@ class TestResolution:
     def test_origin_without_origin_resolves_nothing_when_no_human_session_exists(self):
         assert _latest_lucaryin_session() == ""  # no state.db at all
         assert _resolve_delivery_targets(_job(deliver="origin", origin=None)) == []
-        _seed(ONE_SHOT, "web", 2)  # a store, but nothing a human is reading
+        _seed(ONE_SHOT, "fleet", 2)  # a store, but nothing a human is reading
         assert _latest_lucaryin_session() == ""
         assert _resolve_delivery_targets(_job(deliver="origin", origin=None)) == []
         # Origin-less deliver=origin is not a failure (upstream #43014 semantics unchanged).
@@ -265,9 +265,23 @@ class TestDeliverResult:
         assert not (home / "state.db").exists()
         assert not (home / "cron" / ".pending_hub_flush").exists()
 
-    def test_unknown_session_id_is_a_delivery_error_not_a_ghost_write(self, human_sessions):
+    def test_unknown_session_id_falls_back_to_the_conversation_a_human_reads(self, human_sessions):
+        """Patch 0027 (review F42): a deleted or archived target used to be a delivery error, and
+        the founder's one-month trademark reminder was delivered nowhere. It now lands in the
+        conversation a human is reading, with a one-line note — still never in a session
+        conjured for it (no ghost write)."""
+        err = _deliver_result(_job(deliver="lucaryin:20260101_000000_deleted"), "x")
+        assert err is None
+        last = _messages(human_sessions["new"])[-1]
+        assert last["role"] == "assistant" and "no longer available" in last["content"]
+        with SessionDB() as db:
+            assert db.get_session("20260101_000000_deleted") is None, "no ghost session"
+        hint = (get_hermes_home() / "cron" / ".pending_hub_flush").read_text().split()
+        assert hint == [human_sessions["new"]]
+
+    def test_unknown_session_id_with_no_human_conversation_is_still_an_error(self):
+        _seed(CLI_CHAT, "cli", 40)
         err = _deliver_result(_job(deliver="lucaryin:20260101_000000_deleted"), "x")
         assert err and "20260101_000000_deleted" in err and "not found" in err
-        for sid in human_sessions.values():
-            assert all("Cronjob Response" not in m["content"] for m in _messages(sid))
+        assert all("Cronjob Response" not in m["content"] for m in _messages(CLI_CHAT))
         assert not (get_hermes_home() / "cron" / ".pending_hub_flush").exists()
