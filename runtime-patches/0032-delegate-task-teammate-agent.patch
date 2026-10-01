@@ -1,0 +1,90 @@
+--- a/tools/delegate_tool.py
++++ b/tools/delegate_tool.py
+@@ -421,6 +421,23 @@
+     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+     credentials_cfg: Optional[Dict[str, Any]] = None,
+ ) -> str:
++    """Lucaryin (patch 0032): a task whose ``agent`` names a teammate goes to that teammate's own bridge and never
++    also spawns here (runtime-addons/tools/teammate_handoff.py); a call with no ``agent`` is upstream's, untouched."""
++    from tools.teammate_handoff import hand_off
++    return hand_off(_spawn_delegate_task, dict(
++        goal=goal, context=context, tasks=tasks, max_iterations=max_iterations, role=role, background=background,
++        output_schema=output_schema, images=images, action=action, subagent_id=subagent_id, message=message,
++        credentials_cfg=credentials_cfg,
++    ), parent_agent)
++
++
++def _spawn_delegate_task(
++    goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[List[Dict[str, Any]]] = None,
++    max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
++    output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
++    subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
++    credentials_cfg: Optional[Dict[str, Any]] = None,
++) -> str:
+     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
+     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
+     (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
+@@ -659,6 +676,16 @@
+                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
+                             "order execution; if B needs A's output, dispatch B after A returns.",
+                         ),
++                        # Lucaryin (patch 0032): the explicit hand-off target (runtime-addons/tools/teammate_handoff.py).
++                        "agent": _p(
++                            "string",
++                            "Optional. The teammate who should do this task, by agent id: thoth, neith, ptah or set (the "
++                            "fleet roster pairs each teammate's name with its id; a name is not an id). Set it whenever the "
++                            "task is for a teammate: their own agent does it with their own tools and memory, and their "
++                            "answer comes back as this task's result. This field alone decides who gets the task; names in "
++                            "the goal are not read. Leave it out to spawn your own private subagent.",
++                            enum=["neith", "ptah", "set", "thoth"],
++                        ),
+                     },
+                     "required": ["goal"],
+                 },
+@@ -690,6 +717,7 @@
+ 
+ # --- Registry ---
+ from tools.registry import registry, tool_error
++from tools.teammate_handoff import fold_top_level_agent as _fold_top_level_agent  # Lucaryin (patch 0032)
+ 
+ def _model_background_value(args: dict, parent_agent=None) -> bool:
+     """Background flag for the MODEL-facing dispatch path (registry fallback). Top-level delegations always run in the
+@@ -713,7 +741,8 @@
+     toolset="delegation",
+     schema=DELEGATE_TASK_SCHEMA,
+     handler=lambda args, **kw: delegate_task(
+-        goal=args.get("goal"), context=args.get("context"), tasks=_strip_model_hidden_task_fields(args.get("tasks")),
++        goal=args.get("goal"), context=args.get("context"),
++        tasks=_strip_model_hidden_task_fields(_fold_top_level_agent(args)),  # Lucaryin (patch 0032)
+         max_iterations=args.get("max_iterations"), role=args.get("role"),
+         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
+         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -1299,12 +1299,13 @@
+     def _dispatch_delegate_task(self, function_args: dict) -> str:
+         """Single call site for delegate_task dispatch; new DELEGATE_TASK_SCHEMA fields are added only here."""
+         from tools.delegate_tool import _strip_model_hidden_task_fields, delegate_task as _delegate_task
++        from tools.teammate_handoff import fold_top_level_agent  # Lucaryin (patch 0032): legacy goal + top-level agent
+         # Top-level MODEL delegations always run in the background (handle returned, results re-enter as
+         # messages). An ORCHESTRATOR SUBAGENT (depth > 0) stays synchronous — it needs results in-turn and
+         # owns no gateway session. The schema-level `background` param is intentionally ignored.
+         return _delegate_task(
+             goal=function_args.get("goal"), context=function_args.get("context"),
+-            tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
++            tasks=_strip_model_hidden_task_fields(fold_top_level_agent(function_args)),
+             max_iterations=function_args.get("max_iterations"), role=function_args.get("role"),
+             background=not (getattr(self, "_delegate_depth", 0) > 0), images=function_args.get("images"),
+             action=function_args.get("action"),
+--- a/model_tools.py
++++ b/model_tools.py
+@@ -386,6 +386,9 @@
+     the line when none apply, so the model never learns ghost vocabulary. Two
+     source variants exist (depth-off also names delegate_task itself); test the
+     longer one first because the sibling list is a substring of it."""
++    # Lucaryin (patch 0032): no fleet tools in this session, no teammate `agent` field.
++    from tools.teammate_handoff import drop_agent_field_without_fleet
++    td = drop_agent_field_without_fleet(td, available)
+     blocked_present = [t for t in ("clarify", "memory", "cronjob_manage") if t in available]
+     if len(blocked_present) == 3:
+         return td

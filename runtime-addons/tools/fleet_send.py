@@ -31,7 +31,12 @@ FLEET_SEND_SCHEMA = {
         "properties": {
             "recipient": {
                 "type": "string",
-                "description": "The agent to send to: 'neith', 'ptah', 'set', or 'thoth'."
+                "enum": ["neith", "ptah", "set", "thoth"],
+                "description": (
+                    "The agent to send to, by agent id: 'neith', 'ptah', 'set' or 'thoth'. "
+                    "This field alone decides who gets the message, never a display name; "
+                    "the fleet roster pairs each teammate's name with its id."
+                ),
             },
             "message": {
                 "type": "string",
@@ -176,7 +181,9 @@ def fleet_send_tool(args, **kw):
     if recipient not in valid:
         from tools.registry import tool_error
         return tool_error(
-            f"Unknown agent: '{recipient}'. Valid: {', '.join(sorted(valid))}"
+            f"Unknown agent: '{recipient}'. 'recipient' is an agent id: "
+            f"{', '.join(sorted(valid))}. The fleet roster pairs each teammate's "
+            "name with its id; a name is not an id."
         )
 
     # Don't send to self

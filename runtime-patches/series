@@ -25,3 +25,4 @@
 0026-cron-oneshot-late-fire-window.patch
 0027-cron-catch-up-honesty-and-delivery-fallback.patch
 0028-lucaryin-model-lock.patch
+0032-delegate-task-teammate-agent.patch
