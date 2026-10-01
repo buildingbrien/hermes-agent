@@ -19,6 +19,7 @@ import os
 import socket
 import urllib.request
 import urllib.error
+from tools.bridge_auth import bridge_bearer
 
 # Neith runs on the Hermes bridge (profile neith), port 9007 — migrated off the
 # deprecated OpenClaw bridge (9003).
@@ -31,54 +32,20 @@ _SYNC_TIMEOUT = 320
 # ── WS2: Fleet delegation budget (bounds cross-bridge cascades) ──────────────
 # The bridge worker exports FLEET_DELEGATION_* env vars when this process is
 # itself running a delegated task. Each cross-bridge hop increments depth; once
-# depth reaches MAX_FLEET_DEPTH (default 1: thoth→neith fine, neith→anyone
-# refused) or the target already appears in the visited chain, delegation is
-# refused with a structured result instead of cascading.
-_FLEET_VISITED_MAX = 16
-
-
-def _max_fleet_depth() -> int:
-    """Cross-bridge delegation hop cap (env MAX_FLEET_DEPTH, default 1)."""
-    try:
-        return max(0, int(os.environ.get("MAX_FLEET_DEPTH", "1")))
-    except ValueError:
-        return 1
-
-
-def _fleet_budget_from_env() -> tuple:
-    """Read (depth, origin, visited) seeded by the bridge worker, if any."""
-    try:
-        depth = max(0, int(os.environ.get("FLEET_DELEGATION_DEPTH", "0")))
-    except ValueError:
-        depth = 0
-    origin = os.environ.get("FLEET_DELEGATION_ORIGIN", "").strip().lower()
-    visited = []
-    for item in os.environ.get("FLEET_DELEGATION_VISITED", "").split(","):
-        name = item.strip().lower()
-        if name and name not in visited:
-            visited.append(name)
-        if len(visited) >= _FLEET_VISITED_MAX:
-            break
-    return depth, origin, visited
+# depth reaches MAX_FLEET_DEPTH or Neith already appears in the visited chain,
+# delegation is refused with a structured result instead of cascading. The
+# budget itself lives in tools/fleet_budget.py, shared with fleet_send and
+# pinned to the bridge worker's default of 3 (R2-2-23: this tool's own default
+# of 1 refused research delegation to every agent handling a bus-delivered
+# task). The three names below are kept for callers and tests.
+from tools.fleet_budget import (  # noqa: E402
+    budget_from_env as _fleet_budget_from_env, max_fleet_depth as _max_fleet_depth,
+    next_hop_fields, refusal_reason)
 
 
 def _budget_refusal(sender: str, depth: int, visited) -> "str | None":
-    """Return a refusal reason when this delegation must not leave the box,
-    or None when it is within budget."""
-    sender = (sender or "").strip().lower()
-    if sender == "neith":
-        return "you ARE Neith — delegating to Neith would send the task to yourself"
-    if depth >= _max_fleet_depth():
-        return (
-            f"this conversation was itself delegated across {depth} fleet "
-            f"hop(s), which exhausts the limit of {_max_fleet_depth()}"
-        )
-    if "neith" in visited:
-        return (
-            f"Neith already handled this request "
-            f"(chain: {' -> '.join(visited)}), so delegating back would loop"
-        )
-    return None
+    """Refusal reason for a hop from ``sender`` to Neith, or None when within budget."""
+    return refusal_reason("neith", sender, depth, visited)
 
 
 def _structured_failure(status: str, error: str, guidance: str) -> str:
@@ -110,9 +77,9 @@ DELEGATE_TO_NEITH_SCHEMA = {
         "back as the tool result, which you then relay to the user. Use this "
         "whenever the user needs live web research or information beyond your "
         "knowledge cutoff. Neith does NOT see this conversation, so make the task "
-        "specific and self-contained. If Neith's bridge is unavailable, the task "
-        "is automatically handled by a research subagent instead, so it never "
-        "silently fails."
+        "specific and self-contained. If Neith's bridge is unavailable the result "
+        "says so (status 'failed' or 'timeout') — tell the user honestly and do "
+        "the research with your own tools if you can; it is not retried for you."
     ),
     "parameters": {
         "type": "object",
@@ -147,7 +114,7 @@ def _call_neith_sync(task: str, budget: "dict | None" = None) -> dict:
     headers = {"Content-Type": "application/json"}
     # Bridge auth (P4): attach the per-launch token when present so this keeps
     # working once the bridges require authentication. Harmless when unset.
-    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+    token = bridge_bearer()  # file-then-env (tools/bridge_auth.py, HA3)
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
@@ -204,11 +171,7 @@ def delegate_to_neith_tool(args, **kw):
             f"Fleet delegation refused: {refusal}.",
             _NO_RETRY_GUIDANCE,
         )
-    budget = {
-        "delegation_depth": depth + 1,
-        "delegation_origin": origin or sender,
-        "delegation_visited": (visited + [sender]) if sender not in visited else list(visited),
-    }
+    budget = next_hop_fields(sender)  # the same fields fleet_send attaches
 
     # ── Primary: synchronous call to the persistent Neith on :9007 ──
     try:
@@ -272,8 +235,20 @@ def delegate_to_neith_tool(args, **kw):
     except Exception as e:
         neith_err = f"Neith call failed: {type(e).__name__}: {e}"
 
-    # ── Fallback: in-process research subagent (single attempt — this is the
-    # only automatic retry in the delegation flow, capped at 1) ──
+    # ── Fallback: in-process research subagent (single attempt) — ONLY when the
+    # caller handed us the running agent. The registry dispatches handlers with
+    # task_id/session_id/user_task and no agent (model_tools._execute_tool), so
+    # from a normal tool call this never runs (R2-2-23); the result then says
+    # plainly that no fallback was available instead of implying one ran.
+    if parent_agent is None:
+        return _structured_failure(
+            "failed",
+            f"Could not reach Neith ({neith_err}); no in-process research fallback "
+            "is available from this call.",
+            "Tell the user the research could not be delegated, and why; do it "
+            "with your own tools if you can. Do not retry the delegation "
+            "automatically.",
+        )
     summary = _fallback_subagent(task, parent_agent)
     if summary:
         return json.dumps(

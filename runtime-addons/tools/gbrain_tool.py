@@ -32,6 +32,14 @@ HTTP has no PATH dependency and no engine assumption, and needs no psycopg.
 
 Degrades quietly either way: a machine without gbrain (or with the bridge down)
 reports that recall is unavailable rather than failing the turn.
+
+THE BRIDGE BEARER: since lucaryin-ai B17 (#109, bug hunt round 2 R2-1-23) the
+gbrain bridge refuses every route but GET /health without ``Authorization:
+Bearer <bridge token>`` (any website could read and overwrite the brain through
+it before). Every call here signs through tools/bridge_auth (file first, env
+second, the HA3 order every bridge-calling addon uses). Unsigned, both verbs
+got a 401 on every call while check_gbrain_requirements, which probes the open
+/health, kept them advertised.
 """
 
 import json
@@ -41,6 +49,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
+
+from tools.bridge_auth import bridge_auth_headers
 
 logger = logging.getLogger(__name__)
 
@@ -65,12 +75,16 @@ def _bridge_get(path: str, params: Dict[str, str]) -> Optional[Any]:
     for an unknown slug); or None when the bridge itself is unreachable (no
     gbrain on this machine, or the bridge is down), which the caller renders as
     'recall unavailable' rather than failing the turn.
+
+    Every request carries the bridge bearer (file-then-env, tools/bridge_auth):
+    the bridge answers 401 to anything else but /health.
     """
     url = f"{GBRAIN_BRIDGE}{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
     try:
-        with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp:
+        req = urllib.request.Request(url, headers=bridge_auth_headers())
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         logger.warning("gbrain bridge %s → HTTP %s", path, e.code)
@@ -80,6 +94,18 @@ def _bridge_get(path: str, params: Dict[str, str]) -> Optional[Any]:
         return None
 
 
+def _refused(body: Any) -> bool:
+    """The bridge answered 401/403: it is up, but refused this runtime's bearer
+    (none provisioned, or a stale one). Recall is unavailable, not "no page"."""
+    return isinstance(body, dict) and body.get(_HTTP_ERROR) in (401, 403)
+
+
+_REFUSED = {
+    "error": "gbrain refused the request (bridge bearer missing or not current)",
+    "recall_available": False,
+}
+
+
 def gbrain_search(query: str, limit: int = 5) -> str:
     """Find compiled pages about a topic, person or company."""
     q = (query or "").strip()
@@ -87,6 +113,8 @@ def gbrain_search(query: str, limit: int = 5) -> str:
         return json.dumps({"error": "query is required"})
     n = max(1, min(int(limit or 5), 12))
     body = _bridge_get("/api/gbrain/search", {"q": q})
+    if _refused(body):
+        return json.dumps(_REFUSED)
     if body is None or (isinstance(body, dict) and _HTTP_ERROR in body):
         return json.dumps({
             "error": "gbrain is not reachable on this machine",
@@ -158,6 +186,8 @@ def gbrain_read(slug: str) -> str:
     if body is None:
         return json.dumps({"error": "gbrain is not reachable on this machine",
                            "recall_available": False})
+    if _refused(body):
+        return json.dumps(_REFUSED)
     if isinstance(body, dict) and _HTTP_ERROR in body:
         # The bridge answered — a 404 means there is simply no such page.
         return json.dumps({"error": f"no compiled page at slug '{s}'",

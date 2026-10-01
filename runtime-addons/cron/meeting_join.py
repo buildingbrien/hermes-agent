@@ -25,6 +25,16 @@ VALID_STYLES = ("clerk", "scribe", "hold", "driver")
 DIAL_TIMEOUT_S = 20.0
 
 
+def _bridge_bearer() -> str:
+    """Bridge bearer, file first then BRIDGE_AUTH_TOKEN (tools/bridge_auth.py, HA3);
+    lazy so a scheduler tick never fails to import this hook."""
+    try:
+        from tools.bridge_auth import bridge_bearer
+        return bridge_bearer()
+    except Exception:  # noqa: BLE001
+        return os.environ.get("BRIDGE_AUTH_TOKEN", "")
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -85,7 +95,7 @@ def _post_dial(body: Dict[str, Any]) -> Tuple[bool, str]:
     # BRIDGE_AUTH_ENFORCE flip (Chunk 1 Phase B); token is in the cron
     # subprocess env (scheduler spawns with os.environ.copy()).
     _hdrs = {"Content-Type": "application/json"}
-    _tok = os.environ.get("BRIDGE_AUTH_TOKEN", "")
+    _tok = _bridge_bearer()  # file-then-env (tools/bridge_auth.py, HA3)
     if _tok:
         _hdrs["Authorization"] = f"Bearer {_tok}"
     req = urllib.request.Request(url, data=data, headers=_hdrs)

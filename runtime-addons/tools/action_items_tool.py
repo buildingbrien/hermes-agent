@@ -14,15 +14,25 @@ call this tool in the same turn — otherwise say you can't.
 Storage is one shared JSON file under HERMES_HOME's parent scope so every
 agent reads the same list: an item closed in a voice call with Ptah stays
 closed when Thoth briefs tomorrow's meeting.
+
+Because it IS shared across agent processes, every mutation runs under a
+cross-process lock (R2-2-10, bug hunt round 2): load -> change -> save used to
+be three unlocked steps on one file with one shared temp name, so two agents
+committing at once lost most of what either wrote, and one's ``os.replace``
+raised FileNotFoundError mid-tool-call when the other had just renamed the same
+``.tmp``. A corrupt store is also no longer read as "empty" and overwritten —
+it is reported and left untouched.
 """
 
 import json
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 STORE_ENV = "LUCARYIN_ACTION_ITEMS_PATH"
+
+from tools.lucaryin_filelock import exclusive_lock, replace_with_retry, unique_tmp
 
 
 def _store_path() -> str:
@@ -34,22 +44,54 @@ def _store_path() -> str:
     return os.path.expanduser("~/.lucaryin/action_items.json")
 
 
-def _load() -> List[Dict[str, Any]]:
+def _store_lock():
+    """Exclusive cross-process lock on ``<store>.lock`` for one load(->change->save).
+    Readers take it too: on Windows a reader holding the store open makes a
+    writer's ``os.replace`` fail with a sharing violation (review, 2026-09-23).
+    tools/lucaryin_filelock.py: fcntl / msvcrt, and a lock that cannot be taken
+    degrades to unlocked rather than losing the commitment."""
+    return exclusive_lock(_store_path() + ".lock")
+
+
+def _load() -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """``(items, error)``: a MISSING store is an empty list; an unreadable or
+    malformed one is an error, and the caller must not write over it."""
+    path = _store_path()
     try:
-        with open(_store_path()) as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return [], None
+    except OSError as e:
+        return [], f"The action-items store at {path} could not be read ({e}); nothing was changed."
+    if not raw.strip():
+        return [], None  # an empty file is the same as a missing one
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        return [], (f"The action-items store at {path} is not valid JSON ({e}); it was left "
+                    "untouched. Ask the operator to repair or move it aside.")
+    if not isinstance(data, list) or not all(isinstance(i, dict) for i in data):
+        return [], (f"The action-items store at {path} does not hold a list of items; it was "
+                    "left untouched. Ask the operator to repair or move it aside.")
+    return data, None
 
 
 def _save(items: List[Dict[str, Any]]) -> None:
     path = _store_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(items, f, indent=2)
-    os.replace(tmp, path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # pid + random suffix: two agents saving at once never share a temp name.
+    tmp = unique_tmp(path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(items, f, indent=2)
+        replace_with_retry(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _match(items: List[Dict[str, Any]], needle: str) -> Optional[Dict[str, Any]]:
@@ -68,8 +110,32 @@ def _match(items: List[Dict[str, Any]], needle: str) -> Optional[Dict[str, Any]]
 def action_items_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     args = args if isinstance(args, dict) else {}
     op = (args.get("op") or "list").strip().lower()
-    items = _load()
+    if op in ("add", "close", "reopen"):
+        # Whole read-modify-write under the cross-process lock.
+        with _store_lock():
+            items, error = _load()
+            if error:
+                return {"error": error}
+            return _mutate(op, args, items)
+    with _store_lock():  # readers too — see _store_lock
+        items, error = _load()
+    if error:
+        return {"error": error}
 
+    if op == "list":
+        status = (args.get("status") or "open").strip().lower()
+        if status == "all":
+            out = items
+        else:
+            out = [i for i in items if i.get("status") == status]
+        out = sorted(out, key=lambda i: i.get("updated_at", 0), reverse=True)
+        return {"items": out[:50], "count": len(out)}
+
+    return {"error": f"Unknown op '{op}'. Use add, close, reopen, or list."}
+
+
+def _mutate(op: str, args: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """add / close / reopen against ``items`` (caller holds the lock)."""
     if op == "add":
         title = (args.get("title") or "").strip()
         if not title:
@@ -107,15 +173,6 @@ def action_items_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
             target["resolution"] = str(args["resolution"])[:300]
         _save(items)
         return {"item": target}
-
-    if op == "list":
-        status = (args.get("status") or "open").strip().lower()
-        if status == "all":
-            out = items
-        else:
-            out = [i for i in items if i.get("status") == status]
-        out = sorted(out, key=lambda i: i.get("updated_at", 0), reverse=True)
-        return {"items": out[:50], "count": len(out)}
 
     return {"error": f"Unknown op '{op}'. Use add, close, reopen, or list."}
 

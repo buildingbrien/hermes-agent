@@ -1,52 +1,245 @@
 --- a/tools/cronjob_tools.py
 +++ b/tools/cronjob_tools.py
-@@ -544,6 +544,45 @@ def _try_dispatch_background_run(
+@@ -544,6 +544,238 @@ def _try_dispatch_background_run(
      return result
  
  
-+# Actions a job may carry as standing grants. Payment is deliberately absent
-+# (locked doctrine: financial actions are never pre-authorizable), and
-+# "standing_grant" itself can never appear (no self-amplification) — both are
-+# ALSO refused at the gate, so this list is UX, not the security boundary.
++# Actions a job may carry as standing grants. The bridge gate
++# (approval_gate._grant_permits) decides at run time what a stored grant covers,
++# but it never refuses to STORE one. A shape it would not honour must be stopped
++# here, or the user approves a card that then blocks every run. A shape it
++# honours too broadly is stopped ONLY here (see _validate_grants).
 +_GRANTABLE_ACTIONS = {
 +    "email_send", "message_send", "calendar_create",
-+    "meeting_schedule", "outbound_call", "file_write", "ui_action",
++    "outbound_call", "file_write", "ui_action",
++}
++
++# Mirrors the gate's UNGRANTABLE_ACTIONS. Payment is never pre-authorizable
++# (locked doctrine), standing_grant would be self-amplification, and
++# meeting_schedule mints an outbound_call grant, which makes it a granting action.
++_UNGRANTABLE_ACTIONS = ("payment_execute", "standing_grant", "meeting_schedule")
++
++# Grants that must NAME their recipients. Only the object form can carry a 'to',
++# so the bare string is refused too. Without a 'to', the gate honours
++# "message_send" for ANY recipient and bounds "email_send" only to the owner's
++# confirmed addresses.
++# outbound_call is deliberately NOT here (founder design, v4.6.43 standing
++# grants): its bar is the explicit unattended:true, and the outbound contact
++# policy still clamps every call. Its 'to' is optional, but one that is given
++# must list numbers the gate can match (see _to_entry_ok).
++_RECIPIENT_SCOPED_ACTIONS = ("email_send", "message_send")
++
++_RECIPIENT_EXAMPLES = {
++    "email_send": '{"action": "email_send", "to": ["self"]} ("self" = the owner; '
++                  'or exact addresses, or "@domain")',
++    # The gate reads a message's recipients from its to/recipient/chat_id-style
++    # arguments and, for send_message, from 'target' normalised the way the tool
++    # splits it (approval_gate._send_message_target: first ':', platform
++    # stripped + lowercased, ref stripped) to "platform:ref". A 'to' entry is
++    # normalised the same way, so "Telegram: -100123" names telegram:-100123. A
++    # bare platform sends to its home channel, whose chat the gate cannot see,
++    # so it is never covered.
++    "message_send": '{"action": "message_send", "to": ["telegram:-1001234567890"]} '
++                    'or {"action": "message_send", "to": ["+15551230000"]}. '
++                    "send_message(target=...) is covered only when 'to' names "
++                    'that exact target as "platform:chat_id" (a topic such as '
++                    '"telegram:-1001234567890:17" is a different target); a bare '
++                    "platform (its home channel) is never covered",
++}
++
++_TO_RULES = {
++    "email_send": 'exact bare addresses (one per entry: no "Name <...>" forms or '
++                  'comma lists), "self" (the owner) or "@domain" with a dotted '
++                  'domain such as "@partner.com", with no wildcards or empty '
++                  "entries",
++    "message_send": 'exact numbers, chat ids or addresses (one per entry: no '
++                    'comma or semicolon lists and no "Name <...>" forms), '
++                    'send_message targets as "platform:chat_id", or "@domain" '
++                    'with a dotted domain such as "@partner.com", with no '
++                    'wildcards or empty entries. An entry starting with "@" '
++                    "always means a domain, so name a Matrix user as the "
++                    'send_message target "matrix:@user:server". A bare '
++                    'platform ("telegram") or one with no chat id '
++                    '("telegram:") means its home channel, which a grant '
++                    'never covers, so name the chat id. "self" is not accepted '
++                    "here: it matches only the owner's email address, never "
++                    "their phone number or chat id, so name the owner's number "
++                    "explicitly",
++    "outbound_call": "exact phone numbers in E.164 form, e.g. [\"+15551230000\"]. "
++                     "'to' is optional for outbound_call: omit it to cover any "
++                     "number (the outbound contact policy still applies). "
++                     '"self" and "@domain" never match a dialled number',
 +}
 +
 +
++def _is_e164(entry: str) -> bool:
++    # No regex: this module's only `re` import sits in a revert-scheduled block.
++    digits = entry[1:]
++    return (entry.startswith("+") and digits.isascii() and digits.isdigit()
++            and 7 <= len(digits) <= 15 and digits[0] != "0")
++
++
++def _to_entry_ok(act: str, entry: Any) -> bool:
++    """One 'to' entry the gate can match for this action. The gate
++    (approval_gate._allowlist_entry) matches "self" only against the owner's
++    EMAIL addresses (its principals), "@domain"/"*@domain" as an exact email
++    domain, an email address as its bare address, and anything else literally
++    (a "platform:ref" entry also in send_message's normalised form). So a bare
++    "*" never matches (yet the card shows it as "to *", which reads as
++    "anyone"), "self"/"@domain" can never match a dialled number, and a bare
++    platform never matches a send_message target."""
++    if not isinstance(entry, str) or not entry.strip():
++        return False
++    entry = entry.strip()
++    if act == "outbound_call":
++        return _is_e164(entry)
++    low = entry.lower()
++    if low == "self":
++        # Message recipients are numbers or chat ids far more often than the
++        # owner's email address, so "self" there would almost never be honoured.
++        return act == "email_send"
++    if low.startswith(("@", "*@")):
++        # The gate reads EVERY entry starting with '@' as a domain and drops
++        # one that is not a dotted DNS name, so "@localhost" or a Matrix user
++        # id ("@alice:matrix.org") covers nothing. A Matrix user is named as
++        # the send_message target "matrix:@alice:matrix.org" instead.
++        return _is_domain(low.split("@", 1)[1])
++    if act == "email_send":
++        # Email recipients reach the gate as parsed bare addresses, so an
++        # entry that is not one (a name, a platform) never matches. The gate
++        # would also parse "Name <addr>" and an all-address comma list, but
++        # one bare address per entry is what the card should show.
++        return _is_bare_email(low)
++    # message_send. The gate splits an entry on , ; or a line break only when
++    # every piece is an email address or "@domain"; "+1555..., +1555..." or
++    # "telegram:-100, telegram:-200" stays ONE literal that no send equals.
++    # It drops an angle-bracket entry whose inside is not an email address
++    # ("Bob <+15551230000>"). Refuse both shapes rather than mirror the
++    # email-only exceptions: one recipient per entry, no display names.
++    if any(ch in entry for ch in _RECIPIENT_SEPARATORS) or "<" in entry or ">" in entry:
++        return False
++    if _names_home_channel(entry):
++        return False
++    return "*" not in entry
++
++
++# What the gate's _DOMAIN_RE and _EMAIL_ADDR_RE accept, after lowercasing.
++# Kept regex-free for the reason given at _is_e164.
++_DOMAIN_LABEL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
++_EMAIL_LOCAL_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_+-")
++# The gate's _RECIPIENT_SEP_RE.
++_RECIPIENT_SEPARATORS = (",", ";", "\r", "\n")
++
++
++def _is_domain(domain: str) -> bool:
++    """The gate's _DOMAIN_RE on a lowercased domain: two or more dot-separated
++    labels of [a-z0-9-], none empty or starting or ending with '-'."""
++    labels = domain.split(".")
++    return len(labels) >= 2 and all(
++        label and set(label) <= _DOMAIN_LABEL_CHARS
++        and not label.startswith("-") and not label.endswith("-")
++        for label in labels)
++
++
++def _is_bare_email(addr: str) -> bool:
++    """The gate's _EMAIL_ADDR_RE on a lowercased address: dot-separated
++    local-part atoms of [a-z0-9_+-], one '@', then a _is_domain domain."""
++    local, sep, domain = addr.partition("@")
++    return bool(sep) and all(
++        atom and set(atom) <= _EMAIL_LOCAL_CHARS for atom in local.split(".")
++    ) and _is_domain(domain)
++
++
++def _names_home_channel(entry: str) -> bool:
++    """A message_send 'to' entry naming only a platform: "telegram" or
++    "telegram:". That is send_message's home-channel form, which the gate never
++    covers (it cannot see which chat the home channel is), so the entry would
++    never match. Split the way the gate and send_message split a target: at the
++    first ':', both halves stripped, platform case-insensitive."""
++    platform, sep, ref = entry.partition(":")
++    if sep:
++        return not ref.strip()
++    return platform.strip().lower() in _send_message_platforms()
++
++
++def _send_message_platforms() -> frozenset:
++    # send_message resolves a target's platform through this enum. Imported
++    # lazily like this module's other gateway imports; without the gateway
++    # there are no platform names to refuse, and the gate still never covers one.
++    try:
++        from gateway.config import Platform
++    except Exception:  # noqa: BLE001
++        return frozenset()
++    return frozenset(p.value for p in Platform)
++
++
++def _to_allowlist_error(act: str, to: Any) -> Optional[str]:
++    # The gate accepts a string or a list. A number, bool or dict 'to' makes its
++    # matcher raise (or iterate dict keys), so the run blocks despite the approval.
++    entries = [to] if isinstance(to, str) else to
++    if isinstance(entries, list) and entries and all(_to_entry_ok(act, e) for e in entries):
++        return None
++    return (f"an {act} grant's 'to' must be a non-empty list of "
++            f"{_TO_RULES[act]}. Got {to!r}")
++
++
 +def _validate_grants(grants: Any) -> Optional[str]:
-+    """Human-quality error or None. The gate re-checks all of this; failing
-+    here just gives the model a fixable message instead of a filed card that
-+    the user then has to read and reject."""
++    """Human-quality error or None. Failing here gives the model a fixable
++    message instead of a filed card the user then has to read and reject.
++
++    The gate repeats the ungrantable and outbound_call unattended:true checks
++    at run time. It does NOT enforce the recipient rule (a missing 'to' is
++    bounded for email_send and ignored for message_send, never refused) or the
++    'to' well-formedness check. Both are enforced ONLY here, on create and on
++    update."""
 +    if grants is None:
 +        return None
 +    if not isinstance(grants, list):
 +        return "grants must be a list of grant objects"
 +    for g in grants:
 +        act = g if isinstance(g, str) else (g.get("action") if isinstance(g, dict) else None)
-+        if not act:
++        # A non-string action (e.g. a list) would raise on the set lookup below.
++        if not act or not isinstance(act, str):
 +            return f"malformed grant (needs an 'action'): {g!r}"
-+        if act in ("payment_execute", "standing_grant"):
++        if act in _UNGRANTABLE_ACTIONS:
 +            return (f"'{act}' can never be a standing grant — payment and "
 +                    "grant-creation always require a live human decision")
 +        if act not in _GRANTABLE_ACTIONS:
 +            return (f"'{act}' is not a grantable action "
 +                    f"(grantable: {', '.join(sorted(_GRANTABLE_ACTIONS))})")
-+        if act == "outbound_call" and not (isinstance(g, dict) and g.get("unattended") is True):
-+            return ("an outbound_call grant must be the object form with "
-+                    "explicit unattended:true — autonomous dialling is a "
-+                    "separate decision from calling")
-+        if isinstance(g, dict) and act in ("email_send", "message_send") and not g.get("to"):
-+            return (f"an {act} grant needs a 'to' allowlist — 'may email these "
-+                    "specific people' is grantable, 'may email anyone' is not "
-+                    "something to hand an unattended job")
++        if act == "outbound_call":
++            if not (isinstance(g, dict) and g.get("unattended") is True):
++                return ("an outbound_call grant must be the object form with "
++                        "explicit unattended:true — autonomous dialling is a "
++                        "separate decision from calling")
++            # 'to' is optional (see _RECIPIENT_SCOPED_ACTIONS). A given one must
++            # be matchable: the gate cannot match a malformed entry, and
++            # outbound_call is not cron-escalatable, so every call the outbound
++            # policy holds is blocked despite the approval. An empty or null 'to'
++            # is refused too. Both the gate and the card treat it as absent,
++            # but in the stored job it reads as "nobody" while it means "any
++            # number", so the model is told to omit it instead.
++            if "to" in g:
++                to_error = _to_allowlist_error(act, g["to"])
++                if to_error:
++                    return to_error
++        if act in _RECIPIENT_SCOPED_ACTIONS:
++            if not (isinstance(g, dict) and g.get("to")):
++                return (f"an {act} grant must be the object form with a 'to' "
++                        f"allowlist, e.g. {_RECIPIENT_EXAMPLES[act]}. 'May "
++                        "email/message these specific people' is grantable, 'may "
++                        "email/message anyone' is not something to hand an "
++                        "unattended job")
++            to_error = _to_allowlist_error(act, g["to"])
++            if to_error:
++                return to_error
 +    return None
 +
 +
  # ---------------------------------------------------------------------------
  # Tool actions. Each takes the cronjob() argument dict `a` (and the resolved
  # job record for job-bound actions) and returns the JSON result string.
-@@ -588,7 +627,10 @@ def _action_create(a: Dict[str, Any]) -> str:
+@@ -588,7 +820,10 @@ def _action_create(a: Dict[str, Any]) -> str:
          # failure_deliver shares deliver's grammar and validators.
          or _validate_bot_chat_deliver(_normalize_deliver_param(a["failure_deliver"]))
          or (a["context_from"] and _validate_context_from_refs(
@@ -58,7 +251,7 @@
      if error:
          return tool_error(error, success=False)
  
-@@ -604,6 +646,7 @@ def _action_create(a: Dict[str, Any]) -> str:
+@@ -604,6 +839,7 @@ def _action_create(a: Dict[str, Any]) -> str:
              model=_normalize_optional_job_value(a["model"]), provider=_normalize_optional_job_value(a["provider"]),
              base_url=_normalize_optional_job_value(a["base_url"], strip_trailing_slash=True),
              script=_normalize_optional_job_value(script), context_from=context_from,
@@ -66,13 +259,16 @@
              enabled_toolsets=a["enabled_toolsets"] or None, workdir=_normalize_optional_job_value(a["workdir"]),
              no_agent=_no_agent, attach_to_session=a["attach_to_session"],
              monitor_script=_normalize_optional_job_value(a["monitor_script"]),
-@@ -814,6 +857,13 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
+@@ -814,6 +1050,16 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
      if a["workdir"] is not None:
          # Empty string clears; otherwise update_job() validates/normalizes.
          updates["workdir"] = _normalize_optional_job_value(a["workdir"]) or None
 +    if a["grants"] is not None:
-+        # Editing grants in place preserves the job's standing approval; the gate
-+        # re-checks these at run time, so this is UX not the security boundary.
++        # Editing grants in place preserves the job's standing approval, so this
++        # check must not be skipped. The gate repeats the ungrantable and
++        # unattended checks at run time, but the email_send/message_send
++        # recipient rule and the 'to' well-formedness check are enforced ONLY
++        # in _validate_grants.
 +        grant_error = _validate_grants(a["grants"])
 +        if grant_error:
 +            return grant_error
@@ -80,7 +276,7 @@
      if a["no_agent"] is not None:
          # Flipping to True needs a script on the job or in this same update.
          target_no_agent = bool(a["no_agent"])
-@@ -955,6 +1005,7 @@ def cronjob(
+@@ -955,6 +1201,7 @@ def cronjob(
      monitor_url: Optional[str] = None,
      reasoning_effort: Optional[str] = None,
      failure_deliver: Optional[Union[str, List[str]]] = None,
@@ -88,7 +284,7 @@
      all: Optional[bool] = None,
      task_id: str = None,
      session_id: Optional[str] = None,
-@@ -1004,7 +1055,9 @@ CRONJOB_SCHEMA = {
+@@ -1004,7 +1251,9 @@ CRONJOB_SCHEMA = {
  
  'resnap' adopts the CURRENT global inference resolution for an unpinned job (job_id) or all unpinned jobs (all=true) WITHOUT pinning it, so it keeps tracking future global changes — use after deliberately changing the default model.
  
@@ -99,7 +295,7 @@
      "parameters": {
          "type": "object",
          "properties": {
-@@ -1087,6 +1140,24 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
+@@ -1087,6 +1336,40 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                  "type": "boolean",
                  "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), a user-written bare platform target (deliver='slack' — that platform's home channel), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
              },
@@ -115,16 +311,32 @@
 +                    "\"max_per_day\": 4, \"expires\": \"YYYY-MM-DD\"}. "
 +                    "Creating or updating a job WITH grants raises one approval "
 +                    "card naming the powers — tell the user to expect that single "
-+                    "tap. email_send/message_send require a 'to' allowlist; "
-+                    "payment can never be granted; outbound_call needs explicit "
-+                    "unattended:true. Actions outside the grants still gate "
-+                    "normally at run time."
++                    "tap. email_send and message_send must be objects with a "
++                    "'to' list of exact addresses/numbers, one per entry (no "
++                    "comma lists or \"Name <...>\" forms), or \"@domain\" with "
++                    "a dotted domain (no wildcards); email_send also accepts "
++                    "\"self\" (the owner). "
++                    "outbound_call must be an object with explicit "
++                    "unattended:true; its 'to' is optional (omit it to cover "
++                    "any number) and, when given, lists exact E.164 phone "
++                    "numbers such as \"+15551230000\". A message_send grant "
++                    "covers other messaging tools by their 'to'/'recipient'/"
++                    "'chat_id' argument, and covers send_message only when its "
++                    "'to' names the exact target as \"platform:chat_id\", e.g. "
++                    "\"telegram:-1001234567890\" (platform case-insensitive; a "
++                    "topic such as \"telegram:-1001234567890:17\" is a different "
++                    "target; a bare platform, i.e. its home channel, is never "
++                    "covered; a Matrix user is \"matrix:@user:server\", since "
++                    "an entry starting with \"@\" always means a domain). "
++                    "Payment, standing_grant and meeting_schedule "
++                    "can never be granted. Actions outside the grants still "
++                    "gate normally at run time."
 +                ),
 +            },
          },
          "required": ["action"]
      }
-@@ -1111,7 +1182,12 @@ def check_cronjob_requirements() -> bool:
+@@ -1111,7 +1394,12 @@ def check_cronjob_requirements() -> bool:
  _HANDLER_FORWARDED_ARGS = (
      "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
      "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",

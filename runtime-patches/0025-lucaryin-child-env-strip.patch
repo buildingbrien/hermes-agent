@@ -1,0 +1,101 @@
+--- a/tools/environments/local_env_policy.py
++++ b/tools/environments/local_env_policy.py
+@@ -169,13 +169,56 @@
+ _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONHOME")
+ 
+ 
++# ── Lucaryin fold (HA3 / R2-1-03, bug hunt round 2, 2026-09-22) ─────────────
++# The bridge worker's OWN credentials reach the runtime's process env: the
++# per-launch bridge bearer (BRIDGE_AUTH_TOKEN — with it a terminal child can
++# curl 127.0.0.1:<bridge>/api/approvals/<id>/decide and approve the agent's own
++# cards or flip always-approve), the hub admin key (LUCARYIN_API_KEY), the fleet
++# bus key and the fleet mailbox password (FLEET_TOKEN, FLEET_EMAIL_PASSWORD),
++# the voice session signer (VOICE_JWT_SECRET), the Plaid access tokens, the
++# iMessage relay password and the transcription key. In-process addons read
++# them from os.environ (the bearer from its file first — tools/bridge_auth.py)
++# and keep working; no child a model can drive (terminal, background/PTY,
++# execute_code, the browser/driver spawns) needs any of them. Folded into
++# _is_hermes_internal_secret because that predicate is the ONE check every env
++# builder applies unconditionally — the terminal's _make_run_env,
++# _sanitize_subprocess_env (process_registry._spawn_env for background/PTY
++# children, search workers, script runners) and hermes_subprocess_env even
++# with inherit_credentials — and because it also refuses the _HERMES_FORCE_
++# re-injection. The plugin ``strip_env_keys`` registry would not do: the
++# terminal builder never consults it (_make_run_env passes an empty set) and a
++# bundled plugin is opt-in per config.yaml.
++#
++# Exact names, not FLEET_* / PLAID_* prefixes (review, 2026-09-23). The shipped
++# plaid-banking-api skill curls Plaid from the terminal with $PLAID_CLIENT_ID
++# and $PLAID_CLIENT_SECRET (the bridge gate keeps that read path alive on
++# purpose — its scoped read-only exemption), and email-data-feeds reads
++# $FLEET_EMAIL; a prefix strip killed both, and the Plaid one failed as an
++# auth error the skill blames on the user ("reconnect Plaid"). The access
++# tokens are the Plaid secret that matters (the skill reads its token from
++# disk), and FLEET_ID / FLEET_EMAIL / FLEET_DELEGATION_* are not secrets.
++_LUCARYIN_WORKER_SECRET_ENV_NAMES = frozenset({
++    "BRIDGE_AUTH_TOKEN", "LUCARYIN_API_KEY", "VOICE_JWT_SECRET", "IMESSAGE_PASSWORD",
++    "ASSEMBLYAI_API_KEY", "FLEET_TOKEN", "FLEET_EMAIL_PASSWORD", "PLAID_ACCESS_TOKENS",
++})
++
++
++def _is_lucaryin_worker_secret(key: str) -> bool:
++    """True for a bridge-worker credential (``_LUCARYIN_WORKER_SECRET_ENV_NAMES``),
++    case-insensitively — stripped from every child the runtime spawns."""
++    return key.upper() in _LUCARYIN_WORKER_SECRET_ENV_NAMES
++
++
+ def _is_hermes_internal_secret(key: str) -> bool:
+     """True for Hermes-internal secrets injected under *dynamic* names the static
+     blocklist cannot enumerate: ``AUXILIARY_<TASK>_API_KEY``/``_BASE_URL`` (per-task
+     side-LLM credentials) and ``GATEWAY_RELAY_*_SECRET``/``_KEY``/``_TOKEN`` (relay
+-    auth; non-secret routing hints stay visible). Stripped on every spawn path
+-    regardless of env_passthrough registration or ``inherit_credentials``."""
++    auth; non-secret routing hints stay visible) — and, Lucaryin fold, the bridge
++    worker's own credentials (``_is_lucaryin_worker_secret``). Stripped on every
++    spawn path regardless of env_passthrough registration or ``inherit_credentials``."""
+     upper = key.upper()
++    if _is_lucaryin_worker_secret(upper):
++        return True
+     if upper.startswith("AUXILIARY_") and upper.endswith(("_API_KEY", "_BASE_URL")):
+         return True
+     return upper.startswith("GATEWAY_RELAY_") and upper.endswith(("_SECRET", "_KEY", "_TOKEN"))
+--- a/tools/browser_tool.py
++++ b/tools/browser_tool.py
+@@ -233,6 +233,19 @@
+ from tools import browser_tool_lightpanda_fallback as _lp
+ 
+ 
++def _lucaryin_bridge_bearer() -> str:
++    """Lucaryin fold (HA3, with 0025): the bridge bearer the way every runtime
++    reader gets it — $LUCARYIN_AUTH_DIR/bridge.token first (published by the
++    bridge, B1), BRIDGE_AUTH_TOKEN in this worker's env second
++    (tools/bridge_auth.py). The env copy stays for in-process tools, but a
++    reader that only knew the env would break the day it does not."""
++    try:
++        from tools.bridge_auth import bridge_bearer
++        return bridge_bearer()
++    except Exception:  # noqa: BLE001 - the addon ships with the runtime; env as last resort
++        return os.environ.get("BRIDGE_AUTH_TOKEN", "")
++
++
+ # ===========================================================================
+ # Lucaryin UI-access: the signed-in "team browser" as a third CDP-override tier
+ # ===========================================================================
+@@ -288,7 +301,7 @@
+         _mark_signed_in_reachable()
+         return ws  # a /json/version webSocketDebuggerUrl is already a concrete ws:// endpoint
+     # Closed — ask a bridge to bring it up (single launcher lives bridge-side).
+-    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
++    token = _lucaryin_bridge_bearer()
+     headers = {"Authorization": f"Bearer {token}"} if token else {}
+     for port in _BRIDGE_PORTS:
+         try:
+@@ -1438,7 +1451,7 @@
+     if not h or "." not in h:
+         return json.dumps({"success": False,
+                            "error": "host must be a domain like linkedin.com"})
+-    token = os.environ.get("BRIDGE_AUTH_TOKEN", "")
++    token = _lucaryin_bridge_bearer()
+     headers = {"Authorization": f"Bearer {token}"} if token else {}
+     payload = {
+         "host": h,

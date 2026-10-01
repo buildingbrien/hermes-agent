@@ -43,8 +43,39 @@ if [ -f "$PATCHES/series" ]; then
   done < "$PATCHES/series"
 fi
 
-# 3) overlay fork-only addon files (never conflict — absent upstream)
-[ -d "$ADDONS" ] && cp -R "$ADDONS/." "$OUT/"
+# 3) overlay fork-only addon files. An addon never replaces a file upstream (or a
+#    patch) already put there — that would silently swap out upstream code or
+#    tests — so a collision fails the build. One routed exception:
+#    runtime-addons/tests/conftest.py, the addon suite's hermetic guard, would
+#    land on upstream's tests/conftest.py; it is installed as the runtime ROOT
+#    conftest.py instead, and .lucaryin-addon-tests lists the addon test files it
+#    guards (upstream's tests are untouched by it).
+if [ -d "$ADDONS" ]; then
+  clobbered=""
+  addon_tests=""
+  while IFS= read -r f; do
+    f="${f#./}"
+    case "$f" in */__pycache__/*|*.pyc|*/.pytest_cache/*|.DS_Store|*/.DS_Store) continue ;; esac
+    dest="$f"
+    [ "$f" = "tests/conftest.py" ] && dest="conftest.py"
+    if [ -e "$OUT/$dest" ]; then
+      clobbered="$clobbered $f"
+      continue
+    fi
+    mkdir -p "$(dirname "$OUT/$dest")"
+    cp "$ADDONS/$f" "$OUT/$dest"
+    case "$f" in tests/*/test_*.py|tests/test_*.py) addon_tests="$addon_tests$f"$'\n' ;; esac
+  done < <(cd "$ADDONS" && find . -type f | LC_ALL=C sort)
+  if [ -n "$clobbered" ]; then
+    echo "[build-runtime] addon file(s) would replace an upstream/patched file:$clobbered" >&2
+    exit 5
+  fi
+  {
+    echo "# Written by build-runtime.sh: the fork-owned addon tests (runtime-addons/tests)."
+    echo "# conftest.py at this root applies its hermetic guard to exactly these files."
+    printf '%s' "$addon_tests"
+  } > "$OUT/.lucaryin-addon-tests"
+fi
 
 echo "[build-runtime] done: upstream $TAG + $applied patch(es) + addons"
 

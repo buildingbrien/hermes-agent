@@ -27,6 +27,8 @@ import mimetypes
 import os
 import re
 import subprocess
+from email import message_from_bytes
+from email import policy as email_policy
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
 from typing import Any, Dict, List, Optional
@@ -52,7 +54,7 @@ def _himalaya() -> Optional[str]:
 
 
 def _as_list(v: Any) -> List[str]:
-    """Accept either a list or a comma-separated string for address fields."""
+    """Accept either a list or a comma-separated string (attachment paths)."""
     if not v:
         return []
     if isinstance(v, str):
@@ -60,9 +62,112 @@ def _as_list(v: Any) -> List[str]:
     return [str(p).strip() for p in v if str(p).strip()]
 
 
-def _valid(addr: str) -> bool:
-    _, email = parseaddr(addr)
-    return "@" in email and "." in email.split("@")[-1]
+# ── Recipients: exactly the set the approval gate checked ───────────────────
+# A standing grant ("may email these people") is checked by the bridge gate
+# (hermes-bridge approval_gate._recipients_of) against EVERY recipient it reads
+# out of to/cc/bcc. What this tool mails must be that same set, so:
+#   * address fields are split exactly where the gate splits them: ',', ';'
+#     and line breaks (approval_gate._RECIPIENT_SEP_RE), inside a string AND
+#     inside every list item;
+#   * the To/Cc/Bcc headers carry the BARE addresses only. The gate reads the
+#     address inside "Name <addr>", but a display name is parsed by whatever
+#     reads the header next: EmailMessage decodes an RFC 2047 encoded-word name
+#     and writes it back unquoted, so
+#     "=?utf-8?q?Owner_=3Cz=40evil.com=3E=2C?= <owner@x.com>" went out as
+#     "Owner <z@evil.com>, <owner@x.com>", a second, real recipient. Dropping
+#     the name removes that whole class.
+_RECIPIENT_SEP_RE = re.compile(r"[,;\r\n]")
+
+# An RFC 5322 dot-atom addr-spec, ASCII only: no quoted local part, no
+# comments, no whitespace, and a dotted domain. Nothing in it can split into a
+# second address.
+_ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]"
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+_ADDR_SPEC_RE = re.compile(rf"{_ATEXT}+(?:\.{_ATEXT}+)*@{_LABEL}(?:\.{_LABEL})+")
+# "anything <addr>": the name is dropped, so it is not inspected.
+_NAMED_ADDR_RE = re.compile(r"([^<>]*)<([^<>]*)>")
+# An explicit From: plain ASCII name (letters, digits, spaces, . ' _ -),
+# optionally in plain double quotes. No commas or group syntax (more than one
+# From mailbox), and no = ? (an encoded word, which EmailMessage decodes).
+_FROM_NAME_ADDR_RE = re.compile(r"""(?:[A-Za-z0-9 .'_-]*|"[A-Za-z0-9 .'_-]*") *<([^<>]*)>""")
+
+
+def _is_addr_spec(s: str) -> bool:
+    # "=?" starts an encoded word, which EmailMessage decodes even inside an
+    # address: "=?utf-8?q?z=40evil.com?=@x.com" serialises as "z@evil.com@x.com".
+    return bool(_ADDR_SPEC_RE.fullmatch(s)) and "=?" not in s
+
+
+def _bare_address(piece: Any) -> Optional[str]:
+    """'bob@x.com' or 'Any Name <bob@x.com>' → 'bob@x.com'; anything else → None."""
+    if not isinstance(piece, str):
+        return None
+    s = piece.strip()
+    m = _NAMED_ADDR_RE.fullmatch(s)
+    if m:
+        s = m.group(2).strip()
+    return s if _is_addr_spec(s) else None
+
+
+def _address_pieces(v: Any) -> Optional[List[str]]:
+    """Every raw recipient in an address field ([] when absent), split the way
+    the gate splits it. None when the field is not a string or a list of
+    strings: a dict would be read by its keys, a number would crash."""
+    if v is None or (isinstance(v, (str, list, tuple)) and not v):
+        return []
+    items = [v] if isinstance(v, str) else v
+    if not isinstance(items, (list, tuple)) or not all(isinstance(x, str) for x in items):
+        return None
+    return [p.strip() for item in items for p in _RECIPIENT_SEP_RE.split(item) if p.strip()]
+
+
+def _wire_addresses(header: str, value: str) -> List[str]:
+    """The addresses a header value carries once serialised and parsed back —
+    what the MTA reads, not what we meant."""
+    probe = EmailMessage()
+    probe[header] = value
+    wire = message_from_bytes(probe.as_bytes(), policy=email_policy.default)
+    return [a.addr_spec for a in wire[header].addresses]
+
+
+def _address_header(header: str, addrs: List[str]) -> str:
+    """A To/Cc/Bcc value of bare addresses only. Raises ValueError unless it
+    serialises to exactly those addresses (a differential check behind the
+    addr-spec pattern, in case some parser quirk still reinterprets one)."""
+    bare = []
+    for a in addrs:
+        b = _bare_address(a)
+        if b is None:
+            raise ValueError(f"not an email address: {a!r}")
+        bare.append(b)
+    value = ", ".join(bare)
+    try:
+        exact = _wire_addresses(header, value) == bare
+    except Exception:  # noqa: BLE001 - the caller only turns ValueError into an error reply
+        exact = False
+    if not exact:
+        raise ValueError(f"{header} would not reach exactly {value}")
+    return value
+
+
+def _explicit_from(value: Any) -> Optional[str]:
+    """The 'from' argument as the From header will carry it: a bare address,
+    or a plain ASCII 'Name <address>'. None for anything else, including any
+    line break (which can start a new header such as Bcc)."""
+    if not isinstance(value, str) or not value.isascii() or not value.isprintable():
+        return None
+    s = value.strip()
+    if _is_addr_spec(s):
+        addr = s
+    else:
+        m = _FROM_NAME_ADDR_RE.fullmatch(s)
+        addr = m.group(1).strip() if m else ""
+        if not _is_addr_spec(addr):
+            return None
+    try:
+        return s if _wire_addresses("From", s) == [addr] else None
+    except Exception:  # noqa: BLE001 - an unparseable From is simply not accepted
+        return None
 
 
 def _org_signature() -> tuple:
@@ -102,16 +207,31 @@ def _org_signature() -> tuple:
 # The send is the LAST line of defence against a double-send. Upstream approval
 # dedup reduces which sends get filed, but retries, the approval resume/re-drive,
 # the */15 auto-recap cron, and any route-around can still call this tool more
-# than once for one outcome. Reserving on (recipients + subject) within a window
-# BEFORE the himalaya call means exactly one of them physically sends; the rest
-# return the cached success. (The founder received the same recap 3x on
-# 2026-08-24 — this closes the physical duplicate regardless of the upstream
-# race.) Keyed on recipient+subject, NOT body, so a redraft of the same email is
-# recognised as the same intent instead of sending twice. Pass force=true to send
-# a deliberate second copy within the window.
+# than once for one outcome. Reserving BEFORE the himalaya call means exactly
+# one of them physically sends; the rest are reported as not sent. (The founder
+# received the same recap 3x on 2026-08-24 — the cron recap plus re-sends, each
+# re-rendering the body; recipient+subject was the keystone that stopped it.)
+#
+# Two keys since R2-1-38 (bug hunt round 2; decision recorded in the HA PR):
+#   * the MESSAGE key — recipients (to/cc/bcc), subject with Re:/Fwd: folded,
+#     body, html and attachment paths. The same message inside the window is
+#     never sent twice, whoever asks.
+#   * the THREAD key — recipients (to/cc/bcc) + folded subject, the Aug-24
+#     keystone. It still blocks a send when EITHER side of the match is
+#     unattended (a cron run): a re-rendered recap, or a manual re-send right
+#     after a cron recap, is the Aug-24 class. Two ATTENDED sends in a
+#     conversation — a reply in the same thread, a corrected body, a new bcc —
+#     are different messages and both go out (they were silently dropped and
+#     reported sent:true).
+# A skip returns one of two shapes — the EMAIL_SEND RESULT CONTRACT, which the
+# bridge (lucaryin-ai hermes-bridge worker/server) reads and mirrors in a
+# fixture test; change both repos together (see _dedup_result).
+# force=true sends a deliberate second copy.
 import hashlib
 import json
 import time as _time
+
+from tools.lucaryin_filelock import exclusive_lock, replace_with_retry, unique_tmp
 
 _SEND_WINDOW_S = 2700  # 45 min — matches the approval-store DOA window
 
@@ -126,34 +246,56 @@ def _addr_only(a: str) -> str:
     return (e or a or "").strip().lower()
 
 
-def _idem_key(to: List[str], cc: List[str], subject: str) -> str:
-    addrs = sorted({_addr_only(a) for a in (list(to) + list(cc)) if a})
+def _thread_parts(to: List[str], cc: List[str], subject: str, bcc=()) -> str:
+    addrs = sorted({_addr_only(a) for a in (list(to) + list(cc) + list(bcc or ())) if a})
     subj = " ".join((subject or "").lower().split())
     while subj[:3] in ("re:", "fw:") or subj[:4] == "fwd:":
         subj = subj.split(":", 1)[1].strip()
-    return hashlib.sha256(("|".join(addrs) + "||" + subj).encode()).hexdigest()[:40]
+    return "|".join(addrs) + "||" + subj
+
+
+def _thread_key(to: List[str], cc: List[str], subject: str, *, bcc=()) -> str:
+    """Recipients (bcc included) + subject with reply/forward prefixes folded."""
+    return "t:" + hashlib.sha256(_thread_parts(to, cc, subject, bcc).encode()).hexdigest()[:40]
+
+
+def _idem_key(to: List[str], cc: List[str], subject: str, *, bcc=(), body: str = "",
+              html: str = "", attachments=()) -> str:
+    """The MESSAGE key: every recipient (bcc included — a bcc is a different
+    audience), the subject with reply/forward prefixes folded, and the exact
+    content (body, html, attachment paths). Whitespace-only edits to the body do
+    not count as a different message; any other edit does."""
+    content = hashlib.sha256()
+    for part in (" ".join((body or "").split()), " ".join((html or "").split()),
+                 "\x00".join(str(a) for a in (attachments or ()))):
+        content.update(part.encode("utf-8", "surrogatepass"))
+        content.update(b"\x1f")
+    return "m:" + hashlib.sha256(
+        (_thread_parts(to, cc, subject, bcc) + "||" + content.hexdigest()).encode()).hexdigest()[:40]
+
+
+def _is_unattended_send() -> bool:
+    """True inside a cron run (the runtime's own contextvar-first marker,
+    HERMES_CRON_SESSION). Anything unreadable counts as attended: the message
+    key still dedups it."""
+    try:
+        from tools.approval_context import _is_cron_approval_context
+        return bool(_is_cron_approval_context())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _ledger_txn(fn):
-    """Run fn(ledger, now) under an exclusive file lock; prune the window and
-    persist. IO/lock failure runs fn against an empty ledger (a missing dedup is
-    recoverable; a stuck send is not) — but a readable ledger is authoritative,
-    so the reserve below only skips on real, fresh records."""
-    import fcntl
+    """Run fn(ledger, now) under an exclusive cross-process lock (fcntl or msvcrt
+    — tools/lucaryin_filelock.py; the old in-line ``import fcntl`` raised on
+    Windows), prune the window and persist. IO/lock failure runs fn against
+    whatever could be read (a missing dedup is recoverable; a stuck send is
+    not) — but a readable ledger is authoritative, so the reserve below only
+    skips on real, fresh records."""
     path = _ledger_path()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-    except Exception:
-        pass
-    lf = None
-    try:
-        lf = open(path + ".lock", "w")
-        fcntl.flock(lf, fcntl.LOCK_EX)
-    except Exception:
-        lf = None
-    try:
+    with exclusive_lock(path + ".lock"):
         try:
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 ledger = json.load(f)
             if not isinstance(ledger, dict):
                 ledger = {}
@@ -163,49 +305,135 @@ def _ledger_txn(fn):
         ledger = {k: v for k, v in ledger.items()
                   if isinstance(v, dict) and now - float(v.get("ts") or 0) < _SEND_WINDOW_S}
         out = fn(ledger, now)
+        tmp = unique_tmp(path)
         try:
-            tmp = path + ".tmp"
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(ledger, f)
-            os.replace(tmp, path)
+            replace_with_retry(tmp, path)
         except Exception:
             pass
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         return out
-    finally:
-        if lf is not None:
-            try:
-                fcntl.flock(lf, fcntl.LOCK_UN)
-                lf.close()
-            except Exception:
-                pass
 
 
-def _reserve_send(key: str):
+def _live(rec, now: float) -> bool:
+    """A record that blocks an equivalent send: sent in the window, or a pending
+    attempt younger than the send timeout (older = a crashed attempt, free)."""
+    if not isinstance(rec, dict):
+        return False
+    if rec.get("status") == "sent":
+        return True
+    return rec.get("status") == "pending" and now - float(rec.get("ts") or 0) < SEND_TIMEOUT_S
+
+
+def _reserve_send(message_key: str, thread_key: Optional[str] = None, *, unattended: bool = False):
     """Atomically decide whether THIS call physically sends. Returns
-    ('go', None) to send, or ('skip', prior) when an equivalent send already
-    completed OR is in flight within the window — the caller returns the cached
-    result rather than sending again. A stale 'pending' (a crashed/timed-out
-    prior attempt older than the send timeout) is treated as free so a genuine
-    retry is never permanently blocked."""
+    ``('go', reservation)`` — pass the reservation to _commit_send /
+    _release_send — or ``('skip', prior)`` where prior carries ``match``:
+    ``'message'`` (the same message) or ``'thread'`` (same recipients and
+    subject, with a cron run on one side)."""
     def _op(ledger, now):
-        rec = ledger.get(key)
-        if isinstance(rec, dict):
-            age = now - float(rec.get("ts") or 0)
-            if rec.get("status") == "sent":
-                return ("skip", rec)
-            if rec.get("status") == "pending" and age < SEND_TIMEOUT_S:
-                return ("skip", rec)
-        ledger[key] = {"ts": now, "status": "pending"}
-        return ("go", None)
+        rec = ledger.get(message_key)
+        if _live(rec, now):
+            return ("skip", dict(rec, match="message"))
+        trec = ledger.get(thread_key) if thread_key else None
+        if _live(trec, now) and (unattended or trec.get("unattended")):
+            return ("skip", dict(trec, match="thread"))
+        reservation = {"message_key": message_key, "thread_key": thread_key,
+                       "unattended": bool(unattended), "prior_thread": trec}
+        ledger[message_key] = {"ts": now, "status": "pending"}
+        if thread_key:
+            ledger[thread_key] = {"ts": now, "status": "pending", "unattended": bool(unattended)}
+        return ("go", reservation)
     return _ledger_txn(_op)
 
 
-def _commit_send(key: str, summary: str) -> None:
-    _ledger_txn(lambda ledger, now: ledger.__setitem__(key, {"ts": now, "status": "sent", "summary": summary}))
+def _as_reservation(res) -> dict:
+    """Accept the reservation dict, or a bare message key (older callers)."""
+    return res if isinstance(res, dict) else {"message_key": res, "thread_key": None,
+                                              "unattended": False, "prior_thread": None}
 
 
-def _release_send(key: str) -> None:
-    _ledger_txn(lambda ledger, now: ledger.pop(key, None))
+def _commit_send(res, summary: str) -> None:
+    r = _as_reservation(res)
+
+    def _op(ledger, now):
+        ledger[r["message_key"]] = {"ts": now, "status": "sent", "summary": summary}
+        if r.get("thread_key"):
+            ledger[r["thread_key"]] = {"ts": now, "status": "sent", "summary": summary,
+                                       "unattended": bool(r.get("unattended"))}
+    _ledger_txn(_op)
+
+
+def _release_send(res) -> None:
+    """Definitively not sent: free the message key and put the thread key back
+    the way it was (an earlier send's record must survive this failed attempt)."""
+    r = _as_reservation(res)
+
+    def _op(ledger, now):
+        ledger.pop(r["message_key"], None)
+        tk = r.get("thread_key")
+        if tk:
+            prior = r.get("prior_thread")
+            if isinstance(prior, dict):
+                ledger[tk] = prior
+            else:
+                ledger.pop(tk, None)
+    _ledger_txn(_op)
+
+
+# EMAIL_SEND RESULT CONTRACT for a de-duplicated call (Wave 2 lead decision;
+# lucaryin-ai carries the mirror fixture). Exactly these keys, nothing else:
+#
+#   match "message" — the identical message already went out in the window. It
+#   WAS delivered (earlier), so it counts as sent everywhere: the chat line, the
+#   worker's false-success guard, and an approval that resumes into it.
+#     {sent: True, already_sent: True, deduplicated: True, match: "message",
+#      idempotent_skip: True, summary}
+#
+#   match "thread" — same recipients + subject from a cron run inside the hold
+#   window, different content. It did NOT go out, and an approval must not be
+#   consumed by it: no idempotent_skip, no error field.
+#     {sent: False, held: True, deduplicated: True, match: "thread", reason, summary}
+DEDUP_MESSAGE_KEYS = frozenset(
+    {"sent", "already_sent", "deduplicated", "match", "idempotent_skip", "summary"})
+DEDUP_THREAD_KEYS = frozenset({"sent", "held", "deduplicated", "match", "reason", "summary"})
+
+
+def _dedup_result(match: Optional[str], to: List[str], subject: str) -> Dict[str, Any]:
+    """The result of a call the ledger skipped (see the contract above)."""
+    minutes = _SEND_WINDOW_S // 60
+    who = ", ".join(to)
+    if match == "message":
+        return {
+            "sent": True,
+            "already_sent": True,
+            "deduplicated": True,
+            "match": "message",
+            "idempotent_skip": True,
+            "summary": (f"Already sent: “{subject}” to {who} went out within the last "
+                        f"{minutes} minutes; not sent a second time."),
+        }
+    # "thread" (the only other value _reserve_send returns): nothing went out.
+    return {
+        "sent": False,
+        "held": True,
+        "deduplicated": True,
+        "match": "thread",
+        "reason": (
+            f"An email with this subject (“{subject}”) already went to {who} within "
+            f"the last {minutes} minutes and a scheduled job is involved, so this "
+            "different version was held back rather than sent as a second copy. If "
+            "the user asked for a new copy, send again with force=true."
+        ),
+        "summary": (f"Held, not sent: “{subject}” to {who} — a scheduled job already "
+                    f"sent this subject within the last {minutes} minutes."),
+    }
 
 
 def _build_message(
@@ -220,11 +448,12 @@ def _build_message(
 ) -> EmailMessage:
     msg = EmailMessage()
     msg["From"] = sender
-    msg["To"] = ", ".join(to)
+    # Bare addresses only, whatever the caller passed: see _address_header.
+    msg["To"] = _address_header("To", to)
     if cc:
-        msg["Cc"] = ", ".join(cc)
+        msg["Cc"] = _address_header("Cc", cc)
     if bcc:
-        msg["Bcc"] = ", ".join(bcc)
+        msg["Bcc"] = _address_header("Bcc", bcc)
     msg["Subject"] = subject
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
@@ -300,23 +529,49 @@ def _account_from(account: str) -> str:
 def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     args = args if isinstance(args, dict) else {}
 
-    to = _as_list(args.get("to"))
-    cc = _as_list(args.get("cc"))
-    bcc = _as_list(args.get("bcc"))
+    fields = {}
+    for key in ("to", "cc", "bcc"):
+        pieces = _address_pieces(args.get(key))
+        if pieces is None:
+            return {"error": f"'{key}' must be an address or a list of addresses."}
+        fields[key] = pieces
     subject = (args.get("subject") or "").strip()
     body = args.get("body") or ""
     html = args.get("html") or ""
+    # The intent as the caller stated it (before the org signature is appended):
+    # what the dedup key hashes.
+    raw_body, raw_html = body, html
     attachments = _as_list(args.get("attachments"))
     account = (args.get("account") or "fleet").strip()
     draft = bool(args.get("draft"))
 
-    if not to:
+    if not fields["to"]:
         return {"error": "No recipient. Pass 'to' as an address or list of addresses."}
-    bad = [a for a in (to + cc + bcc) if not _valid(a)]
+    bad = [a for key in ("to", "cc", "bcc") for a in fields[key] if _bare_address(a) is None]
     if bad:
-        return {"error": f"These do not look like email addresses: {', '.join(bad)}"}
+        return {"error": (
+            f"These do not look like email addresses: {', '.join(bad)}. Pass "
+            "plain addresses such as person@example.com."
+        )}
+    # From here on every recipient is its bare address: that is what the
+    # headers carry, and what the result and summary report.
+    to, cc, bcc = ([_bare_address(a) for a in fields[key]] for key in ("to", "cc", "bcc"))
     if not subject:
         return {"error": "No subject. An email without one reads as spam."}
+
+    # An explicit `from` comes from the model, so it is held to a bare address
+    # or a plain ASCII "Name <address>" on one line (see _explicit_from).
+    sender = ""
+    raw_from = args.get("from")
+    if not (raw_from is None or (isinstance(raw_from, str) and not raw_from.strip())):
+        sender = _explicit_from(raw_from) or ""
+        if not sender:
+            return {"error": (
+                "'from' must be a bare address (fleet-001@lucaryin.com) or a "
+                "plain ASCII name and address (Lucaryin Fleet "
+                "<fleet-001@lucaryin.com>) with no line breaks. Omit it to "
+                "send as the account's own identity."
+            )}
 
     binary = _himalaya()
     if not binary:
@@ -330,7 +585,6 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     # wins; otherwise read the account's own identity out of the himalaya config
     # (works for gmail/zoho/any account, not just fleet). Fleet keeps a hardcoded
     # fallback so it still sends if the config couldn't be read.
-    sender = (args.get("from") or "").strip()
     if not sender:
         sender = _account_from(account)
     if not sender and account == "fleet":
@@ -373,31 +627,26 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
     # and validated identically, so "turn this draft into a send" is only a
     # flag flip away.
     force = bool(args.get("force"))
-    idem = _idem_key(to, cc, subject)
-    reserved = False
+    idem = _idem_key(to, cc, subject, bcc=bcc, body=raw_body, html=raw_html, attachments=attachments)
+    reservation = None
     if draft:
         cmd = [binary, "message", "save", "-a", account, "--folder", "Drafts"]
         verb = "Saving the draft"
     else:
-        # Reserve BEFORE sending — one physical send per (recipients, subject)
-        # in the window. force=true bypasses for a deliberate second copy.
+        # Reserve BEFORE sending (see the ledger note above). force=true
+        # bypasses for a deliberate second copy.
         if not force:
-            decision, prior = _reserve_send(idem)
+            decision, prior = _reserve_send(
+                idem, _thread_key(to, cc, subject, bcc=bcc), unattended=_is_unattended_send())
             if decision == "skip":
-                return {
-                    "sent": True,
-                    "idempotent_skip": True,
-                    "to": to, "cc": cc, "subject": subject, "account": account,
-                    "summary": (prior or {}).get("summary")
-                    or f"“{subject}” was already sent to {', '.join(to)} moments ago — not re-sent.",
-                }
-            reserved = True
+                return _dedup_result((prior or {}).get("match"), to, subject)
+            reservation = prior  # decision == "go": the reservation to commit / release
         # Dry-run: exercise the full gate/dedup/ledger path end to end but never
         # hand bytes to himalaya (tests + the dry-run harness). Records the send
         # so idempotency is exercised.
         if os.environ.get("HERMES_EMAIL_DRYRUN"):
-            if reserved:
-                _commit_send(idem, f"[dry-run] Sent “{subject}” to {', '.join(to)}.")
+            if reservation:
+                _commit_send(reservation, f"[dry-run] Sent “{subject}” to {', '.join(to)}.")
             return {
                 "sent": True, "dry_run": True,
                 "to": to, "cc": cc, "subject": subject, "account": account,
@@ -420,13 +669,13 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
                          f"or may not have gone through. Check the "
                          f"{'Drafts' if draft else 'Sent'} folder before retrying."}
     except Exception as e:  # noqa: BLE001 — surface the real reason
-        if reserved:
-            _release_send(idem)  # definitively did not send → free the reservation
+        if reservation:
+            _release_send(reservation)  # definitively did not send → free the reservation
         return {"error": f"Could not run himalaya: {e}"}
 
     if proc.returncode != 0:
-        if reserved:
-            _release_send(idem)  # definitively did not send → allow a retry
+        if reservation:
+            _release_send(reservation)  # definitively did not send → allow a retry
         detail = (proc.stderr or proc.stdout or b"").decode(errors="replace").strip()
         return {"error": f"{verb} failed: {detail[:400] or 'himalaya exited non-zero'}"}
 
@@ -452,8 +701,8 @@ def email_send_tool(args: Dict[str, Any], **_kw) -> Dict[str, Any]:
         + (f" with {len(attachments)} attachment(s)" if attachments else "")
         + f" — {recipients} recipient(s) total."
     )
-    if reserved:
-        _commit_send(idem, summary)  # confirmed sent → block equivalents in-window
+    if reservation:
+        _commit_send(reservation, summary)  # confirmed sent → block equivalents in-window
     return {
         "sent": True,
         "to": to,
@@ -479,7 +728,11 @@ EMAIL_SEND_SCHEMA = {
             "to": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Recipient address(es). A comma-separated string is also accepted.",
+                "description": (
+                    "Recipient address(es). A string separated by commas, "
+                    "semicolons or line breaks is also accepted. Headers carry "
+                    "the bare addresses only; display names are dropped."
+                ),
             },
             "subject": {"type": "string", "description": "Subject line."},
             "body": {"type": "string", "description": "Plain-text body of the message."},
@@ -514,7 +767,11 @@ EMAIL_SEND_SCHEMA = {
             },
             "from": {
                 "type": "string",
-                "description": "Optional explicit From header, e.g. 'Lucaryin Fleet <fleet-001@lucaryin.com>'.",
+                "description": (
+                    "Optional explicit From header: a bare address or a plain "
+                    "ASCII name and address, e.g. 'Lucaryin Fleet "
+                    "<fleet-001@lucaryin.com>'. Omit to use the account's identity."
+                ),
             },
             "draft": {
                 "type": "boolean",
@@ -529,11 +786,18 @@ EMAIL_SEND_SCHEMA = {
             "force": {
                 "type": "boolean",
                 "description": (
-                    "Send a DELIBERATE second copy of an email with the same "
-                    "recipient and subject within the last ~45 minutes. Normally "
-                    "an identical send is de-duplicated (returned as already "
-                    "sent) so retries and background jobs never double-mail — set "
-                    "force only when the user explicitly asks to resend."
+                    "Send a DELIBERATE second copy. Normally a send is "
+                    "de-duplicated: when the identical message (same recipients, "
+                    "subject, body and attachments) went out in the last ~45 "
+                    "minutes the result is sent:true, already_sent:true (it was "
+                    "delivered earlier; nothing new went out), and when a "
+                    "scheduled job is involved and an email with the same "
+                    "subject already went to the same recipients the result is "
+                    "sent:false, held:true (this version did NOT go out) — so "
+                    "retries and background jobs never double-mail. A DIFFERENT "
+                    "message to the same people in a conversation (a reply, a "
+                    "corrected body, a new bcc) is sent normally. Set force only "
+                    "when the user explicitly asks to resend."
                 ),
             },
             "signature": {

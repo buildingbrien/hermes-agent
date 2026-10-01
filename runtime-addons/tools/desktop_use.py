@@ -575,37 +575,73 @@ def desktop_type(app: str = "", text: str = "", description: str = "",
                      lambda: _post_key_text(text))
 
 
+# ── desktop_key: what may reach osascript ────────────────────────────────────
+# ``keys`` is model-authored and the approval card shows only ``description``
+# (R2-2-07, bug hunt round 2). The keystroke branch used to interpolate the
+# first non-modifier token straight into ``keystroke "<token>"``, so a token
+# containing a double quote closed the AppleScript literal and the rest ran as
+# code — ``do shell script`` as the logged-in user, after every allowlist /
+# frontmost / TCC check had passed. Nothing is interpolated any more: a key is
+# either ONE printable ASCII character from _KEYSTROKE_CHARS (never the two
+# AppleScript string metacharacters, quote and backslash) or a NAME in
+# _KEY_CODES, which becomes an integer ``key code``. Anything else is refused
+# before the app is even brought to the front.
+_KEY_MODIFIERS = {"cmd": "command down", "command": "command down", "ctrl": "control down",
+                  "control": "control down", "opt": "option down", "option": "option down",
+                  "alt": "option down", "shift": "shift down"}
+_KEY_CODES = {"return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51,
+              "escape": 53, "esc": 53}
+_KEYSTROKE_CHARS = frozenset(
+    ch for ch in map(chr, range(0x20, 0x7F)) if ch not in ('"', "\\"))
+
+
+def _parse_key_combo(keys: str):
+    """Validate a ``keys`` combo ("cmd+s", "return", "shift+a").
+
+    Returns ``(script_tail, mods)`` where ``script_tail`` is the exact
+    ``keystroke "x"`` / ``key code N`` clause — built from the allowlist, never
+    from the model's bytes — or ``(None, reason)`` when the combo is refused."""
+    parts = [p.strip().lower() for p in str(keys).replace("-", "+").split("+") if p.strip()]
+    if not parts:
+        return None, "No key specified."
+    mods = [_KEY_MODIFIERS[p] for p in parts if p in _KEY_MODIFIERS]
+    others = [p for p in parts if p not in _KEY_MODIFIERS]
+    if len(others) != 1:
+        return None, ("Send exactly one key per call, optionally with modifiers "
+                      "(e.g. 'cmd+s', 'return', 'shift+tab').")
+    key = others[0]
+    if key in _KEY_CODES:
+        return f"key code {_KEY_CODES[key]}", mods
+    if len(key) == 1 and key in _KEYSTROKE_CHARS:
+        return f'keystroke "{key}"', mods
+    return None, (
+        f"Unsupported key {key[:20]!r}: use one printable ASCII character or one of "
+        f"{', '.join(sorted(set(_KEY_CODES)))}, with optional modifiers cmd/ctrl/opt/shift.")
+
+
 def desktop_key(app: str = "", keys: str = "", description: str = "",
                 task_id: str = "", **_) -> dict:
     """State-changing (carded): send a key/combo to a NAMED app via System Events
     (e.g. "return", "cmd+s"). Kept osascript-based so named keys/modifiers are
-    reliable without a keycode table."""
+    reliable without a keycode table — but only an allowlisted key ever reaches
+    the script (see _parse_key_combo); the model's bytes are never interpolated."""
     bad = _require_ready(app, need_input=True)
     if bad:
         return bad
     if not keys:
         return _err("No key specified.")
+    clause, mods = _parse_key_combo(keys)
+    if clause is None:
+        # Refused BEFORE _focus: a rejected combo must not raise the app either.
+        _audit({"app": app, "action": "key", "keys": str(keys)[:80], "description": description,
+                "refused": mods})
+        return _err(f"Refused to send keys '{str(keys)[:40]}' — {mods}")
     if not _focus(app):
         return _err(f"Couldn't bring '{app}' to the front — no action taken.")
     if (_frontmost_name() or "").lower() != app.strip().lower():
         return _err(f"'{app}' isn't frontmost — refused to send keys to another window.")
-    parts = [p.strip().lower() for p in keys.replace("-", "+").split("+") if p.strip()]
-    mod_map = {"cmd": "command down", "command": "command down", "ctrl": "control down",
-               "control": "control down", "opt": "option down", "option": "option down",
-               "alt": "option down", "shift": "shift down"}
-    mods = [mod_map[p] for p in parts if p in mod_map]
-    key = next((p for p in parts if p not in mod_map), "")
-    special = {"return": "return", "enter": "return", "tab": "tab", "escape": "escape",
-               "esc": "escape", "space": "space", "delete": "delete"}
-    if key in special:
-        script = f'tell application "System Events" to key code {{}}'  # placeholder
-        keymap = {"return": 36, "tab": 48, "space": 49, "delete": 51, "escape": 53}
-        code = keymap.get(special[key])
-        using = (" using {" + ", ".join(mods) + "}") if mods else ""
-        script = f'tell application "System Events" to key code {code}{using}'
-    else:
-        using = (" using {" + ", ".join(mods) + "}") if mods else ""
-        script = f'tell application "System Events" to keystroke "{key}"{using}'
+    using = (" using {" + ", ".join(mods) + "}") if mods else ""
+    script = f'tell application "System Events" to {clause}{using}'
     r = subprocess.run(["osascript", "-e", script], check=False, stdin=subprocess.DEVNULL,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     _audit({"app": app, "action": "key", "keys": keys, "description": description,
