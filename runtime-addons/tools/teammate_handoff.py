@@ -42,6 +42,13 @@ Rules:
   are not enabled (a cron job's toolset, the coding posture) the call is
   refused, so delegate_task never widens a toolset boundary, and the schema
   rewrite drops the field there (``drop_agent_field_without_fleet``).
+* A scheduled (cron) run never hands off, even when its job has the fleet
+  tools (patch 0037 gives them to the Team Huddle): the hand-off runs on
+  threads that do not carry the run's scheduled marker, so the teammate
+  would answer an ATTENDED turn (Lucaryin review of #140, round 5). The call
+  is refused and the field is dropped there, as before the job had the
+  fleet tools; the job asks a teammate with ``ask_agent``, which marks the
+  request unattended (tools/fleet_send.py ``_unattended_fields``).
 * Over the fleet hop budget, or back to an agent already in the chain, a task
   is refused locally with the reason (tools/fleet_budget.py), as
   delegate_to_neith does. The receiving bridge enforces the same budget. The
@@ -157,6 +164,20 @@ def fleet_tools_enabled(parent_agent: Any) -> bool:
         return False
 
 
+def in_scheduled_run(parent_agent: Any = None) -> bool:
+    """True inside a cron run: the agent the scheduler builds (platform
+    "cron"), or the HERMES_CRON_SESSION session var cron/scheduler.py
+    _CronRunScope sets for the run (read as tools/fleet_send.py reads it).
+    Imports lazily: this module stays importable on its own."""
+    if str(getattr(parent_agent, "platform", "") or "").strip().lower() == "cron":
+        return True
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env("HERMES_CRON_SESSION") == "1"
+    except Exception:  # noqa: BLE001 — no session module: the process env decides
+        return os.environ.get("HERMES_CRON_SESSION") == "1"
+
+
 def _recover_tasks(tasks: Any) -> Tuple[Any, Optional[str]]:
     """Upstream accepts ``tasks`` as a JSON-array string too; read it the same way."""
     from tools.delegate_tool_tasks import _recover_tasks_from_json_string
@@ -197,10 +218,14 @@ def fold_top_level_agent(args: Any) -> Any:
 
 def drop_agent_field_without_fleet(td: Dict[str, Any], available) -> Dict[str, Any]:
     """delegate_task's schema without the per-task ``agent`` field when this
-    session has no fleet tools (a cron job's toolset): there it can only be
-    refused. Called from model_tools._rewrite_delegate_task (patch 0032).
+    session has no fleet tools (a cron job's toolset) or is a scheduled run:
+    there it can only be refused. Called from model_tools._rewrite_delegate_task
+    (patch 0032); the scheduler builds a run's tools inside its run scope, and
+    the tool-definition cache already keys a cron run apart from a chat
+    (model_tools._is_dispatcher_owned_worker). The hand-off itself is refused
+    in a scheduled run whatever the schema showed (_plan).
     Never mutates ``td``: the static schema is shared."""
-    if HANDOFF_REQUIRES_TOOL in (available or ()):
+    if HANDOFF_REQUIRES_TOOL in (available or ()) and not in_scheduled_run():
         return td
     try:
         fn = td["function"]
@@ -336,6 +361,11 @@ def _plan(kwargs: Dict[str, Any], parent_agent: Any) -> Tuple[str, Any]:
             "Handing a task to a teammate is not available in this session (its "
             "toolset has no fleet tools). Leave 'agent' out and do the task with a "
             "subagent or your own tools, or tell the user it needs the teammate.")
+    if in_scheduled_run(parent_agent):
+        return "error", (
+            "Handing a task to a teammate through delegate_task is not available in "
+            "a scheduled run. Leave 'agent' out and do the task with a subagent or "
+            "your own tools, or ask the teammate with ask_agent.")
     handoffs = [{
         "index": i,
         "agent": agent,

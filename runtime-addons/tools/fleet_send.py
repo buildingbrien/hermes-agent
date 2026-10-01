@@ -166,6 +166,35 @@ def _preflight_refusal(recipient: str, sender: str):
     return _not_delivered(recipient, reason, guidance)
 
 
+# ── Scheduled runs ask for UNATTENDED teammate turns (Lucaryin review F21) ──
+# A teammate turn requested from a cron run must not run with that teammate's
+# ATTENDED trust (the inline approval wait, its always-approve toggle and
+# interactive grants, which cannot see that the turn came from cron). Every
+# tool of the "fleet" toolset (ask_agent, fleet_send, delegate_to_neith) adds
+# these fields to a request made inside a cron run; the Lucaryin bridge turns
+# them into an unattended worker turn on /api/chat/sync and on the bus
+# (hermes-bridge server.py _mark_turn_unattended). The marker only ever
+# tightens: the bridge still applies the origin hold on outbound contact the
+# owner did not type to such a turn, at every trust level (approval_gate
+# _origin_hold_applies, lucaryin-ai#140 round 4), and an older bridge that
+# ignores it changes nothing.
+# runtime-addons/tests/tools/test_fleet_tools_cron_unattended.py pins it for
+# every tool registered in the "fleet" toolset.
+def _in_scheduled_run() -> bool:
+    """True inside a cron run (cron/scheduler.py _CronRunScope sets the
+    HERMES_CRON_SESSION session var for the run)."""
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env("HERMES_CRON_SESSION") == "1"
+    except Exception:
+        return os.environ.get("HERMES_CRON_SESSION") == "1"
+
+
+def _unattended_fields() -> dict:
+    """``{"unattended": True}`` for a request made inside a cron run, else {}."""
+    return {"unattended": True} if _in_scheduled_run() else {}
+
+
 def _post_json(url: str, payload: dict, timeout: int = 10) -> dict:
     """POST JSON payload and return parsed response dict."""
     req = urllib.request.Request(
@@ -304,6 +333,10 @@ def fleet_send_tool(args, **kw):
         payload["origin_session_id"] = _origin["session_id"]
     if _origin["source"]:
         payload["origin_source"] = _origin["source"]
+    # F21: from a scheduled run, the recipient answers as an unattended turn
+    # (the bridge carries the marker onto the bus; the direct fallback POSTs
+    # this same payload).
+    payload.update(_unattended_fields())
 
     # Receipt is tri-state: "delivered" (confirmed), "queued" (published but
     # unconfirmed — recipient may still pick it up), or "dead" (every transport

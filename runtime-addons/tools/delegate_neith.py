@@ -41,6 +41,7 @@ _SYNC_TIMEOUT = 320
 from tools.fleet_budget import (  # noqa: E402
     budget_from_env as _fleet_budget_from_env, max_fleet_depth as _max_fleet_depth,
     next_hop_fields, refusal_reason)
+from tools.fleet_send import _unattended_fields  # noqa: E402  (F21, shared with ask_agent)
 
 
 def _budget_refusal(sender: str, depth: int, visited) -> "str | None":
@@ -187,6 +188,10 @@ def _call_neith_sync(task: str, budget: "dict | None" = None) -> dict:
         payload["requester_session_id"] = origin["session_id"]
     if origin.get("source"):
         payload["requester_source"] = origin["source"]
+    # F21: from a scheduled run, Neith answers as an unattended turn (the
+    # Lucaryin bridge also refuses this tool in scheduled runs in favour of
+    # ask_agent; this keeps the marker on whichever path runs).
+    payload.update(_unattended_fields())
     headers = {"Content-Type": "application/json"}
     # Bridge auth (P4): attach the per-launch token when present so this keeps
     # working once the bridges require authentication. Harmless when unset.

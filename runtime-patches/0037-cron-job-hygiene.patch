@@ -1,0 +1,130 @@
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1948,6 +1948,31 @@
+ _RunResult = tuple[bool, str, str, Optional[str]]
+ 
+ 
++def _lucaryin_hygiene():
++    """cron/lucaryin_hygiene.py (patch 0037) or None. Never lets the overlay break a run."""
++    try:
++        from cron import lucaryin_hygiene
++        return lucaryin_hygiene
++    except Exception:
++        logger.debug("lucaryin hygiene overlay unavailable", exc_info=True)
++        return None
++
++
++def _lucaryin_toolsets(job: dict, resolved):
++    """Per-job sanctioned extras on the resolved cron toolsets (patch 0037): the tools a job's
++    own prompt names (ask_agent, fleet_send, board_view, ...) that the cron set leaves out.
++    disabled_toolsets is passed alongside, so config.yaml's denylist still wins."""
++    _lh = _lucaryin_hygiene()
++    return _lh.toolsets(job, resolved) if _lh is not None else resolved
++
++
++def _lucaryin_disabled_toolsets(job: dict, disabled: list[str]) -> list[str]:
++    """The cron denylist plus what this job must never have (patch 0037): the Team Huddle's
++    session_search, even when its own enabled_toolsets or the cron platform config list it."""
++    _lh = _lucaryin_hygiene()
++    return _lh.disabled_toolsets(job, disabled) if _lh is not None else disabled
++
++
+ def _prepare_job_prompt(
+     job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
+ ) -> tuple[Optional[_RunResult], Optional[str]]:
+@@ -1979,6 +2004,27 @@
+     if _early is not None:
+         return _early, None
+ 
++    # Lucaryin job hygiene (patch 0037, cron/lucaryin_hygiene.py): quiet hours, a minimum
++    # interval and cheap change checks decide BEFORE any model call whether this fire is worth a
++    # turn — a skip is a silent success with no LLM call and no delivery (the */30 heartbeat and
++    # the polling jobs spent most runs saying nothing new). The job's per-run context (teammate
++    # roster, release facts, persona notice, recently-reported topics) rides the Run Context seam.
++    # Fail-open: no bridge, an older bridge or any error and the job runs exactly as before.
++    _lh = _lucaryin_hygiene()
++    if _lh is not None:
++        _hy = _lh.pre_run(job)
++        if _hy.skip:
++            logger.info("Job '%s' (ID: %s): hygiene skip — %s", job_name, job_id, _hy.reason)
++            _hy_now = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
++            return (
++                True,
++                f"{_job_doc_header(job_name, job_id, _hy_now, 'hygiene')}"
++                f"**Status:** skipped — {_hy.reason}\n",
++                SILENT_MARKER, None,
++            ), None
++        if _hy.context:
++            extra_prompt = f"{extra_prompt}\n\n{_hy.context}" if extra_prompt else _hy.context
++
+     # Wake-gate: run the pre-check script BEFORE building the prompt; its result is passed into
+     # _build_job_prompt so the script runs only once.
+     # NOTE: the SQLite session store used to be initialized here, BEFORE the wake-gate and prompt-validation
+@@ -2206,8 +2252,8 @@
+         providers_order=pr.get("order"),
+         provider_sort=pr.get("sort"),
+         openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
+-        enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
+-        disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
++        enabled_toolsets=_lucaryin_toolsets(job, _resolve_cron_enabled_toolsets(job, _cfg)),
++        disabled_toolsets=_lucaryin_disabled_toolsets(job, _resolve_cron_disabled_toolsets(_cfg)),
+         quiet_mode=True,
+         # Project context files only with a configured workdir; SOUL.md always.
+         skip_context_files=not bool(workdir),
+@@ -2262,6 +2308,17 @@
+             return
+ 
+ 
++def _lucaryin_install_kwargs(install_fn, job: dict) -> dict:
++    _lh = _lucaryin_hygiene()
++    if _lh is None:
++        return {}
++    try:
++        return _lh.install_kwargs(install_fn, job)
++    except Exception:
++        logger.debug("lucaryin install kwargs unavailable", exc_info=True)
++        return {}
++
++
+ def _install_cron_approval_gate(job: dict) -> None:
+     """Arm the Lucaryin cron approval gate for this job's agent.
+ 
+@@ -2324,6 +2381,10 @@
+             # legacy read_only behaviors. Absent -> cron_gate derives from
+             # read_only, so nothing else changes.
+             policy=job.get("cron_action_policy"),
++            # Patch 0037: the heartbeat budget (the upstream rebase dropped it, so runs went to
++            # 54 min), job_id (per-job grant ledgers, R2-1-75) and the job itself (its hygiene
++            # kind) -- each only when this bridge's install() accepts it.
++            **_lucaryin_install_kwargs(cron_gate.install, job),
+         )
+     except Exception:
+         # Never let gate wiring break job execution -- but cron_gate itself logs
+@@ -2700,14 +2761,25 @@
+             "This alert is sent once; the job stays blocked until the configuration is fixed."
+         )
+     elif success:
+-        deliver_content = final_response
++        # Patch 0037: topic dedupe, no-op silencing and the shared GBrain alert decide what of
++        # a successful run reaches the owner ("[SILENT]" -> suppressed below).
++        _lh = _lucaryin_hygiene()
++        deliver_content = (_lh.filter_delivery(job, final_response) if _lh is not None
++                           else final_response)
+     else:
+         # Record the job+error signature once; if already acked by the operator, suppress the
+         # per-run ping. Best-effort: a ledger failure never breaks delivery.
+         incident_acked, failure_incident_id = _upsert_incident_for_failure(
+             job, error or "", output_file=output_file
+         )
+-        if incident_acked:
++        # Patch 0037: a run that finished its report but had one step blocked (needs_grant)
++        # delivers the report with a footnote; the bare failure line hid finished work.
++        _lh = _lucaryin_hygiene()
++        _grant_report = (_lh.blocked_run_delivery(job, error, final_response)
++                         if _lh is not None else None)
++        if _grant_report:
++            deliver_content = _grant_report
++        elif incident_acked:
+             deliver_content = ""
+         else:
+             deliver_content = (
