@@ -191,6 +191,10 @@ def run_meeting_join(job: dict, agent_key: str = "thoth") -> Tuple[bool, str, st
         # Surface hint (teams_meet/teams_meetup/zoom/…) so the browser join drives
         # the right flow. Bridge re-derives from join_url if this is absent.
         body["join_surface"] = str(meeting["join_surface"])
+    if meeting.get("end_iso"):
+        # The bridge keeps the line up to the meeting's end plus an overrun
+        # buffer (never under 2 h), so a long meeting is not cut (review F17).
+        body["meeting_end_iso"] = str(meeting["end_iso"])
     origin = job.get("origin") or {}
     if origin.get("chat_id"):
         body["session_id"] = str(origin["chat_id"])

@@ -85,12 +85,23 @@ def dial_meeting_tool(args, **kwargs):
     pin = re.sub(r"[^\d#*w]", "", (args.get("pin") or "").strip())
     label = (args.get("label") or "").strip()[:120]
 
+    # `minutes` is how long the meeting is EXPECTED to run, not a cap. On
+    # 2026-09-21 (Sophie call) minutes=35 and then 30 became hard Twilio
+    # limits: both calls were cut at exactly 2100 s / 1800 s while the room
+    # was still talking (review F17). The line now stays up at least 2 h —
+    # the clerk leaves on its own when the room goes quiet, or when asked —
+    # and only hard_stop=true (the user said when to leave) keeps a short one.
+    # The bridge enforces the same floor.
     minutes = args.get("minutes")
     try:
         minutes = int(minutes) if minutes else 120
     except (TypeError, ValueError):
         minutes = 120
+    hard_stop = args.get("hard_stop") is True
+    if not hard_stop:
+        minutes = max(minutes, 120)
     time_limit_s = max(60, min(minutes * 60, 14400))  # 1 min – 4 h
+    minutes = time_limit_s // 60
 
     # Two very different ways to be on a call (founder finding 2026-08-18:
     # he added a bot to a live call, addressed it by name, and it could not
@@ -113,6 +124,9 @@ def dial_meeting_tool(args, **kwargs):
             "style": "clerk",
             "agent": agent,
             "time_limit_s": time_limit_s,
+            # So "connected", "dropped" and the Rejoin card land in THIS chat,
+            # not whichever thread happened to be newest (review F17).
+            "session_id": os.environ.get("HERMES_SESSION_ID", "")[:80],
         }
         endpoint = "/api/voice/dial-meeting"
     else:
@@ -128,6 +142,8 @@ def dial_meeting_tool(args, **kwargs):
             if val:
                 payload[key] = val[:200]
         endpoint = "/api/voice/notetaker"
+    if hard_stop:
+        payload["hard_stop"] = True
 
     req = urllib.request.Request(
         _bridge_url(endpoint),
@@ -159,6 +175,23 @@ def dial_meeting_tool(args, **kwargs):
         return tool_error(result.get("error", "The call could not be placed."))
 
     where = label or to
+    # The caller ID the meeting sees, from the bridge that placed the call.
+    # Three times on 2026-09-21 the founder was told to admit a number that
+    # was not the fleet line (a stale default from old docs, recalled from
+    # memory) because this result never said which number was calling
+    # (review F17). The only number to admit is this one.
+    caller_id = str(result.get("from") or "").strip()
+    admit = (
+        f" If the meeting has a waiting room, the number to admit is {caller_id} "
+        f"(this machine's fleet line) — give the user exactly that number."
+        if caller_id else
+        " If the meeting has a waiting room, I'll post the number to admit once "
+        "the call connects — do not name a number before then."
+    )
+    try:
+        limit_min = int(result.get("time_limit_s") or time_limit_s) // 60
+    except (TypeError, ValueError):
+        limit_min = minutes
     recap = ""
     if payload.get("email_to"):
         recap = f" A recap will be emailed to {payload['email_to']}"
@@ -166,20 +199,34 @@ def dial_meeting_tool(args, **kwargs):
             recap += f" (cc {payload['email_cc']})"
         recap += " once it ends."
 
+    stay = (f"I'll leave at the {limit_min}-minute mark you asked for"
+            if hard_stop else
+            f"I stay on while the meeting runs (the line closes at the latest after "
+            f"{limit_min} minutes)")
     if mode == "clerk":
         message = (
             f"Dialing into {where} now from the fleet line as a LIVE "
             f"participant. I can hear the call in real time — address me as "
-            f"\"copilot\" or by my name and I will answer out loud. I stay on "
-            f"for up to {minutes} minutes; the transcript is filed after."
+            f"\"copilot\" or by my name and I will answer out loud. {stay}, and "
+            f"I leave when the room goes quiet or when asked; if the call drops "
+            f"early I'll say so here and offer a rejoin. The transcript is filed "
+            f"after.{admit}"
         )
     else:
+        # A silent notetaker cannot hear the room empty, so the bridge ends
+        # its line after 75 minutes, or at the meeting's calendar end when
+        # that is later; time_limit_s in the answer is that real cap. "Stays
+        # on while the meeting runs" overstated it (review of PR #33).
+        if not hard_stop:
+            stay = (f"I stay on until the host ends the call, for at most "
+                    f"{limit_min} minutes, because this silent mode cannot hear "
+                    f"when the room empties")
         message = (
-            f"Dialing into {where} now from the fleet line. I will stay on the "
-            f"call silently for up to {minutes} minutes, then transcribe it. "
+            f"Dialing into {where} now from the fleet line, silently. {stay}. "
+            f"Then I transcribe it. "
             f"The notes land in Files → Meeting notes and I will post here when "
             f"they are ready.{recap} (I cannot hear or speak live in this "
-            f"mode — ask for mode=clerk if you want me participating.)"
+            f"mode — ask for mode=clerk if you want me participating.){admit}"
         )
 
     return json.dumps({
@@ -187,8 +234,10 @@ def dial_meeting_tool(args, **kwargs):
         "mode": mode,
         "call_sid": result.get("call_sid", ""),
         "dialed": to,
+        "caller_id": caller_id,
         "label": label,
         "status": result.get("status", ""),
+        "max_minutes": limit_min,
         "message": message,
     })
 
@@ -209,7 +258,11 @@ DIAL_MEETING_SCHEMA = {
         "a call so I can ask you things'. Writing 'clerk' in the label does "
         "NOT do this — only mode='clerk' does.\n"
         "Needs the dial-in PHONE NUMBER from the invite; a video link alone "
-        "will not work, so ask for the number if you only have a URL.\n"
+        "will not work, so ask for the number if you only have a URL. Read it "
+        "from the invite (calendar event, the forwarded email, [LAST MEETING]) "
+        "— never from memory.\n"
+        "The result's caller_id is the number the meeting sees; it is the ONLY "
+        "number to tell anyone to admit from a waiting room.\n"
         "Be honest about the mode you chose: notetaker notes come after the "
         "meeting ends; clerk answers live."
     ),
@@ -235,7 +288,18 @@ DIAL_MEETING_SCHEMA = {
             },
             "minutes": {
                 "type": "integer",
-                "description": "How long to stay on the call before hanging up. Default 120, max 240.",
+                "description": (
+                    "How long the meeting is expected to run. NOT a cut-off: "
+                    "the line stays up at least 120 minutes (max 240) so a "
+                    "meeting that runs over is not dropped. Leave it out "
+                    "unless the meeting is longer than 2 hours."),
+            },
+            "hard_stop": {
+                "type": "boolean",
+                "description": (
+                    "true ONLY when the user told you to leave at a set time or "
+                    "after a set length; then `minutes` is a real cut-off. "
+                    "Never set it on your own."),
             },
             "email_to": {
                 "type": "string",
