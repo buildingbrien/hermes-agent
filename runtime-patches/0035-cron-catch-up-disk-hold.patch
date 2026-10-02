@@ -1,0 +1,72 @@
+--- a/cron/scheduler_prompt.py
++++ b/cron/scheduler_prompt.py
+@@ -267,6 +267,42 @@
+     return None
+ 
+ 
++# ── Lucaryin fold (0035, review of lucaryin-ai#141, F56) ──────────────────────
++# The bridge holds scheduled runs while the computer is almost out of disk space
++# (hermes-bridge/disk_guard.py) and records each hold in <cron dir>/.disk_hold.json =
++# {"holding_since": <epoch or null>, "recent": [{"from", "until"}, ...]}. The app is
++# running then, so no downtime window covers the slot, and the note below used to say
++# the run was late because "the app was closed or the computer was asleep".
++_DISK_HOLD_FILE = ".disk_hold.json"
++
++
++def _disk_hold_covering(due_ts: float, now: Optional[float] = None) -> Optional[tuple]:
++    """The recorded disk hold that covers ``due_ts`` (a hold still in force ends now), or None."""
++    import time as _time
++    try:
++        from cron.jobs import _current_cron_store
++        raw = json.loads((_current_cron_store().cron_dir / _DISK_HOLD_FILE).read_text(encoding="utf-8"))
++    except Exception:
++        return None
++    if not isinstance(raw, dict):
++        return None
++    windows = []
++    for w in raw.get("recent") if isinstance(raw.get("recent"), list) else []:
++        try:
++            windows.append((float(w["from"]), float(w["until"])))
++        except Exception:
++            continue
++    try:
++        if raw.get("holding_since") is not None:
++            windows.append((float(raw["holding_since"]), float(now if now is not None else _time.time())))
++    except (TypeError, ValueError):
++        pass
++    for start, end in windows:
++        if end > start and start - _DOWNTIME_START_SLACK_SECONDS <= due_ts <= end:
++            return (start, end)
++    return None
++
++
+ def _catch_up_note(job: dict) -> str:
+     """The scheduling note for THIS run when it is a catch-up, else "".
+ 
+@@ -286,10 +322,16 @@
+     except (TypeError, ValueError):
+         return ""
+     window = _downtime_covering(due.timestamp())
++    hold = None if window else _disk_hold_covering(due.timestamp())
+     if window:
+         why = (" because the Lucaryin app was not running (or the computer was asleep) from "
+                f"{_local_label(datetime.fromtimestamp(window[0]).astimezone())} until "
+                f"{_local_label(datetime.fromtimestamp(window[1]).astimezone())}")
++    elif hold:
++        # Lucaryin fold (0035): the app was running; scheduled jobs were paused for disk space.
++        why = (" because scheduled jobs were paused while this computer was almost out of disk space, "
++               f"from {_local_label(datetime.fromtimestamp(hold[0]).astimezone())} until "
++               f"{_local_label(datetime.fromtimestamp(hold[1]).astimezone())}")
+     else:
+         why = (" because the scheduler did not run at that time (the app was closed, the "
+                "computer was asleep, or earlier scheduled jobs ran long)")
+@@ -299,7 +341,8 @@
+         f"{_late_label(late)} late{why}. The job's schedule is correct and is not misconfigured, "
+         "so do not suggest changing it. If this task was tied to that time (a meeting, a call, or "
+         "a reminder for a moment that has passed), say plainly that it was missed because the "
+-        "app was not running then, and do not act as if it were on time.\n\n"
++        + ("computer was almost out of disk space then" if hold else "app was not running then")
++        + ", and do not act as if it were on time.\n\n"
+     )
+ 
+ 
