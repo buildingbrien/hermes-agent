@@ -29,6 +29,7 @@ import os
 import urllib.error
 import urllib.request
 from tools.bridge_auth import bridge_bearer
+from tools.fleet_send import _unattended_fields  # F21: cron asks for unattended turns
 
 # Same map the bridges and voice server use. Keep in sync.
 AGENT_PORTS = {"thoth": 9001, "ptah": 9005, "set": 9006, "neith": 9007}
@@ -134,6 +135,12 @@ def ask_agent(agent: str, question: str, sender: str = "") -> str:
         payload["requester_session_id"] = origin["session_id"]
     if origin.get("source"):
         payload["requester_source"] = origin["source"]
+    # A question from a scheduled run is answered as an UNATTENDED turn on the
+    # far side (lucaryin-ai /api/chat/sync -> LUCARYIN_TURN_UNATTENDED): a
+    # gated action there is blocked and carded, never waited on, so a cron job
+    # cannot borrow the teammate's attended trust (F21). Shared with fleet_send
+    # and delegate_to_neith (tools/fleet_send.py _unattended_fields).
+    payload.update(_unattended_fields())
     headers = {"Content-Type": "application/json"}
     token = bridge_bearer()  # file-then-env (tools/bridge_auth.py, HA3)
     if token:
@@ -179,6 +186,19 @@ def ask_agent(agent: str, question: str, sender: str = "") -> str:
         })
     except Exception as e:  # noqa: BLE001
         return json.dumps({"success": False, "agent": target, "error": str(e)})
+
+    # The reply must come from the agent we asked (F20: Team Huddle reached a
+    # legacy OpenClaw 'neith' whose memory ended in July and reported the real
+    # one offline). A bridge that names its profile and names another one is
+    # not the teammate; an older bridge that names none is taken at its port.
+    responder = str(data.get("profile") or "").strip().lower()
+    if responder and responder != target:
+        return json.dumps({
+            "success": False, "agent": target,
+            "error": f"The bridge for {target} answered as '{responder}'. That is not "
+                     f"{target}: report {target} as not reachable and do not use this "
+                     f"reply.",
+        })
 
     # A refusal is a real answer — surface it rather than burying it as failure.
     if data.get("refused"):

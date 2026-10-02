@@ -29,3 +29,4 @@
 0033-state-stale-tool-result-index.patch
 0034-vision-honest-results-and-screenshot-names.patch
 0035-cron-catch-up-disk-hold.patch
+0037-cron-job-hygiene.patch
